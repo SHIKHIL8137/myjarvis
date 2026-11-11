@@ -1,0 +1,32 @@
+[project]
+name = "myjarvis"
+version = "2.0.0"
+description = "Local-first Personal AI Assistant & Multi-Agent Operating System"
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = [
+  "live: hits the real Ollama server",
+  "mic: opens real audio hardware",
+  "integration: runs integration tests against live services",
+  "pg: exercises live PostgreSQL when JARVIS_PG_TEST_URL is configured",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 140
+exclude = [".venv", "models", "data", "apps", "viewer", "docs"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+ignore = ["E501", "E731"]
+
+[tool.mypy]
+python_version = "3.14"
+plugins = ["pydantic.mypy"]
+ignore_missing_imports = true
+warn_unused_ignores = true
+check_untyped_defs = false
+exclude = "^(tests|models|data|apps|viewer)/"

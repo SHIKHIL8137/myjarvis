@@ -1,0 +1,371 @@
+"""SQLAlchemy 2 declarative models covering Personal Assistant, Dev Workforce, 5-Way Memory, Gateway, and DR."""
+import time
+import uuid
+
+from sqlalchemy import Boolean, Float, ForeignKey, Index, Integer, JSON, LargeBinary, String, Text
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+
+def _uuid() -> str:
+    return uuid.uuid4().hex
+
+
+def _now() -> float:
+    return round(time.time(), 3)
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+# ---- 1. Personal Assistant & Notes -------------------------------------------------------------------
+class PersonalMemoryRow(Base):
+    __tablename__ = "personal_memories"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    category: Mapped[str] = mapped_column(String(32), index=True)  # explicit | preference | temporary
+    scope: Mapped[str] = mapped_column(String(24), default="global")  # global | temporary
+    topic: Mapped[str] = mapped_column(String(120), default="")
+    title: Mapped[str] = mapped_column(String(200), default="")
+    content: Mapped[str] = mapped_column(Text)
+    source: Mapped[str] = mapped_column(String(32), default="explicit")
+    confirmed: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    confidence: Mapped[float] = mapped_column(Float, default=1.0)
+    expires_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    created_at: Mapped[float] = mapped_column(Float, default=_now)
+    updated_at: Mapped[float] = mapped_column(Float, default=_now)
+
+
+class NoteRow(Base):
+    __tablename__ = "notes"
+    uid: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    title: Mapped[str] = mapped_column(String(250), index=True)
+    category: Mapped[str] = mapped_column(String(64), default="general", index=True)
+    slug: Mapped[str] = mapped_column(String(250), unique=True)
+    path: Mapped[str] = mapped_column(String(500), unique=True)
+    body_md: Mapped[str] = mapped_column(Text)
+    wikilinks: Mapped[list] = mapped_column(JSON, default=list)
+    is_trashed: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    created_at: Mapped[float] = mapped_column(Float, default=_now)
+    updated_at: Mapped[float] = mapped_column(Float, default=_now)
+
+
+class ConversationSessionRow(Base):
+    __tablename__ = "conversation_sessions"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    title: Mapped[str] = mapped_column(String(200), default="Default Session")
+    department: Mapped[str] = mapped_column(String(32), default="assistant")  # assistant | dev
+    project_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    active_agent: Mapped[str] = mapped_column(String(64), default="assistant_coordinator")
+    created_at: Mapped[float] = mapped_column(Float, default=_now)
+    updated_at: Mapped[float] = mapped_column(Float, default=_now)
+
+
+class ConversationMessageRow(Base):
+    __tablename__ = "conversation_messages"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    session_id: Mapped[str] = mapped_column(ForeignKey("conversation_sessions.id", ondelete="CASCADE"), index=True)
+    role: Mapped[str] = mapped_column(String(24))
+    agent_name: Mapped[str] = mapped_column(String(64), default="")
+    content: Mapped[str] = mapped_column(Text)
+    meta: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[float] = mapped_column(Float, default=_now, index=True)
+
+
+class VoiceTranscriptRow(Base):
+    __tablename__ = "voice_transcripts"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    audio_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    original_transcript: Mapped[str] = mapped_column(Text)
+    corrected_transcript: Mapped[str] = mapped_column(Text)
+    detected_language: Mapped[str] = mapped_column(String(16), default="en")
+    target_language: Mapped[str] = mapped_column(String(16), default="none")
+    translated_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    translation_engine: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    confidence: Mapped[float] = mapped_column(Float, default=0.0)
+    model: Mapped[str] = mapped_column(String(64), default="")
+    seconds: Mapped[float] = mapped_column(Float, default=0.0)
+    created_at: Mapped[float] = mapped_column(Float, default=_now, index=True)
+
+
+class TaskRow(Base):
+    __tablename__ = "tasks"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    project_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    kind: Mapped[str] = mapped_column(String(48), default="assistant")
+    title: Mapped[str] = mapped_column(String(300))
+    status: Mapped[str] = mapped_column(String(32), default="pending", index=True)
+    steps: Mapped[list] = mapped_column(JSON, default=list)
+    assigned_agent: Mapped[str] = mapped_column(String(64), default="")
+    result: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[float] = mapped_column(Float, default=_now)
+    completed_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+
+class ReminderRow(Base):
+    __tablename__ = "reminders"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    title: Mapped[str] = mapped_column(String(300))
+    notes: Mapped[str] = mapped_column(Text, default="")
+    due_at: Mapped[float] = mapped_column(Float, index=True)
+    recurrence_cron: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    channel: Mapped[str] = mapped_column(String(32), default="voice+ui")
+    status: Mapped[str] = mapped_column(String(24), default="scheduled", index=True)  # scheduled | triggered | completed | cancelled
+    triggered_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    created_at: Mapped[float] = mapped_column(Float, default=_now)
+
+
+# ---- 2. AI Dev Workforce & Multi-Project Intelligence ------------------------------------------------
+class ProjectRow(Base):
+    __tablename__ = "projects"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    name: Mapped[str] = mapped_column(String(120), unique=True)
+    root_path: Mapped[str] = mapped_column(String(600), unique=True)
+    default_branch: Mapped[str] = mapped_column(String(64), default="main")
+    test_cmd: Mapped[str] = mapped_column(String(200), default="pytest -q")
+    lint_cmd: Mapped[str] = mapped_column(String(200), default="ruff check")
+    tech_stack: Mapped[dict] = mapped_column(JSON, default=dict)
+    graphify_status: Mapped[str] = mapped_column(String(32), default="unbuilt")
+    graphify_last_built_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    created_at: Mapped[float] = mapped_column(Float, default=_now)
+
+
+class ProjectGraphRow(Base):
+    __tablename__ = "project_graphs"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    git_commit_sha: Mapped[str] = mapped_column(String(64), default="")
+    node_count: Mapped[int] = mapped_column(Integer, default=0)
+    edge_count: Mapped[int] = mapped_column(Integer, default=0)
+    artifact_path: Mapped[str] = mapped_column(String(600), default="")
+    summary: Mapped[dict] = mapped_column(JSON, default=dict)
+    built_at: Mapped[float] = mapped_column(Float, default=_now)
+
+
+class WorktreeRow(Base):
+    __tablename__ = "worktrees"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    run_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    branch_name: Mapped[str] = mapped_column(String(120))
+    worktree_path: Mapped[str] = mapped_column(String(600), unique=True)
+    status: Mapped[str] = mapped_column(String(24), default="active", index=True)  # active | merged | cleaned
+    created_at: Mapped[float] = mapped_column(Float, default=_now)
+
+
+class AgentRunRow(Base):
+    __tablename__ = "agent_runs"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    session_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    project_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    workflow_name: Mapped[str] = mapped_column(String(64), index=True)  # assistant | workforce
+    agent_role: Mapped[str] = mapped_column(String(64), default="coordinator")
+    thread_id: Mapped[str] = mapped_column(String(64), index=True)
+    state: Mapped[str] = mapped_column(String(32), default="running", index=True)
+    input_summary: Mapped[str] = mapped_column(Text, default="")
+    output_summary: Mapped[str] = mapped_column(Text, default="")
+    state_payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    started_at: Mapped[float] = mapped_column(Float, default=_now)
+    ended_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+
+class AgentStepRow(Base):
+    __tablename__ = "agent_steps"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    run_id: Mapped[str] = mapped_column(ForeignKey("agent_runs.id", ondelete="CASCADE"), index=True)
+    step_index: Mapped[int] = mapped_column(Integer)
+    node_name: Mapped[str] = mapped_column(String(80))
+    tool_name: Mapped[str] = mapped_column(String(80), default="")
+    input_payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    output_payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    status: Mapped[str] = mapped_column(String(24), default="completed")
+    duration_ms: Mapped[float] = mapped_column(Float, default=0.0)
+    created_at: Mapped[float] = mapped_column(Float, default=_now)
+
+
+class ApprovalRequestRow(Base):
+    __tablename__ = "approval_requests"
+    token: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    run_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    action_type: Mapped[str] = mapped_column(String(80))
+    risk_tier: Mapped[str] = mapped_column(String(16), default="EXECUTE")  # READ | WRITE | EXECUTE
+    target_resource: Mapped[str] = mapped_column(String(500), default="")
+    preview_diff: Mapped[str] = mapped_column(Text, default="")
+    args: Mapped[dict] = mapped_column(JSON, default=dict)
+    status: Mapped[str] = mapped_column(String(24), default="pending", index=True)
+    decided_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[float] = mapped_column(Float, default=_now)
+    expires_at: Mapped[float] = mapped_column(Float)
+    decided_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+
+# ---- 3. 5-Way Memory, External Knowledge, Training & Gateway Telemetry -------------------------------
+class ExperienceLessonRow(Base):
+    __tablename__ = "experience_lessons"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    scope: Mapped[str] = mapped_column(String(24), default="assistant", index=True)  # assistant | dev
+    project_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    category: Mapped[str] = mapped_column(String(48), default="correction")
+    topic: Mapped[str] = mapped_column(String(120), default="")
+    trigger_context: Mapped[str] = mapped_column(Text)
+    outcome_before: Mapped[str] = mapped_column(Text, default="")
+    lesson_after: Mapped[str] = mapped_column(Text)
+    approved: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    quality_score: Mapped[float] = mapped_column(Float, default=0.85)
+    source: Mapped[str] = mapped_column(String(32), default="explicit_user")
+    created_at: Mapped[float] = mapped_column(Float, default=_now)
+
+
+class KnowledgeSourceRow(Base):
+    __tablename__ = "knowledge_sources"
+    source_id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    name: Mapped[str] = mapped_column(String(160))
+    kind: Mapped[str] = mapped_column(String(48))
+    location: Mapped[str] = mapped_column(String(600))
+    topic: Mapped[str] = mapped_column(String(120), default="general")
+    license: Mapped[str] = mapped_column(String(64), default="unknown")
+    trust_classification: Mapped[str] = mapped_column(String(48), default="user_provided")
+    active_version: Mapped[int] = mapped_column(Integer, default=0)
+    content_hash: Mapped[str] = mapped_column(String(64), default="")
+    language: Mapped[str] = mapped_column(String(16), default="en")
+    retrieved_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    update_status: Mapped[str] = mapped_column(String(48), default="registered")
+
+
+class KnowledgeVersionRow(Base):
+    __tablename__ = "knowledge_versions"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    source_id: Mapped[str] = mapped_column(ForeignKey("knowledge_sources.source_id", ondelete="CASCADE"), index=True)
+    version_num: Mapped[int] = mapped_column(Integer)
+    content_hash: Mapped[str] = mapped_column(String(64))
+    doc_version: Mapped[str] = mapped_column(String(64), default="1")
+    license: Mapped[str] = mapped_column(String(64), default="unknown")
+    language: Mapped[str] = mapped_column(String(16), default="en")
+    retrieved_at: Mapped[float] = mapped_column(Float, default=_now)
+    byte_size: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class KnowledgeChunkRow(Base):
+    __tablename__ = "knowledge_chunks"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    source_id: Mapped[str] = mapped_column(ForeignKey("knowledge_sources.source_id", ondelete="CASCADE"), index=True)
+    version_num: Mapped[int] = mapped_column(Integer)
+    chunk_index: Mapped[int] = mapped_column(Integer)
+    title: Mapped[str] = mapped_column(String(200), default="")
+    topic: Mapped[str] = mapped_column(String(120), default="general")
+    language: Mapped[str] = mapped_column(String(16), default="en")
+    content: Mapped[str] = mapped_column(Text)
+    content_hash: Mapped[str] = mapped_column(String(64))
+    active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+
+
+class DatasetBuildRow(Base):
+    __tablename__ = "dataset_builds"
+    build_id: Mapped[str] = mapped_column(String(120), primary_key=True)
+    target_format: Mapped[str] = mapped_column(String(24))
+    train_count: Mapped[int] = mapped_column(Integer, default=0)
+    val_count: Mapped[int] = mapped_column(Integer, default=0)
+    test_count: Mapped[int] = mapped_column(Integer, default=0)
+    leakage_clean: Mapped[bool] = mapped_column(Boolean, default=True)
+    sha256: Mapped[str] = mapped_column(String(64))
+    artifact_dir: Mapped[str] = mapped_column(String(500))
+    created_at: Mapped[float] = mapped_column(Float, default=_now)
+
+
+class TrainingJobRow(Base):
+    __tablename__ = "training_jobs"
+    job_id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    dataset_build_id: Mapped[str] = mapped_column(String(120), index=True)
+    base_model: Mapped[str] = mapped_column(String(120))
+    hf_model_id: Mapped[str] = mapped_column(String(160))
+    quantization: Mapped[str] = mapped_column(String(16))
+    status: Mapped[str] = mapped_column(String(32), index=True)
+    est_vram_gb: Mapped[float] = mapped_column(Float, default=0.0)
+    approved_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[float] = mapped_column(Float, default=_now)
+
+
+class EvalReportRow(Base):
+    __tablename__ = "eval_reports"
+    eval_id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    baseline_model: Mapped[str] = mapped_column(String(120))
+    candidate_model: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    baseline_score: Mapped[float] = mapped_column(Float)
+    candidate_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    regressions: Mapped[int] = mapped_column(Integer, default=0)
+    safety_failures: Mapped[int] = mapped_column(Integer, default=0)
+    decision: Mapped[str] = mapped_column(String(48))
+    report: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[float] = mapped_column(Float, default=_now)
+
+
+class ModelVersionRow(Base):
+    __tablename__ = "model_versions"
+    version_id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    base_model: Mapped[str] = mapped_column(String(120))
+    artifact_type: Mapped[str] = mapped_column(String(32), default="ollama_tag")
+    tag_or_path: Mapped[str] = mapped_column(String(500), default="")
+    sha256: Mapped[str] = mapped_column(String(64), default="")
+    status: Mapped[str] = mapped_column(String(24), default="candidate", index=True)
+    eval_report_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    created_at: Mapped[float] = mapped_column(Float, default=_now)
+
+
+class LLMUsageLogRow(Base):
+    __tablename__ = "llm_usage_logs"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    session_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    run_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    decision_layer: Mapped[int] = mapped_column(Integer, default=3)
+    provider: Mapped[str] = mapped_column(String(48), index=True)
+    model: Mapped[str] = mapped_column(String(120))
+    prompt_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    completion_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    latency_ms: Mapped[float] = mapped_column(Float, default=0.0)
+    estimated_cost_usd: Mapped[float] = mapped_column(Float, default=0.0)
+    status: Mapped[str] = mapped_column(String(24), default="ok")
+    created_at: Mapped[float] = mapped_column(Float, default=_now, index=True)
+
+
+class AuditEventRow(Base):
+    __tablename__ = "audit_events"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    actor: Mapped[str] = mapped_column(String(64), default="system")
+    category: Mapped[str] = mapped_column(String(32), index=True)
+    decision: Mapped[str] = mapped_column(String(24))
+    target: Mapped[str] = mapped_column(String(500), default="")
+    details: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[float] = mapped_column(Float, default=_now, index=True)
+
+
+class BackupManifestRow(Base):
+    __tablename__ = "backup_manifests"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    tier: Mapped[str] = mapped_column(String(24), index=True)  # tier1_hot | tier2_warm | tier3_cold
+    bundle_path: Mapped[str] = mapped_column(String(600))
+    sha256_manifest: Mapped[str] = mapped_column(String(64))
+    encrypted: Mapped[bool] = mapped_column(Boolean, default=True)
+    size_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    verified_restore: Mapped[bool] = mapped_column(Boolean, default=False)
+    details: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[float] = mapped_column(Float, default=_now, index=True)
+
+
+class VectorEntryRow(Base):
+    """Isolated 5-way vector chunks (float32 IEEE-754 LE normalized BLOB + metadata filtering)."""
+    __tablename__ = "vector_entries"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    namespace: Mapped[str] = mapped_column(String(48), index=True)  # personal_memory | project_knowledge | experience_memory | external_knowledge | personal_documents
+    owner_id: Mapped[str] = mapped_column(String(64), default="default")
+    project_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    doc_id: Mapped[str] = mapped_column(String(120), index=True)
+    chunk_index: Mapped[int] = mapped_column(Integer, default=0)
+    title: Mapped[str] = mapped_column(String(250), default="")
+    content: Mapped[str] = mapped_column(Text)
+    meta: Mapped[dict] = mapped_column(JSON, default=dict)
+    dim: Mapped[int] = mapped_column(Integer, default=256)
+    embedding_blob: Mapped[bytes] = mapped_column(LargeBinary)
+    updated_at: Mapped[float] = mapped_column(Float, default=_now)
+
+
+Index("ix_vec_ns_proj", VectorEntryRow.namespace, VectorEntryRow.project_id)
+

@@ -312,7 +312,21 @@ class PiperTTS:
         with wave.open(str(f), "wb") as w:
             w.setnchannels(1), w.setsampwidth(2), w.setframerate(sr)
             w.writeframes(audio.tobytes())
+        self._prune_cache()
         return sr, audio
+
+    def _prune_cache(self, max_files: int = 250, max_bytes: int = 50 * 1024 * 1024) -> None:
+        """Evict oldest cached WAVs cleanly when exceeding bounded file or byte budget."""
+        try:
+            files = sorted(self.cache_dir.glob("*.wav"), key=lambda p: p.stat().st_mtime)
+            total = sum(p.stat().st_size for p in files)
+            while files and (len(files) > max_files or total > max_bytes):
+                victim = files.pop(0)
+                sz = victim.stat().st_size
+                victim.unlink(missing_ok=True)
+                total -= sz
+        except Exception:
+            pass
 
     def wav_bytes(self, text: str) -> bytes:
         sr, audio = self.synth(clean_for_speech(text) or text)

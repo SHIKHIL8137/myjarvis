@@ -5,12 +5,14 @@ import json
 import logging
 import time
 from typing import AsyncIterator
+from urllib.parse import urlsplit
 
 import httpx
 
 from . import audit
-from .config import BrainSpec, Settings, get_provider_api_key, has_provider_api_key
+from .config import BrainSpec, InternetSpec, Settings, get_provider_api_key, has_provider_api_key
 from .netsec import NetworkSecurityError, safe_request
+from .security.pii_firewall import scrub_messages
 
 log = logging.getLogger("jarvis.brain")
 
@@ -77,10 +79,9 @@ class Brain:
         p = getattr(self.spec, "provider", None)
         if p:
             return str(p).lower()
-        if str(self.current).startswith("openai:"):
-            return "openai"
-        if str(self.current).startswith("anthropic:"):
-            return "anthropic"
+        for prefix in ("openai", "anthropic", "openrouter", "gemini", "huggingface"):
+            if str(self.current).startswith(f"{prefix}:"):
+                return prefix
         return "ollama"
 
     def _cloud_allowed(self, prov: str) -> str:
@@ -141,18 +142,30 @@ class Brain:
         } for m in inst if m not in known]
 
         p = self.settings.providers
-        if has_provider_api_key("openai"):
-            k = f"openai:{p.openai_model}"
-            out.append({"key": k, "model": p.openai_model, "provider": "openai", "local": False, "thinking": False, "tools": True,
-                        "installed": bool(p.allow_cloud and self.settings.internet.enabled), "current": self.current == k})
-        if has_provider_api_key("anthropic"):
-            k = f"anthropic:{p.anthropic_model}"
-            out.append({"key": k, "model": p.anthropic_model, "provider": "anthropic", "local": False, "thinking": False, "tools": True,
-                        "installed": bool(p.allow_cloud and self.settings.internet.enabled), "current": self.current == k})
+        cloud_specs = [
+            ("openai", p.openai_model),
+            ("anthropic", p.anthropic_model),
+            ("openrouter", p.openrouter_model),
+            ("gemini", p.gemini_model),
+            ("huggingface", p.huggingface_model),
+        ]
+        for prov_name, prov_model in cloud_specs:
+            if has_provider_api_key(prov_name):
+                k = f"{prov_name}:{prov_model}"
+                out.append({
+                    "key": k,
+                    "model": prov_model,
+                    "provider": prov_name,
+                    "local": False,
+                    "thinking": False,
+                    "tools": prov_name != "gemini",
+                    "installed": bool(p.allow_cloud and self.settings.internet.enabled),
+                    "current": self.current == k,
+                })
         return out
 
     async def resolve_choice(self, want: str) -> str | None:
-        """Resolve natural alias ('fast', 'reasoning', 'best installed reasoning', 'llama', 'openai', etc.)."""
+        """Resolve natural alias ('fast', 'reasoning', 'openrouter', 'gemini', 'openai', etc.)."""
         q = (want or "").strip().lower()
         aliases = {
             "fast": "local", "quick": "local", "default": self.settings.boot_brain, "normal": "local",
@@ -166,6 +179,12 @@ class Brain:
             return f"openai:{self.settings.providers.openai_model}"
         if q.startswith("anthropic") or "claude" in q:
             return f"anthropic:{self.settings.providers.anthropic_model}"
+        if q.startswith("openrouter"):
+            return f"openrouter:{self.settings.providers.openrouter_model}"
+        if q.startswith("gemini"):
+            return f"gemini:{self.settings.providers.gemini_model}"
+        if q.startswith("huggingface") or q == "hf":
+            return f"huggingface:{self.settings.providers.huggingface_model}"
         inst = await self.installed()
         for m in inst:
             if m.lower() == q:
@@ -177,11 +196,17 @@ class Brain:
 
     async def switch(self, key_or_model: str) -> dict:
         """Select a configured brain, installed Ollama model, or gated cloud adapter. Never pulls models."""
-        if key_or_model.startswith(("openai:", "anthropic:")):
+        if key_or_model.startswith(("openai:", "anthropic:", "openrouter:", "gemini:", "huggingface:")):
             prov, model_id = key_or_model.split(":", 1)
             self._cloud_allowed(prov)
-            base_url = self.settings.providers.openai_base_url if prov == "openai" else self.settings.providers.anthropic_base_url
-            spec = BrainSpec(base_url=base_url, model=model_id, thinking=False)
+            url_map = {
+                "openai": self.settings.providers.openai_base_url,
+                "anthropic": self.settings.providers.anthropic_base_url,
+                "openrouter": self.settings.providers.openrouter_base_url,
+                "gemini": self.settings.providers.gemini_base_url,
+                "huggingface": self.settings.providers.huggingface_base_url,
+            }
+            spec = BrainSpec(base_url=url_map[prov], model=model_id, thinking=False)
             setattr(spec, "provider", prov)
             self.adhoc[key_or_model] = spec
             if key_or_model != self.current:
@@ -236,29 +261,59 @@ class Brain:
 
     async def _cloud_complete(self, prov: str, messages: list[dict]) -> AsyncIterator[dict]:
         key = self._cloud_allowed(prov)
+        if self.settings.gateway.scrub_outbound_secrets:
+            messages, _ = scrub_messages(messages)
+        net_spec = InternetSpec(enabled=True, timeout_s=30.0, max_fetch_bytes=self.settings.internet.max_fetch_bytes)
         t0 = time.time()
         try:
-            if prov == "openai":
-                url = self.settings.providers.openai_base_url.rstrip("/") + "/chat/completions"
+            if prov in ("openai", "openrouter", "huggingface"):
+                base_map = {
+                    "openai": self.settings.providers.openai_base_url,
+                    "openrouter": self.settings.providers.openrouter_base_url,
+                    "huggingface": self.settings.providers.huggingface_base_url,
+                }
+                url = base_map[prov].rstrip("/") + "/chat/completions"
+                host = (urlsplit(url).hostname or "").lower()
+                hdrs = {"Authorization": f"Bearer {key}"}
+                if prov == "openrouter":
+                    hdrs["HTTP-Referer"] = "https://localhost.jarvis.local"
                 res = await safe_request(
                     "POST",
                     url,
+                    net_spec,
+                    allowed_hosts={host} if host else None,
                     json_body={"model": self.spec.model, "messages": messages, "max_tokens": self.spec.max_tokens},
-                    headers={"Authorization": f"Bearer {key}"},
-                    timeout_s=30.0,
+                    headers=hdrs,
                 )
                 data = json.loads(res.body.decode("utf-8"))
                 txt = data["choices"][0]["message"]["content"]
+            elif prov == "gemini":
+                url = f"{self.settings.providers.gemini_base_url.rstrip('/')}/models/{self.spec.model}:generateContent"
+                host = (urlsplit(url).hostname or "").lower()
+                sys_parts = [m["content"] for m in messages if m["role"] == "system"]
+                contents = [
+                    {"role": "model" if m["role"] == "assistant" else "user", "parts": [{"text": m["content"]}]}
+                    for m in messages if m["role"] != "system"
+                ]
+                body = {"contents": contents, "generationConfig": {"maxOutputTokens": self.spec.max_tokens}}
+                if sys_parts:
+                    body["systemInstruction"] = {"parts": [{"text": "\n".join(sys_parts)}]}
+                res = await safe_request("POST", url, net_spec, allowed_hosts={host} if host else None, json_body=body, headers={"x-goog-api-key": key})
+                data = json.loads(res.body.decode("utf-8"))
+                parts = ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
+                txt = "".join(p.get("text", "") for p in parts)
             elif prov == "anthropic":
                 url = self.settings.providers.anthropic_base_url.rstrip("/") + "/messages"
+                host = (urlsplit(url).hostname or "").lower()
                 sys_msg = "\n".join(m["content"] for m in messages if m["role"] == "system")
                 chat_msgs = [{"role": m["role"], "content": m["content"]} for m in messages if m["role"] != "system"]
                 res = await safe_request(
                     "POST",
                     url,
+                    net_spec,
+                    allowed_hosts={host} if host else None,
                     json_body={"model": self.spec.model, "system": sys_msg, "messages": chat_msgs, "max_tokens": self.spec.max_tokens},
                     headers={"x-api-key": key, "anthropic-version": "2023-06-01"},
-                    timeout_s=30.0,
                 )
                 data = json.loads(res.body.decode("utf-8"))
                 txt = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
@@ -274,7 +329,7 @@ class Brain:
 
     async def stream_events(self, messages: list[dict], tools: list[dict] | None = None) -> AsyncIterator[dict]:
         """Stream `/api/chat` (or gated cloud provider) yielding {"type": "token", "text"} and {"type": "tool_calls", "calls"}."""
-        if self.provider in ("openai", "anthropic"):
+        if self.provider in ("openai", "anthropic", "openrouter", "gemini", "huggingface"):
             async for ev in self._cloud_complete(self.provider, messages):
                 yield ev
             return

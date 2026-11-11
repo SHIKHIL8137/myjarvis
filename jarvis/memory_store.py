@@ -11,29 +11,9 @@ import uuid
 
 from .config import DATA, MemorySpec
 from .retrieval import tokens
+from .security.pii_firewall import detect_secret
 
 MEMORY_CATEGORIES = ("explicit", "preference", "project", "temporary", "feedback")
-
-_SECRET_PATTERNS = [
-    (re.compile(r"\bsk-(?:proj-|live-|test-)?[A-Za-z0-9_-]{16,}\b"), "OpenAI-style API key"),
-    (re.compile(r"\bsk-ant-[A-Za-z0-9_-]{16,}\b"), "Anthropic API key"),
-    (re.compile(r"\bhf_[A-Za-z0-9]{16,}\b"), "Hugging Face token"),
-    (re.compile(r"\bgh[pousr]_[A-Za-z0-9]{16,}\b"), "GitHub token"),
-    (re.compile(r"\bAIza[0-9A-Za-z\-_]{20,}\b"), "Google API key"),
-    (re.compile(r"\btvly-[A-Za-z0-9\-_]{12,}\b"), "Tavily API key"),
-    (re.compile(r"-----BEGIN (?:RSA |OPENSSH |EC |PGP )?PRIVATE KEY-----"), "Private key block"),
-    (re.compile(r"\bBearer\s+[A-Za-z0-9\-._~+/]+=*\b", re.I), "Bearer token"),
-    (re.compile(r"(?i)\b(?:password|passwd|pwd|api[_-]?key|secret[_-]?key|access[_-]?token|auth[_-]?token)\s*[:=]\s*['\"]?[^\s'\"]{6,}"), "Credential/password assignment"),
-]
-
-
-def detect_secret(text: str) -> str | None:
-    """Return description if `text` appears to contain credentials/tokens/passwords, else None."""
-    s = text or ""
-    for pat, label in _SECRET_PATTERNS:
-        if pat.search(s):
-            return label
-    return None
 
 
 @dataclass

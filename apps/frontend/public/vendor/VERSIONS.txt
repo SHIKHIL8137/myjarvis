@@ -1,0 +1,6 @@
+﻿3d-force-graph 1.80.2 (MIT) - dist/3d-force-graph.min.js (bundles three.js 0.187.0 and its deps)
+Source: https://registry.npmjs.org/3d-force-graph/-/3d-force-graph-1.80.2.tgz  (npm install 3d-force-graph on 2026-11-11)
+SHA256 of vendored file: AE9B5CA9D525095978D0F5D23F9136DFE177B2E949773102FFBF145DD7776F04
+No CDN is referenced anywhere under viewer/.
+Orbitron typeface (SIL Open Font License) - @fontsource/orbitron 5.3.0, latin 500 and 700 woff2
+Source: https://registry.npmjs.org/@fontsource/orbitron/-/orbitron-5.3.0.tgz (npm install on 2026-11-11)

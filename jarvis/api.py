@@ -14,9 +14,11 @@ from pydantic import BaseModel, Field
 from . import audit
 from .actions import ActionPermissionError
 from .api_learning import create_learning_router
+from .api_v2 import create_v2_router
 from .api_workspace import create_workspace_router
 from .assistant import Assistant
 from .brain import BrainError
+from .core.errors import JarvisError
 from .filesystem import FilesystemPermissionError
 from .memory_store import infer_memory_category
 from .config import (
@@ -143,6 +145,10 @@ def create_app(settings: Settings | None = None, assistant: Assistant | None = N
         if request.url.path.startswith("/api"):
             resp.headers["Cache-Control"] = "no-store"
         return resp
+
+    @app.exception_handler(JarvisError)
+    async def _jarvis_err(_, e: JarvisError):
+        return JSONResponse({"error": str(e), "code": e.code, **({"details": e.details} if e.details else {})}, status_code=e.status_code)
 
     @app.exception_handler(BrainError)
     async def _brain_err(_, e):
@@ -563,10 +569,16 @@ def create_app(settings: Settings | None = None, assistant: Assistant | None = N
                 A().bus.unsubscribe(q)
         return StreamingResponse(gen(), media_type="text/event-stream")
 
-    app.include_router(create_workspace_router(app.state.a))
-    app.include_router(create_learning_router(app.state.a))
+    app.include_router(create_workspace_router())
+    app.include_router(create_learning_router())
+    app.include_router(create_v2_router())
 
     vdir = viewer or ROOT / "viewer"
-    if vdir.exists():
+    react_dist = ROOT / "apps" / "frontend" / "dist"
+    if react_dist.exists() and (react_dist / "index.html").exists() and viewer is None:
+        if vdir.exists():
+            app.mount("/legacy", StaticFiles(directory=vdir, html=True), name="viewer_legacy")
+        app.mount("/", StaticFiles(directory=react_dist, html=True), name="frontend")
+    elif vdir.exists():
         app.mount("/", StaticFiles(directory=vdir, html=True), name="viewer")
     return app

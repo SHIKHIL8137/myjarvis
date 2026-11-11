@@ -11,6 +11,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import Iterable
 
 from .config import ROOT
 
@@ -140,7 +141,7 @@ def is_online_enabled() -> bool:
 
 
 @contextmanager
-def allow_outbound(hosts: set[str] | list[str] = (), ips: set[str] | list[str] = (), ports: set[int] = (443,), purpose: str = "web"):
+def allow_outbound(hosts: Iterable[str] = (), ips: Iterable[str] = (), ports: Iterable[int] = (443,), purpose: str = "web"):
     """Temporarily authorize a strictly scoped outbound DNS/HTTPS target inside Online Assisted Mode."""
     if not _state["online_enabled"]:
         raise ConnectionError("offline mode: internet access is disabled")

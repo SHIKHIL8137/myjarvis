@@ -166,7 +166,34 @@ function renderKnowledge(host, ov) {
 }
 
 async function renderDatasets(host, ov) {
-  const ds = await api("/learning/datasets");
+  const [ds, fb] = await Promise.all([api("/learning/datasets"), api("/learning/feedback")]);
+  const fbList = el("div", "l-list");
+  (fb.records || []).slice(0, 20).forEach((rec) => {
+    const card = kvCard(
+      `[${rec.category}] ${rec.topic || "feedback"}`,
+      rec.approval_status.toUpperCase(),
+      `Q: ${rec.input_text.slice(0, 90)} → ${rec.corrected_response.slice(0, 120)}`,
+      [pill(`score ${rec.quality_score}`)],
+    );
+    const act = el("div", "l-actions");
+    if (rec.approval_status !== "approved") {
+      const aBtn = el("button", null, "Approve");
+      aBtn.onclick = async () => { await api(`/learning/feedback/${rec.id}/approve`, { method: "POST" }); renderLearning(); };
+      act.append(aBtn);
+    }
+    if (rec.approval_status !== "rejected") {
+      const rBtn = el("button", "ghost", "Reject");
+      rBtn.onclick = async () => { await api(`/learning/feedback/${rec.id}/reject`, { method: "POST" }); renderLearning(); };
+      act.append(rBtn);
+    }
+    const dBtn = el("button", "ghost danger", "Delete");
+    dBtn.onclick = async () => { await api(`/learning/feedback/${rec.id}`, { method: "DELETE" }); renderLearning(); };
+    act.append(dBtn);
+    card.append(act);
+    fbList.append(card);
+  });
+  if (!fb.records?.length) fbList.append(el("p", "dim", "No feedback records yet."));
+
   const form = el("div", "box form l-form");
   const did = el("input"); did.placeholder = "Dataset ID (e.g. python-qa)";
   const dpath = el("input"); dpath.placeholder = "Local path to .jsonl / .json / .zip";
@@ -222,7 +249,7 @@ async function renderDatasets(host, ov) {
     builds.append(kvCard(b.build_id, b.target_format, `train=${b.train_count} · val=${b.val_count} · test=${b.test_count} · leakage=${b.leakage_overlaps}`));
   });
 
-  host.replaceChildren(form, hfRow, hfOut, el("h2", null, "Dataset Versions"), list, el("h2", null, "Prepared Split Builds"), builds);
+  host.replaceChildren(el("h2", null, "Feedback Review & Approval Queue"), fbList, el("h2", null, "Dataset Import & Validation"), form, hfRow, hfOut, el("h2", null, "Dataset Versions"), list, el("h2", null, "Prepared Split Builds"), builds);
 }
 
 async function renderTraining(host, ov) {

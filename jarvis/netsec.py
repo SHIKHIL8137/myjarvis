@@ -12,8 +12,7 @@ from dataclasses import dataclass
 import ipaddress
 import socket
 import ssl
-import time
-from typing import Iterable
+from typing import Any, Iterable
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 import anyio
@@ -111,7 +110,7 @@ def resolve_and_validate(url: str, allowed_hosts: Iterable[str] | None = None) -
 
         seen = set()
         for info in infos:
-            ip = info[4][0]
+            ip = str(info[4][0])
             if not audit.is_public_ip(ip):
                 audit.record_external("ssrf_block", sanitize_url(url), host, False, f"resolved to non-public IP {ip}")
                 raise NetworkSecurityError(f"blocked connection: {host} resolved to non-public IP {ip}")
@@ -232,7 +231,7 @@ async def safe_request(
                 follow_redirects=False,
                 trust_env=False,
             ) as client:
-                req_kwargs = {"headers": req_headers}
+                req_kwargs: dict[str, Any] = {"headers": req_headers}
                 if hop == 0 and json_body is not None and method.upper() == "POST":
                     req_kwargs["json"] = json_body
                 async with client.stream(method if hop == 0 else "GET", current_url, **req_kwargs) as resp:

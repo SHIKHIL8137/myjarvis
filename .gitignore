@@ -8,7 +8,13 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .ruff_cache/
+.mypy_cache/
 .cache/
+.worktrees/
+.jarvis_worktrees/
+apps/frontend/dist/
+apps/frontend/node_modules/
+artifacts/
 
 # local data and logs
 *.db

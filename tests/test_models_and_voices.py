@@ -38,6 +38,39 @@ async def test_brain_cloud_adapter_blocked_in_local_mode(settings, monkeypatch):
 
 
 @pytest.mark.anyio
+async def test_brain_cloud_adapter_calls_netsec_when_explicitly_allowed(settings, monkeypatch):
+    import json
+    from types import SimpleNamespace
+    from jarvis import audit
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-testdummy12345")
+    settings.offline_enforced = False
+    settings.internet.enabled = True
+    settings.providers.allow_cloud = True
+    audit.set_online_enabled(True)
+    try:
+        seen = {}
+
+        async def fake_safe_req(method, url, spec, *, allowed_hosts=None, json_body=None, headers=None, **kw):
+            seen["method"] = method
+            seen["url"] = url
+            seen["allowed_hosts"] = set(allowed_hosts or ())
+            seen["spec"] = spec
+            return SimpleNamespace(body=json.dumps({"choices": [{"message": {"content": "Cloud reply ok"}}]}).encode("utf-8"))
+
+        monkeypatch.setattr("jarvis.brain.safe_request", fake_safe_req)
+        b = Brain(settings)
+        res = await b.switch("openai:gpt-4o-mini")
+        assert res["provider"] == "openai" and res["local"] is False
+        out = "".join([c async for c in b.stream([{"role": "user", "content": "hi"}])])
+        assert out == "Cloud reply ok"
+        assert seen["url"] == "https://api.openai.com/v1/chat/completions"
+        assert "api.openai.com" in seen["allowed_hosts"]
+    finally:
+        audit.set_online_enabled(False)
+
+
+@pytest.mark.anyio
 async def test_brain_resolve_choice_aliases(fake_brain):
     assert await fake_brain.resolve_choice("thinking") == "local_thinking"
     assert await fake_brain.resolve_choice("fast") == "local"

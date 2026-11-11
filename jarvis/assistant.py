@@ -12,8 +12,10 @@ from typing import AsyncIterator
 from . import audit, commands, sysinfo
 from .actions import ActionExecutor
 from .aec import EchoReferenceBuffer, NLMSEchoCanceller
+from .agents.orchestrator import AgentOrchestrator
 from .brain import Brain, BrainError, ToolsUnsupportedError
 from .config import DATA, Settings
+from .core.event_bus import EventBus
 from .filesystem import SafeFilesystem
 from .history import History
 from .learning.evaluation import ModelEvaluator
@@ -102,32 +104,6 @@ def _web_tools(allow_page_fetch: bool) -> list[dict]:
     return tools
 
 
-class EventBus:
-    """Fan-out of UI events to SSE subscribers; publish() is safe from any thread."""
-
-    def __init__(self):
-        self.loop: asyncio.AbstractEventLoop | None = None
-        self.subs: set[asyncio.Queue] = set()
-
-    def subscribe(self) -> asyncio.Queue:
-        q: asyncio.Queue = asyncio.Queue(maxsize=200)
-        self.subs.add(q)
-        return q
-
-    def unsubscribe(self, q):
-        self.subs.discard(q)
-
-    def publish(self, ev: dict):
-        def _put():
-            for q in list(self.subs):
-                try:
-                    q.put_nowait(ev)
-                except asyncio.QueueFull:
-                    pass  # a stuck client must not stall the app
-        if self.loop and self.loop.is_running():
-            self.loop.call_soon_threadsafe(_put)
-
-
 class Assistant:
     def __init__(self, settings: Settings, data_dir=DATA, brain: Brain | None = None, search_service: WebSearchService | None = None):
         self.settings = settings
@@ -209,6 +185,7 @@ class Assistant:
         self._last_utt_id = 0
         self._bg: set[asyncio.Task] = set()
         self.warm_status = {"stt": False, "tts": False, "brain": False}
+        self.orchestrator = AgentOrchestrator(settings, bus=self.bus, brain=self.brain, data_dir=self.data_dir)
 
     # ---- lifecycle -----------------------------------------------------------------------------------
     async def start(self):
@@ -216,6 +193,34 @@ class Assistant:
         self.bus.loop = self.loop
         threading.Thread(target=self._warm_speech, name="warm-speech", daemon=True).start()
         self._spawn(self._watch_notes())
+        self._spawn(self._watch_knowledge())
+        self._spawn(self._watch_reminders())
+
+    async def _watch_reminders(self):
+        """Poll scheduled reminders without touching external networks."""
+        while True:
+            try:
+                due = await asyncio.to_thread(self.orchestrator.reminders.poll_due)
+                for rem in due:
+                    if self.settings.tts.enabled and "voice" in (rem.get("channel") or ""):
+                        self.speaker.say(f"Reminder: {rem['title']}")
+            except Exception as e:
+                log.debug("reminder poll skipped: %s", e)
+            await asyncio.sleep(15)
+
+    async def _watch_knowledge(self):
+        """Periodically sync configured local (and if online, remote) knowledge sources without weight modification."""
+        while True:
+            try:
+                if self.settings.learning.enabled and self.settings.learning.automatic_knowledge_updates:
+                    if self.knowledge.list_sources():
+                        res = await self.knowledge.sync()
+                        if res.get("new_documents_found"):
+                            self.bus.publish({"type": "knowledge_updated", **res})
+            except Exception as e:
+                log.debug("periodic knowledge check skipped: %s", e)
+            interval_s = max(300, int(self.settings.learning.update_interval_hours or 24) * 3600)
+            await asyncio.sleep(interval_s)
 
     async def stop(self):
         self.voice.disable()
@@ -223,6 +228,7 @@ class Assistant:
         for t in self._bg:
             t.cancel()
         await self.brain.client.aclose()
+        await self.orchestrator.db.close()
 
     def _on_speaker_state(self, speaking: bool):
         self.bus.publish({"type": "speaking", "on": speaking})
@@ -299,6 +305,9 @@ class Assistant:
         self.training_manager.spec = new.learning
         self.training_scheduler.spec = new.learning
         self.registry.spec = new.learning
+        if hasattr(self, "orchestrator"):
+            self.orchestrator.settings = new
+            self.orchestrator.decision.settings = new
 
     # ---- turns ---------------------------------------------------------------------------------------
     def _schedule_voice_queue(self):
@@ -498,7 +507,7 @@ class Assistant:
             "evaluations": evals,
             "registry": self.registry.summary(),
             "hardware": self.training_manager.hardware_profile(ollama_ps=ollama_ps),
-            "scheduler": self.training_scheduler.evaluate_triggers(self.feedback, self.dataset_builder),
+            "scheduler": self.training_scheduler.get_status_snapshot(self.feedback, self.dataset_builder),
             "audit_recent": self.learning_audit.recent(limit=25),
         }
 

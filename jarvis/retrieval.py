@@ -9,11 +9,11 @@ STOP = set("a an the and or but if of to in on at for with from by is are was we
            "we our do does did what which who how why when where about tell please can could would should have has had not no yes as so "
            "than then there their they them he she his her will just any some jarvis "
            "hello hi hey good morning afternoon evening night thanks thank bye goodbye today well".split())  # greetings are small talk
-TOKEN = re.compile(r"[a-z0-9]+")
+TOKEN = re.compile(r"[a-z0-9]+|[^\x00-\x7f\s.,;:!?()\[\]{}\"'`\-_/\\|@#$%^&*+=~<>]+")
 
 
 def tokens(text: str) -> list[str]:
-    return [t for t in TOKEN.findall(text.lower()) if t not in STOP and len(t) > 1]
+    return [t for t in TOKEN.findall((text or "").lower()) if t not in STOP and len(t) > 1]
 
 
 def search(notes, query: str, k: int = 4, min_score: float = 0.0) -> list[tuple]:

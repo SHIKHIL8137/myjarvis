@@ -1,9 +1,10 @@
 """API router for Automatic Knowledge Updates, Feedback Learning, Datasets, Training Jobs,
 Model Evaluation, and Model Registry / Rollback (Phases 3–8)."""
 from pathlib import Path
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
+from .api_deps import make_assistant_dep
 from .learning.knowledge_pipeline import KnowledgeSourceSpec
 from .learning.training.training_config import TrainingJobConfig
 from .search import SearchOfflineError
@@ -97,26 +98,27 @@ class RollbackIn(BaseModel):
     target_version_id: str | None = None
 
 
-def create_learning_router(a) -> APIRouter:
+def create_learning_router(fallback=None) -> APIRouter:
     router = APIRouter()
+    get_a = make_assistant_dep(fallback)
 
     @router.get("/api/learning/overview")
-    async def overview():
+    async def overview(a=Depends(get_a)):
         return a.learning_overview()
 
     # ---- Knowledge Updates (Phase 3) -----------------------------------------------------------------
     @router.get("/api/learning/knowledge/sources")
-    async def list_knowledge_sources():
+    async def list_knowledge_sources(a=Depends(get_a)):
         return {"sources": a.knowledge.list_sources(), "freshness": a.knowledge.freshness()}
 
     @router.post("/api/learning/knowledge/sources")
-    async def add_knowledge_source(body: KnowledgeSourceIn):
+    async def add_knowledge_source(body: KnowledgeSourceIn, a=Depends(get_a)):
         src = KnowledgeSourceSpec(**body.model_dump())
         a.knowledge.register_source(src)
         return {"ok": True, "source": src.to_dict()}
 
     @router.post("/api/learning/knowledge/ingest")
-    async def ingest_knowledge_text(body: KnowledgeTextIn):
+    async def ingest_knowledge_text(body: KnowledgeTextIn, a=Depends(get_a)):
         res = a.knowledge.ingest_text(
             body.source_id,
             body.name,
@@ -128,37 +130,37 @@ def create_learning_router(a) -> APIRouter:
         return res
 
     @router.post("/api/learning/knowledge/sync")
-    async def sync_knowledge(body: KnowledgeSyncIn):
+    async def sync_knowledge(body: KnowledgeSyncIn, a=Depends(get_a)):
         return await a.knowledge.sync(topic_filter=body.topic, source_id=body.source_id, force=body.force)
 
     @router.post("/api/learning/knowledge/{source_id}/rollback")
-    async def rollback_knowledge(source_id: str, version: int | None = None):
+    async def rollback_knowledge(source_id: str, version: int | None = None, a=Depends(get_a)):
         return a.knowledge.rollback_source(source_id, target_version=version)
 
     @router.get("/api/learning/knowledge/search")
-    async def search_knowledge(q: str, k: int = 5):
+    async def search_knowledge(q: str, k: int = 5, a=Depends(get_a)):
         return {"results": a.knowledge.search(q, k=k)}
 
     # ---- Feedback Engine (Phase 4) -------------------------------------------------------------------
     @router.get("/api/learning/feedback")
-    async def list_feedback(status: str | None = None, category: str | None = None, limit: int = 50):
+    async def list_feedback(status: str | None = None, category: str | None = None, limit: int = 50, a=Depends(get_a)):
         return {"summary": a.feedback.summary(), "records": a.feedback.list_records(status=status, category=category, limit=limit)}
 
     @router.post("/api/learning/feedback")
-    async def create_feedback(body: FeedbackCreateIn):
+    async def create_feedback(body: FeedbackCreateIn, a=Depends(get_a)):
         rec = a.feedback.record(**body.model_dump())
         return {"record": rec.to_dict()}
 
     @router.post("/api/learning/feedback/{feedback_id}/approve")
-    async def approve_feedback(feedback_id: str):
+    async def approve_feedback(feedback_id: str, a=Depends(get_a)):
         return {"record": a.feedback.approve(feedback_id).to_dict()}
 
     @router.post("/api/learning/feedback/{feedback_id}/reject")
-    async def reject_feedback(feedback_id: str):
+    async def reject_feedback(feedback_id: str, a=Depends(get_a)):
         return {"record": a.feedback.reject(feedback_id).to_dict()}
 
     @router.delete("/api/learning/feedback/{feedback_id}")
-    async def delete_feedback(feedback_id: str):
+    async def delete_feedback(feedback_id: str, a=Depends(get_a)):
         ok = a.feedback.delete(feedback_id)
         if not ok:
             raise HTTPException(404, f"Feedback record '{feedback_id}' not found")
@@ -166,7 +168,7 @@ def create_learning_router(a) -> APIRouter:
 
     # ---- Datasets (Phase 5) --------------------------------------------------------------------------
     @router.get("/api/learning/datasets")
-    async def list_datasets():
+    async def list_datasets(a=Depends(get_a)):
         return {
             "sources": a.dataset_sources.list_sources(),
             "datasets": a.dataset_manager.list_datasets(),
@@ -174,7 +176,7 @@ def create_learning_router(a) -> APIRouter:
         }
 
     @router.get("/api/learning/datasets/discover")
-    async def discover_datasets(q: str = "instruction", limit: int = 8):
+    async def discover_datasets(q: str = "instruction", limit: int = 8, a=Depends(get_a)):
         try:
             items = await a.dataset_sources.discover_huggingface(q, limit=limit)
             return {"results": items}
@@ -182,7 +184,7 @@ def create_learning_router(a) -> APIRouter:
             raise HTTPException(503, str(e)) from e
 
     @router.post("/api/learning/datasets/import-local")
-    async def import_local_dataset(body: DatasetImportLocalIn):
+    async def import_local_dataset(body: DatasetImportLocalIn, a=Depends(get_a)):
         snap = a.dataset_manager.import_local_file(
             body.path,
             dataset_id=body.dataset_id,
@@ -193,7 +195,7 @@ def create_learning_router(a) -> APIRouter:
         return {"snapshot": snap}
 
     @router.post("/api/learning/datasets/download")
-    async def download_remote_dataset(body: DatasetDownloadIn):
+    async def download_remote_dataset(body: DatasetDownloadIn, a=Depends(get_a)):
         snap = await a.dataset_manager.download_remote(
             body.url,
             dataset_id=body.dataset_id,
@@ -204,11 +206,11 @@ def create_learning_router(a) -> APIRouter:
         return {"snapshot": snap}
 
     @router.post("/api/learning/datasets/prepare-feedback")
-    async def prepare_feedback_dataset(target_format: str = "messages"):
+    async def prepare_feedback_dataset(target_format: str = "messages", a=Depends(get_a)):
         return a.prepare_training_dataset_from_feedback(target_format=target_format)
 
     @router.post("/api/learning/datasets/process")
-    async def process_dataset(body: DatasetProcessIn):
+    async def process_dataset(body: DatasetProcessIn, a=Depends(get_a)):
         ver_info = a.dataset_manager.get_version(body.dataset_id, body.version)
         if not ver_info:
             raise HTTPException(404, f"Dataset '{body.dataset_id}' not found")
@@ -241,7 +243,7 @@ def create_learning_router(a) -> APIRouter:
 
     # ---- Training Jobs (Phase 5) ---------------------------------------------------------------------
     @router.get("/api/learning/training/jobs")
-    async def list_training_jobs():
+    async def list_training_jobs(a=Depends(get_a)):
         h = await a.brain.health()
         return {
             "hardware": a.training_manager.hardware_profile(ollama_ps=h.get("loaded") or []),
@@ -250,7 +252,7 @@ def create_learning_router(a) -> APIRouter:
         }
 
     @router.post("/api/learning/training/jobs")
-    async def create_training_job(body: TrainingJobCreateIn):
+    async def create_training_job(body: TrainingJobCreateIn, a=Depends(get_a)):
         h = await a.brain.health()
         cfg = TrainingJobConfig(
             base_model=body.base_model or a.brain.spec.model,
@@ -263,47 +265,47 @@ def create_learning_router(a) -> APIRouter:
         return a.training_manager.create_job(cfg, ollama_ps=h.get("loaded") or [])
 
     @router.post("/api/learning/training/jobs/{job_id}/approve")
-    async def approve_training_job(job_id: str):
+    async def approve_training_job(job_id: str, a=Depends(get_a)):
         return a.training_manager.approve_job(job_id, approver="ui_user")
 
     @router.post("/api/learning/training/jobs/{job_id}/start")
-    async def start_training_job(job_id: str):
+    async def start_training_job(job_id: str, a=Depends(get_a)):
         try:
             return a.training_manager.start_job(job_id)
         except PermissionError as e:
             raise HTTPException(403, str(e)) from e
 
     @router.post("/api/learning/training/jobs/{job_id}/pause")
-    async def pause_training_job(job_id: str):
+    async def pause_training_job(job_id: str, a=Depends(get_a)):
         return a.training_manager.pause_job(job_id)
 
     @router.post("/api/learning/training/jobs/{job_id}/resume")
-    async def resume_training_job(job_id: str):
+    async def resume_training_job(job_id: str, a=Depends(get_a)):
         return a.training_manager.resume_job(job_id)
 
     @router.post("/api/learning/training/jobs/{job_id}/cancel")
-    async def cancel_training_job(job_id: str):
+    async def cancel_training_job(job_id: str, a=Depends(get_a)):
         return a.training_manager.cancel_job(job_id)
 
     # ---- Evaluation & Model Registry / Rollback (Phases 6 & 7) ---------------------------------------
     @router.post("/api/learning/evaluate")
-    async def evaluate_models(body: EvaluateIn):
+    async def evaluate_models(body: EvaluateIn, a=Depends(get_a)):
         return await a.run_model_evaluation(candidate_version_id=body.candidate_version_id)
 
     @router.get("/api/learning/evaluations")
-    async def list_evaluations():
+    async def list_evaluations(a=Depends(get_a)):
         return {"evaluations": a.evaluator.list_reports(limit=20)}
 
     @router.get("/api/learning/registry")
-    async def get_registry():
+    async def get_registry(a=Depends(get_a)):
         return a.registry.summary()
 
     @router.post("/api/learning/registry/candidate")
-    async def register_candidate(body: CandidateRegisterIn):
+    async def register_candidate(body: CandidateRegisterIn, a=Depends(get_a)):
         return a.registry.register_candidate(**body.model_dump())
 
     @router.post("/api/learning/registry/{version_id}/promote")
-    async def promote_version(version_id: str):
+    async def promote_version(version_id: str, a=Depends(get_a)):
         try:
             installed = await a.brain.installed()
             return a.registry.promote(version_id, actor="ui_user", installed_ollama_models=installed)
@@ -311,11 +313,10 @@ def create_learning_router(a) -> APIRouter:
             raise HTTPException(403, str(e)) from e
 
     @router.post("/api/learning/registry/rollback")
-    async def rollback_version(body: RollbackIn):
+    async def rollback_version(body: RollbackIn, a=Depends(get_a)):
         try:
             return a.rollback_model(target_version_id=body.target_version_id)
         except PermissionError as e:
             raise HTTPException(403, str(e)) from e
 
     return router
-

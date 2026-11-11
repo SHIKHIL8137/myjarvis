@@ -49,11 +49,11 @@ class NetSampler(threading.Thread):
 def honest_list() -> list[str]:
     """Features that need the internet, read from the code (URLs that are not loopback) plus the setup-time downloads."""
     found = []
-    for f in [ROOT / "server.py", *sorted((ROOT / "jarvis").glob("*.py"))]:
+    for f in [ROOT / "server.py", *sorted((ROOT / "jarvis").rglob("*.py"))]:
         for i, ln in enumerate(f.read_text(encoding="utf-8").splitlines(), 1):
             for u in re.findall(r"https?://[^\s\"')]+", ln):
                 if not re.match(r"https?://(localhost|127\.0\.0\.1|testserver)", u) and not ln.strip().startswith(("#", '"""')):
-                    found.append(f"runtime URL in code: {f.name}:{i} {u}")
+                    found.append(f"runtime URL in code: {f.relative_to(ROOT)}:{i} {u}")
     return found + [
         "LOCAL MODE (default, internet.enabled=false): chat, speech-to-text, translation, text-to-speech, wake word, memory and galaxy are 100% local.",
         "ONLINE ASSISTED MODE (opt-in, internet.enabled=true): same local Qwen model + approved HTTPS search providers (jarvis/search.py) & SSRF-guarded page fetch.",
@@ -74,8 +74,14 @@ def run() -> tuple[bool, list[str]]:
     ext = []
     for f in ("index.html", "style.css", *[f"js/{p.name}" for p in sorted((ROOT / "viewer" / "js").glob("*.js"))]):
         t = (ROOT / "viewer" / f).read_text(encoding="utf-8")
-        ext += [f"{f}: {u}" for u in re.findall(r"""(?:src|href)=["'](https?://[^"']+)|url\((https?://[^)]+)\)""", t) for u in u if u]
-    say(f"static scan of viewer/: {len(ext)} external references {ext or ''}")
+        ext += [f"viewer/{f}: {u}" for u in re.findall(r"""(?:src|href)=["'](https?://[^"']+)|url\((https?://[^)]+)\)""", t) for u in u if u]
+    dist_dir = ROOT / "apps" / "frontend" / "dist"
+    if dist_dir.exists():
+        for p in sorted(dist_dir.rglob("*")):
+            if p.is_file() and p.suffix in (".html", ".css", ".js"):
+                t = p.read_text(encoding="utf-8", errors="ignore")
+                ext += [f"{p.relative_to(ROOT)}: {u}" for u in re.findall(r"""(?:src|href)=["'](https?://[^"']+)|url\((https?://[^)]+)\)""", t) for u in u if u]
+    say(f"static scan of viewer/ & apps/frontend/dist/: {len(ext)} external references {ext or ''}")
     ok &= not ext
 
     pids = server_pids()

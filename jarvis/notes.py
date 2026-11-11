@@ -7,9 +7,11 @@ import time
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
+import uuid
 
 WIKI = re.compile(r"\[\[([^\]|#]+)(?:[|#][^\]]*)?\]\]")
 EXCERPT = 700
+_NOTE_NS = uuid.UUID("a3e1f790-41d5-4d91-9b82-6c7a4d55e102")
 
 
 @dataclass
@@ -22,6 +24,11 @@ class Note:
     excerpt: str
     links: set = field(default_factory=set)  # lowercase titles referenced via [[wikilinks]]
     mtime_ns: int = 0
+    uid: str = ""
+
+    def __post_init__(self):
+        if not self.uid:
+            self.uid = str(uuid.uuid5(_NOTE_NS, self.path))
 
 
 def slugify(text: str, maxlen: int = 60) -> str:
@@ -38,7 +45,7 @@ class NoteStore:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
-        self._sig = None
+        self._sig: tuple[tuple[str, int], ...] | None = None
         self._checked = 0.0
         self.notes: list[Note] = []
         self.version = 0  # bumps on every rebuild; cheap change detector for clients
@@ -96,7 +103,7 @@ class NoteStore:
                 if a.links & b.links:
                     pairs.add((a.id, b.id))
         return {"version": self.version,
-                "nodes": [{"id": n.id, "label": n.title, "group": n.category, "excerpt": n.excerpt, "path": n.path} for n in notes],
+                "nodes": [{"id": n.id, "uid": n.uid, "label": n.title, "group": n.category, "excerpt": n.excerpt, "path": n.path} for n in notes],
                 "links": [{"source": a, "target": b} for a, b in sorted(pairs)]}
 
     # ---- writes: ONE door for new notes -------------------------------------------------------------

@@ -1,10 +1,11 @@
 """API router for personal memory management, disk history search, safe filesystem search/docs,
 permission-gated computer actions, task tracking, and Piper runtime voice controls."""
 from pathlib import Path
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from .actions import ActionPermissionError
+from .api_deps import make_assistant_dep
 from .config import save_overrides
 from .filesystem import FilesystemPermissionError
 from .memory_store import MEMORY_CATEGORIES, infer_memory_category
@@ -47,12 +48,13 @@ class ActionExecuteIn(BaseModel):
     confirmed_token: str | None = None
 
 
-def create_workspace_router(a) -> APIRouter:
+def create_workspace_router(fallback=None) -> APIRouter:
     router = APIRouter()
+    get_a = make_assistant_dep(fallback)
 
     # ---- Voices (Phase 13) ---------------------------------------------------------------------------
     @router.get("/api/voices")
-    async def list_voices():
+    async def list_voices(a=Depends(get_a)):
         voices = a.tts.list_voices()
         return {
             "active": a.settings.tts.voice,
@@ -63,7 +65,7 @@ def create_workspace_router(a) -> APIRouter:
         }
 
     @router.post("/api/voices/switch")
-    async def switch_voice(body: VoiceSwitchIn):
+    async def switch_voice(body: VoiceSwitchIn, a=Depends(get_a)):
         switched = a.tts.switch_voice(body.voice)
         a.settings.tts.voice = switched["name"]
         save_overrides({"tts": {"voice": switched["name"]}})
@@ -71,7 +73,7 @@ def create_workspace_router(a) -> APIRouter:
         return {"ok": True, "voice": switched}
 
     @router.post("/api/voices/rate")
-    async def set_voice_rate(body: VoiceRateIn):
+    async def set_voice_rate(body: VoiceRateIn, a=Depends(get_a)):
         applied = a.tts.set_rate(body.speed)
         a.settings.tts.speed = applied
         save_overrides({"tts": {"speed": applied}})
@@ -79,7 +81,7 @@ def create_workspace_router(a) -> APIRouter:
 
     # ---- Structured Personal Memory & Full History Search (Phase 2) ----------------------------------
     @router.get("/api/memory/items")
-    async def memory_items(category: str | None = None, include_pending: bool = True, q: str | None = None):
+    async def memory_items(category: str | None = None, include_pending: bool = True, q: str | None = None, a=Depends(get_a)):
         if category and category not in MEMORY_CATEGORIES:
             raise HTTPException(422, f"Unsupported memory category '{category}'")
         if q:
@@ -88,7 +90,7 @@ def create_workspace_router(a) -> APIRouter:
         return {"items": [r.to_dict() for r in a.memory_store.list_all(category=category, include_pending=include_pending)]}
 
     @router.post("/api/memory/items")
-    async def create_memory_item(body: MemoryRecordIn):
+    async def create_memory_item(body: MemoryRecordIn, a=Depends(get_a)):
         inferred_cat, inferred_topic = infer_memory_category(body.text)
         cat = body.category or inferred_cat
         if cat not in MEMORY_CATEGORIES:
@@ -100,57 +102,57 @@ def create_workspace_router(a) -> APIRouter:
         return {"record": rec.to_dict(), "created": created}
 
     @router.put("/api/memory/items/{rec_id}")
-    async def update_memory_item(rec_id: str, body: MemoryUpdateIn):
+    async def update_memory_item(rec_id: str, body: MemoryUpdateIn, a=Depends(get_a)):
         rec = a.memory_store.update(rec_id, body.text)
         return {"record": rec.to_dict()}
 
     @router.post("/api/memory/items/{rec_id}/confirm")
-    async def confirm_memory_item(rec_id: str, approved: bool = True):
+    async def confirm_memory_item(rec_id: str, approved: bool = True, a=Depends(get_a)):
         rec = a.memory_store.confirm_pending(rec_id, approved=approved)
         return {"ok": True, "record": rec.to_dict() if rec else None}
 
     @router.delete("/api/memory/items/{rec_id}")
-    async def delete_memory_item(rec_id: str):
+    async def delete_memory_item(rec_id: str, a=Depends(get_a)):
         rec = a.memory_store.delete(rec_id)
         return {"deleted": rec.to_dict()}
 
     @router.post("/api/memory/backup")
-    async def backup_memory():
+    async def backup_memory(a=Depends(get_a)):
         p = a.memory_store.backup()
         return {"ok": True, "backup_file": str(p)}
 
     @router.get("/api/memory/export")
-    async def export_memory():
+    async def export_memory(a=Depends(get_a)):
         return a.memory_store.export_data()
 
     @router.post("/api/memory/restore")
-    async def restore_memory(body: MemoryRestoreIn):
+    async def restore_memory(body: MemoryRestoreIn, a=Depends(get_a)):
         count = a.memory_store.restore(Path(body.backup_file))
         return {"ok": True, "restored": count}
 
     @router.get("/api/history/search")
-    async def history_search(q: str = "", days: int | None = None, limit: int = 15):
+    async def history_search(q: str = "", days: int | None = None, limit: int = 15, a=Depends(get_a)):
         return {"results": a.history.search_disk(q, days=days, limit=limit)}
 
     # ---- Safe Filesystem & Codebase Inspection (Phase 11 & 12) ---------------------------------------
     @router.get("/api/files/roots")
-    async def file_roots():
+    async def file_roots(a=Depends(get_a)):
         return {"roots": [str(p) for p in a.filesystem.allowed_roots()], "allow_write": a.settings.filesystem.allow_write}
 
     @router.get("/api/files/search")
-    async def files_search(q: str = "", ext: str | None = None, content: str | None = None, folders_only: bool = False):
+    async def files_search(q: str = "", ext: str | None = None, content: str | None = None, folders_only: bool = False, a=Depends(get_a)):
         return {"matches": a.filesystem.search(q, ext=ext, content_query=content, folders_only=folders_only)}
 
     @router.get("/api/files/read")
-    async def files_read(path: str, max_chars: int = 8000):
+    async def files_read(path: str, max_chars: int = 8000, a=Depends(get_a)):
         return a.filesystem.read_document(path, max_chars=max_chars)
 
     @router.get("/api/files/inspect")
-    async def files_inspect(path: str | None = None):
+    async def files_inspect(path: str | None = None, a=Depends(get_a)):
         return a.filesystem.inspect_project(path)
 
     @router.post("/api/files/write")
-    async def files_write(body: FileWriteIn):
+    async def files_write(body: FileWriteIn, a=Depends(get_a)):
         action = "modify_file" if body.overwrite else "create_file"
         return a.actions.request_or_execute(
             action,
@@ -160,11 +162,11 @@ def create_workspace_router(a) -> APIRouter:
 
     # ---- Permission-Gated Actions & Task Tracking (Phase 14 & 15) ------------------------------------
     @router.get("/api/actions/pending")
-    async def actions_pending():
+    async def actions_pending(a=Depends(get_a)):
         return {"pending": a.actions.pending_approvals()}
 
     @router.post("/api/actions/execute")
-    async def actions_execute(body: ActionExecuteIn):
+    async def actions_execute(body: ActionExecuteIn, a=Depends(get_a)):
         try:
             return a.actions.request_or_execute(body.action, body.args, confirmed_token=body.confirmed_token)
         except ActionPermissionError as e:
@@ -173,19 +175,19 @@ def create_workspace_router(a) -> APIRouter:
             raise HTTPException(403, str(e)) from e
 
     @router.post("/api/actions/{token}/confirm")
-    async def actions_confirm(token: str):
+    async def actions_confirm(token: str, a=Depends(get_a)):
         return a.actions.confirm(token)
 
     @router.post("/api/actions/{token}/reject")
-    async def actions_reject(token: str):
+    async def actions_reject(token: str, a=Depends(get_a)):
         return a.actions.reject(token)
 
     @router.get("/api/tasks")
-    async def list_tasks(limit: int = 20):
+    async def list_tasks(limit: int = 20, a=Depends(get_a)):
         return {"tasks": a.actions.tasks.list_recent(limit=limit)}
 
     @router.post("/api/tasks/{task_id}/cancel")
-    async def cancel_task(task_id: str):
+    async def cancel_task(task_id: str, a=Depends(get_a)):
         t = a.actions.tasks.cancel(task_id)
         return {"task": t.to_dict()}
 

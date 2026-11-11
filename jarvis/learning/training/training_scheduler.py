@@ -37,6 +37,27 @@ class TrainingScheduler:
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
 
+    def get_status_snapshot(self, feedback: FeedbackStore, builder: DatasetBuilder) -> dict:
+        """Read-only snapshot for GET /overview without side-effect writes or audit appends."""
+        state = self._load()
+        fb_sum = feedback.summary()
+        approved_count = int((fb_sum.get("by_status") or {}).get("approved") or 0)
+        builds = builder.list_builds()
+        latest_build = builds[0] if builds else None
+        latest_sha = latest_build.get("sha256", "") if latest_build else ""
+        dataset_changed = bool(latest_sha and latest_sha != state.get("last_trained_sha"))
+        enough_examples = approved_count >= int(self.spec.minimum_examples)
+        return {
+            "automatic_training_enabled": self.spec.automatic_training,
+            "require_training_approval": self.spec.require_training_approval,
+            "minimum_examples": self.spec.minimum_examples,
+            "approved_feedback_examples": approved_count,
+            "enough_examples": enough_examples,
+            "latest_build_id": latest_build.get("build_id") if latest_build else None,
+            "dataset_changed": dataset_changed,
+            "proposal": state.get("pending_proposal"),
+        }
+
     def evaluate_triggers(self, feedback: FeedbackStore, builder: DatasetBuilder) -> dict:
         state = self._load()
         fb_sum = feedback.summary()

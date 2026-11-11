@@ -29,6 +29,9 @@ PROVIDER_ENV_VARS = {
     "searxng": "JARVIS_SEARXNG_API_KEY",
     "openai": "OPENAI_API_KEY",
     "anthropic": "ANTHROPIC_API_KEY",
+    "openrouter": "OPENROUTER_API_KEY",
+    "gemini": "GEMINI_API_KEY",
+    "huggingface": "HF_TOKEN",
 }
 _LANG_RE = re.compile(r"^(auto|none|[a-z]{2,3}(?:-[A-Za-z]{2,4})?)$")
 
@@ -240,6 +243,52 @@ class ProvidersSpec(BaseModel):
     openai_model: str = "gpt-4o-mini"
     anthropic_base_url: str = "https://api.anthropic.com/v1"
     anthropic_model: str = "claude-3-5-sonnet-latest"
+    openrouter_base_url: str = "https://openrouter.ai/api/v1"
+    openrouter_model: str = "qwen/qwen3-coder:free"
+    gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta"
+    gemini_model: str = "gemini-2.5-flash"
+    huggingface_base_url: str = "https://router.huggingface.co/v1"
+    huggingface_model: str = "Qwen/Qwen2.5-Coder-32B-Instruct"
+    allowed_cloud_hosts: list[str] = Field(
+        default_factory=lambda: [
+            "api.openai.com",
+            "api.anthropic.com",
+            "openrouter.ai",
+            "generativelanguage.googleapis.com",
+            "router.huggingface.co",
+            "huggingface.co",
+        ]
+    )
+
+
+class DatabaseSpec(BaseModel):
+    url: str = ""  # Empty -> local SQLite+WAL (data/jarvis.db); or postgresql+psycopg://...
+    echo: bool = False
+
+
+class GatewaySpec(BaseModel):
+    default_rpm_limit: int = Field(60, ge=1, le=1000)
+    daily_token_budget: int = Field(500_000, ge=1000, le=50_000_000)
+    classifier_confidence_threshold: float = Field(0.75, ge=0.3, le=0.99)
+    enable_llm_classifier: bool = True
+    scrub_outbound_secrets: bool = True
+
+
+class WorkforceSpec(BaseModel):
+    enabled: bool = True
+    opencode_bin: str = "opencode"
+    graphify_bin: str = "graphify"
+    worktree_root_name: str = ".jarvis_worktrees"
+    max_agent_steps: int = Field(16, ge=2, le=60)
+    max_repair_retries: int = Field(2, ge=0, le=5)
+    registered_projects: list[dict] = Field(default_factory=list)
+
+
+class RecoverySpec(BaseModel):
+    backup_dir: str = "data/backups"
+    tier3_dir: str = ""
+    retain_tier1: int = Field(10, ge=2, le=100)
+    retain_tier2: int = Field(14, ge=2, le=100)
 
 
 class LearningSpec(BaseModel):
@@ -290,6 +339,10 @@ class Settings(BaseModel):
     actions: ActionsSpec = ActionsSpec()
     providers: ProvidersSpec = ProvidersSpec()
     learning: LearningSpec = LearningSpec()
+    database: DatabaseSpec = DatabaseSpec()
+    gateway: GatewaySpec = GatewaySpec()
+    workforce: WorkforceSpec = WorkforceSpec()
+    recovery: RecoverySpec = RecoverySpec()
 
     @property
     def notes_path(self) -> Path:
@@ -332,16 +385,10 @@ def save_overrides(patch: dict, overrides_path: Path | None = None) -> None:
     os.replace(tmp, p)
 
 
-# ---- secure API key storage (env vars or gitignored data/secrets.json; never committed or returned to UI) ----
+# ---- secure API key storage (DPAPI encrypted on Windows in gitignored data/secrets.json; never returned to UI) ----
 def _load_secrets_file(secrets_path: Path | None = None) -> dict[str, str]:
-    p = secrets_path or SECRETS_PATH
-    if not p.exists():
-        return {}
-    try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-        return {str(k).lower(): str(v) for k, v in data.items() if isinstance(v, str) and v.strip()}
-    except Exception:
-        return {}
+    from .security.secrets import load_secrets_map
+    return load_secrets_map(secrets_path or SECRETS_PATH)
 
 
 def get_provider_api_key(provider: str, secrets_path: Path | None = None) -> str | None:
@@ -359,6 +406,7 @@ def has_provider_api_key(provider: str, secrets_path: Path | None = None) -> boo
 
 
 def set_provider_api_key(provider: str, key: str, secrets_path: Path | None = None) -> None:
+    from .security.secrets import save_secrets_map
     p_name = (provider or "").strip().lower()
     if p_name not in PROVIDER_ENV_VARS:
         raise ValueError(f"provider {provider!r} does not use an API key")
@@ -366,15 +414,13 @@ def set_provider_api_key(provider: str, key: str, secrets_path: Path | None = No
     if not cleaned:
         raise ValueError("API key must not be empty")
     path = secrets_path or SECRETS_PATH
-    path.parent.mkdir(parents=True, exist_ok=True)
     cur = _load_secrets_file(path)
     cur[p_name] = cleaned
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(cur, indent=2), encoding="utf-8")
-    os.replace(tmp, path)
+    save_secrets_map(path, cur, encrypt_dpapi=True)
 
 
 def delete_provider_api_key(provider: str, secrets_path: Path | None = None) -> None:
+    from .security.secrets import save_secrets_map
     p_name = (provider or "").strip().lower()
     path = secrets_path or SECRETS_PATH
     if not path.exists():
@@ -382,9 +428,7 @@ def delete_provider_api_key(provider: str, secrets_path: Path | None = None) -> 
     cur = _load_secrets_file(path)
     if p_name in cur:
         del cur[p_name]
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(cur, indent=2), encoding="utf-8")
-        os.replace(tmp, path)
+        save_secrets_map(path, cur, encrypt_dpapi=True)
 
 
 def setup_logging() -> None:

@@ -84,10 +84,20 @@ def main():
     except Exception as e:
         check("FAIL", "server up", f"{e}. Start it: .\\start-jarvis.ps1")
         return summary(None)
+    react_dist = ROOT / "apps" / "frontend" / "dist"
     served_ok = True
-    for f in VIEWER_FILES:
-        served_ok &= hashlib.sha256(req("/" + f)).digest() == hashlib.sha256((ROOT / "viewer" / f).read_bytes()).digest()
-    check("PASS" if served_ok else "FAIL", "served files match disk", ", ".join(VIEWER_FILES))
+    served_desc = []
+    if (react_dist / "index.html").exists():
+        served_ok &= hashlib.sha256(req("/index.html")).digest() == hashlib.sha256((react_dist / "index.html").read_bytes()).digest()
+        served_desc.append("apps/frontend/dist/index.html")
+        for f in VIEWER_FILES:
+            served_ok &= hashlib.sha256(req("/legacy/" + f)).digest() == hashlib.sha256((ROOT / "viewer" / f).read_bytes()).digest()
+        served_desc.append(f"/legacy/ ({len(VIEWER_FILES)} files)")
+    else:
+        for f in VIEWER_FILES:
+            served_ok &= hashlib.sha256(req("/" + f)).digest() == hashlib.sha256((ROOT / "viewer" / f).read_bytes()).digest()
+        served_desc.append(", ".join(VIEWER_FILES))
+    check("PASS" if served_ok else "FAIL", "served files match disk", "; ".join(served_desc))
     leaks = []
     for p in ("/config.json", "/preflight.py", "/server.py", "/data/history.jsonl", "/.env", "/notes/learning/Active%20Recall.md"):
         try:
@@ -99,7 +109,12 @@ def main():
     g = jreq("/api/graph")
     check("PASS" if g["nodes"] else "FAIL", "graph data", f"{len(g['nodes'])} nodes, {len(g['links'])} links")
     bad = [f for f in VIEWER_FILES if re.search(r"sk-[A-Za-z0-9]{16,}|PUT-YOUR-KEY|api[_-]?key\s*[:=]\s*[\"'][^\"']{8,}", (ROOT / "viewer" / f).read_text(encoding="utf-8"))]
-    check("FAIL" if bad else "PASS", "no cloud key under viewer/", str(bad) if bad else "clean")
+    if react_dist.exists():
+        for p in react_dist.rglob("*"):
+            if p.is_file() and p.suffix in (".html", ".js", ".css"):
+                if re.search(r"sk-[A-Za-z0-9]{16,}|PUT-YOUR-KEY|api[_-]?key\s*[:=]\s*[\"'][^\"']{8,}", p.read_text(encoding="utf-8", errors="ignore")):
+                    bad.append(str(p.relative_to(ROOT)))
+    check("FAIL" if bad else "PASS", "no cloud key under viewer/ or frontend dist", str(bad) if bad else "clean")
 
     # --- Ollama
     spec = CFG["brains"][CFG["boot_brain"]]
@@ -194,6 +209,10 @@ def main():
         )
         reg = ov.get("registry") or {}
         check("PASS" if reg.get("active_version_id") else "FAIL", "model registry & baseline pointer", f"active={reg.get('active_version_id')}")
+
+        sys_v2 = jreq("/api/v2/system/overview")
+        v2_ok = isinstance(sys_v2, dict) and all(k in sys_v2 for k in ("backups", "db", "documents", "gateway", "memory", "projects", "reminders", "runs"))
+        check("PASS" if v2_ok else "FAIL", "v2 AI OS overview endpoint", f"keys={sorted(sys_v2.keys()) if isinstance(sys_v2, dict) else sys_v2}")
     except Exception as e:
         check("FAIL", "workspace & learning subsystem", str(e))
 
