@@ -5,20 +5,20 @@ which stays in Ollama on `127.0.0.1:11434`.
 
 ```
 browser (viewer/)  --HTTP/SSE-->  jarvis/api.py  -->  Assistant (assistant.py)
-                                                        |-- commands.py    deterministic routes (remember, switch, stop, offline web guard)
-                                                        |-- notes.py       markdown store + graph        retrieval.py  keyword search
-                                                        |-- persona.py     stable system prompts (Local & Online Assisted)
-                                                        |-- history.py     data/history.jsonl
-                                                        |-- brain.py       Ollama client + tool calling   --> 127.0.0.1:11434
-                                                        |-- translator.py  transcript preservation + Whisper/Qwen translation
-                                                        |-- stt.py         faster-whisper (CPU, multilingual) + polyphase resampling
-                                                        |-- tts.py         StreamingSpeechBuffer + Piper + Speaker (BT fallback + echo tap)
-                                                        |-- aec.py         AEC backend check + EchoReferenceBuffer + NLMS delay/ERLE filter
-                                                        |-- wakeword.py    openWakeWord       voice.py  VoiceState state machine + Silero VAD
-                                                        |-- search.py      SearchProvider interface + robots.txt + cache + rate limit
-                                                        |-- netsec.py      hardened HTTPS client (IP pinning, SSRF/redirect/size guards)
-                                                        |-- audit.py       connection log, scoped outbound gate, external audit log
-                                                        `-- sysinfo.py     CPU / RAM / GPU / audio
+                                                        |-- intent.py / commands.py  centralized router (voice/text/actions/learning)
+                                                        |-- memory_store.py  6-category personal memory + duplicate/secret/backup
+                                                        |-- filesystem.py   allowlisted file/codebase search, bounded read, soft .trash
+                                                        |-- actions.py      permission tiers (READ..SYSTEM), confirmations, TaskManager
+                                                        |-- notes.py / retrieval.py  markdown store + 3D graph + keyword retrieval
+                                                        |-- persona.py      stable system prompts + provenance-separated context sections
+                                                        |-- history.py      data/history.jsonl + unbounded on-disk archival search
+                                                        |-- brain.py        Ollama native + tool calling + gated OpenAI/Anthropic adapter
+                                                        |-- translator.py   transcript preservation + Whisper/Qwen translation
+                                                        |-- stt.py / tts.py / aec.py / wakeword.py / voice.py  speech & audio pipeline
+                                                        |-- learning/       knowledge_pipeline.py, feedback.py, evaluation.py
+                                                        |-- learning/training/  dataset pipeline, hardware estimator, PEFT worker, registry, rollback
+                                                        |-- search.py / netsec.py / audit.py  loopback guard & scoped HTTPS gateway
+                                                        `-- sysinfo.py      CPU / RAM / GPU / audio
 ```
 
 | Path | Role |
@@ -73,6 +73,11 @@ browser (viewer/)  --HTTP/SSE-->  jarvis/api.py  -->  Assistant (assistant.py)
 | `POST /memory`, `GET /memory/search`, `GET/PUT/DELETE /notes*`, `GET /graph` | Notes CRUD and 3D graph |
 | `GET/PUT /config` | Safe settings read/write (excludes secrets and brain definitions) |
 | `GET /events`, `GET /drill/connections` | Live SSE stream and connection audit log |
+| `GET/POST/PUT/DELETE /memory/items*`, `/memory/backup`, `/memory/export`, `/memory/restore`, `GET /history/search` | Structured 6-category personal memory & full on-disk conversation search |
+| `GET /files/roots`, `/files/search`, `/files/read`, `/files/inspect`, `POST /files/write` | Allowlisted local filesystem search, project inspection, and gated writes |
+| `GET /actions/pending`, `POST /actions/execute`, `/actions/{token}/confirm|reject`, `GET /tasks*` | Permission-tiered actions (`READ`..`SYSTEM`) & tracked `TaskManager` lifecycle |
+| `GET /voices`, `POST /voices/switch`, `POST /voices/rate` | Runtime Piper voice discovery, hot-switching, and speed control |
+| `GET /learning/overview`, `/learning/knowledge/*`, `/learning/feedback/*`, `/learning/datasets/*`, `/learning/training/*`, `/learning/evaluate`, `/learning/registry/*` | Knowledge updates (RAG index + rollback), feedback curation, validated dataset pipeline, approval-gated LoRA worker, 12-category evaluation, model registry & rollback |
 
 ## Security
 

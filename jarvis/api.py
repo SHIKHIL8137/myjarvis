@@ -12,8 +12,13 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import audit
+from .actions import ActionPermissionError
+from .api_learning import create_learning_router
+from .api_workspace import create_workspace_router
 from .assistant import Assistant
 from .brain import BrainError
+from .filesystem import FilesystemPermissionError
+from .memory_store import infer_memory_category
 from .config import (
     PROVIDER_ENV_VARS,
     ROOT,
@@ -158,6 +163,22 @@ def create_app(settings: Settings | None = None, assistant: Assistant | None = N
     @app.exception_handler(ValueError)
     async def _bad(_, e):
         return JSONResponse({"error": str(e)}, status_code=422)
+
+    @app.exception_handler(ActionPermissionError)
+    async def _perm(_, e):
+        return JSONResponse({"error": str(e)}, status_code=403)
+
+    @app.exception_handler(PermissionError)
+    async def _perm2(_, e):
+        return JSONResponse({"error": str(e)}, status_code=403)
+
+    @app.exception_handler(FilesystemPermissionError)
+    async def _fs_err(_, e):
+        return JSONResponse({"error": str(e)}, status_code=403)
+
+    @app.exception_handler(FileNotFoundError)
+    async def _fnf(_, e):
+        return JSONResponse({"error": str(e)}, status_code=404)
 
     @app.exception_handler(Exception)
     async def _any(_, e):
@@ -401,6 +422,8 @@ def create_app(settings: Settings | None = None, assistant: Assistant | None = N
         a = A()
         related = [n.title for n, s in search(a.store.all(), body.text, 2) if s >= 5.0]
         note = await asyncio.to_thread(a.store.add, body.text, body.category, body.title, related)
+        cat, top = infer_memory_category(body.text)
+        a.memory_store.add(body.text, category=cat, topic=top, title=note.title, note_path=note.path)
         a.bus.publish({"type": "graph_changed", "new": [note.path]})
         return {"id": note.id, "title": note.title, "path": note.path, "category": note.category}
 
@@ -448,6 +471,11 @@ def create_app(settings: Settings | None = None, assistant: Assistant | None = N
             "stt": s.stt.model_dump(),
             "translation": s.translation.model_dump(),
             "internet": s.internet.model_dump(exclude={"allowed_search_hosts"}),
+            "memory": s.memory.model_dump(),
+            "filesystem": s.filesystem.model_dump(),
+            "actions": s.actions.model_dump(),
+            "providers": s.providers.model_dump(),
+            "learning": s.learning.model_dump(),
             "history_turns": s.history_turns,
             "boot_brain": s.boot_brain,
             "offline_enforced": s.offline_enforced,
@@ -462,7 +490,11 @@ def create_app(settings: Settings | None = None, assistant: Assistant | None = N
     @app.put("/api/config")
     async def put_config(request: Request):
         patch = await request.json()
-        allowed = {"tts", "wake", "audio", "stt", "translation", "internet", "history_turns", "boot_brain", "num_ctx"}
+        allowed = {
+            "tts", "wake", "audio", "stt", "translation", "internet",
+            "history_turns", "boot_brain", "num_ctx",
+            "memory", "filesystem", "actions", "providers", "learning",
+        }
         if not isinstance(patch, dict) or set(patch) - allowed:
             raise ValueError("only tts, wake, audio, stt, translation, internet, history_turns, boot_brain and num_ctx can be changed here")
         if "num_ctx" in patch:  # context size of the current brain; Ollama reloads the model with it on the next request
@@ -530,6 +562,9 @@ def create_app(settings: Settings | None = None, assistant: Assistant | None = N
             finally:
                 A().bus.unsubscribe(q)
         return StreamingResponse(gen(), media_type="text/event-stream")
+
+    app.include_router(create_workspace_router(app.state.a))
+    app.include_router(create_learning_router(app.state.a))
 
     vdir = viewer or ROOT / "viewer"
     if vdir.exists():

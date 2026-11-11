@@ -26,16 +26,36 @@ def user_message(
     notes: list[tuple[str, str]],
     today: str,
     web_results: list[dict] | None = None,
+    *,
+    memories: list[tuple[str, str]] | None = None,
+    history_hits: list[str] | None = None,
+    feedback_lessons: list[str] | None = None,
+    knowledge_hits: list[tuple[str, str]] | None = None,
 ) -> str:
-    """Variable part of the prompt. notes = [(title, excerpt)], web_results = [{title, url, snippet, published_date}]."""
-    ctx = "\n\n".join(f"[{t}]\n{x}" for t, x in notes)
-    head = f"Notes:\n{ctx}\n\n" if notes else ""
+    """Variable part of the prompt with separated provenance sections."""
+    sections: list[str] = []
+    if memories:
+        mlines = "\n".join(f"- [{cat}] {txt}" for cat, txt in memories)
+        sections.append(f"Personal memory (private user profile/preferences):\n{mlines}")
+    if history_hits:
+        hlines = "\n".join(f"- {h}" for h in history_hits)
+        sections.append(f"Past conversations:\n{hlines}")
+    if feedback_lessons:
+        flines = "\n".join(f"- {f}" for f in feedback_lessons)
+        sections.append(f"Approved behavioral feedback lessons:\n{flines}")
+    if notes:
+        ctx = "\n\n".join(f"[{t}]\n{x}" for t, x in notes)
+        sections.append(f"Notes:\n{ctx}")
+    if knowledge_hits:
+        klines = "\n\n".join(f"[{src}]\n{chunk}" for src, chunk in knowledge_hits)
+        sections.append(f"Indexed documentation (local knowledge pipeline):\n{klines}")
     if web_results:
         wlines = []
         for i, r in enumerate(web_results, 1):
             dt = f" ({r['published_date']})" if r.get("published_date") else ""
             wlines.append(f"[{i}] {r.get('title', 'Result')}{dt}\nURL: {r.get('url', '')}\nSnippet: {r.get('snippet', '')}")
-        head += "Web search results:\n" + "\n\n".join(wlines) + "\n\n"
+        sections.append("Web search results:\n" + "\n\n".join(wlines))
+    head = ("\n\n".join(sections) + "\n\n") if sections else ""
     return f"{head}Today is {today}.\nUser: {question}"
 
 
@@ -47,6 +67,26 @@ def build_messages(
     *,
     online: bool = False,
     web_results: list[dict] | None = None,
+    memories: list[tuple[str, str]] | None = None,
+    history_hits: list[str] | None = None,
+    feedback_lessons: list[str] | None = None,
+    knowledge_hits: list[tuple[str, str]] | None = None,
 ) -> list[dict]:
     sys_prompt = ONLINE_PERSONA if online else PERSONA
-    return [{"role": "system", "content": sys_prompt}, *history, {"role": "user", "content": user_message(question, notes, today, web_results=web_results)}]
+    return [
+        {"role": "system", "content": sys_prompt},
+        *history,
+        {
+            "role": "user",
+            "content": user_message(
+                question,
+                notes,
+                today,
+                web_results=web_results,
+                memories=memories,
+                history_hits=history_hits,
+                feedback_lessons=feedback_lessons,
+                knowledge_hits=knowledge_hits,
+            ),
+        },
+    ]

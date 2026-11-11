@@ -3,16 +3,34 @@ import asyncio
 import datetime
 import json
 import logging
+from pathlib import Path
 import re
 import threading
 import time
 from typing import AsyncIterator
 
 from . import audit, commands, sysinfo
+from .actions import ActionExecutor
 from .aec import EchoReferenceBuffer, NLMSEchoCanceller
 from .brain import Brain, BrainError, ToolsUnsupportedError
 from .config import DATA, Settings
+from .filesystem import SafeFilesystem
 from .history import History
+from .learning.evaluation import ModelEvaluator
+from .learning.feedback import FeedbackStore
+from .learning.knowledge_pipeline import KnowledgePipeline
+from .learning.training.dataset_builder import DatasetBuilder
+from .learning.training.dataset_cleaner import DatasetCleaner
+from .learning.training.dataset_manager import DatasetManager
+from .learning.training.dataset_sources import DatasetSourceCatalog
+from .learning.training.dataset_validator import DatasetValidator
+from .learning.training.model_registry import ModelRegistry
+from .learning.training.rollback import rollback_active_model
+from .learning.training.training_audit import TrainingAuditLog
+from .learning.training.training_config import TrainingJobConfig
+from .learning.training.training_manager import TrainingManager
+from .learning.training.training_scheduler import TrainingScheduler
+from .memory_store import PersonalMemoryStore
 from .notes import NoteStore
 from .persona import build_messages
 from .retrieval import search
@@ -113,11 +131,48 @@ class EventBus:
 class Assistant:
     def __init__(self, settings: Settings, data_dir=DATA, brain: Brain | None = None, search_service: WebSearchService | None = None):
         self.settings = settings
+        self.data_dir = Path(data_dir)
         audit.set_online_enabled(settings.internet.enabled)
         self.bus = EventBus()
         self.store = NoteStore(settings.notes_path)
+        self.memory_store = PersonalMemoryStore(self.data_dir / "memory" / "records.jsonl", settings.memory)
+        self.filesystem = SafeFilesystem(settings.filesystem)
+        self.actions = ActionExecutor(settings.actions, self.filesystem)
         self.brain = brain or Brain(settings)
-        self.history = History(data_dir / "history.jsonl", settings.history_turns)
+        self.history = History(self.data_dir / "history.jsonl", settings.history_turns)
+
+        online_fn = lambda: bool(self.settings.internet.enabled and audit.is_online_enabled())  # noqa: E731
+        self.knowledge = KnowledgePipeline(settings.learning, data_dir=self.data_dir / "learning" / "knowledge", is_online_fn=online_fn)
+        self.feedback = FeedbackStore(self.data_dir / "learning" / "feedback" / "records.jsonl")
+        self.learning_audit = TrainingAuditLog(self.data_dir / "learning" / "training" / "audit.jsonl")
+        self.dataset_sources = DatasetSourceCatalog(settings.learning, is_online_fn=online_fn)
+        self.dataset_manager = DatasetManager(
+            settings.learning,
+            training_dir=self.data_dir / "learning" / "training",
+            is_online_fn=online_fn,
+            audit_log=self.learning_audit,
+        )
+        self.dataset_validator = DatasetValidator(settings.learning, quarantine_dir=self.data_dir / "learning" / "training" / "quarantine")
+        self.dataset_cleaner = DatasetCleaner(cleaned_dir=self.data_dir / "learning" / "training" / "cleaned")
+        self.dataset_builder = DatasetBuilder(prepared_dir=self.data_dir / "learning" / "training" / "prepared")
+        self.training_manager = TrainingManager(
+            settings.learning,
+            jobs_dir=self.data_dir / "learning" / "training" / "jobs",
+            prepared_dir=self.data_dir / "learning" / "training" / "prepared",
+            audit_log=self.learning_audit,
+        )
+        self.training_scheduler = TrainingScheduler(
+            settings.learning,
+            state_path=self.data_dir / "learning" / "training" / "scheduler_state.json",
+            audit_log=self.learning_audit,
+        )
+        self.evaluator = ModelEvaluator(eval_dir=self.data_dir / "learning" / "evaluations")
+        self.registry = ModelRegistry(
+            settings.learning,
+            registry_path=self.data_dir / "learning" / "registry.json",
+            audit_log=self.learning_audit,
+        )
+        self.registry.ensure_baseline(self.brain.spec.model)
         self.tts = PiperTTS(settings.tts)
         self.echo_ref = EchoReferenceBuffer()
         self.aec = NLMSEchoCanceller()
@@ -229,6 +284,21 @@ class Assistant:
         self.search.spec = new.internet
         self.search.status_state = "offline" if not new.internet.enabled else "ready"
         audit.set_online_enabled(new.internet.enabled)
+        self.settings.memory = new.memory
+        self.memory_store.spec = new.memory
+        self.settings.filesystem = new.filesystem
+        self.filesystem.spec = new.filesystem
+        self.settings.actions = new.actions
+        self.actions.spec = new.actions
+        self.settings.providers = new.providers
+        self.settings.learning = new.learning
+        self.knowledge.spec = new.learning
+        self.dataset_sources.spec = new.learning
+        self.dataset_manager.spec = new.learning
+        self.dataset_validator.spec = new.learning
+        self.training_manager.spec = new.learning
+        self.training_scheduler.spec = new.learning
+        self.registry.spec = new.learning
 
     # ---- turns ---------------------------------------------------------------------------------------
     def _schedule_voice_queue(self):
@@ -334,13 +404,163 @@ class Assistant:
         async for ev in self.stream_turn(prompt_text, speak=True, source="voice"):
             self.bus.publish(ev)
 
-    def _context(self, text: str):
+    def _gather_context(self, text: str) -> dict:
+        """Collect provenance-separated personal memory, history, feedback, notes, and indexed knowledge."""
         q = text
-        if len(text.split()) < 4 and self.history.items:  # short follow-up: borrow the previous question's keywords
+        if len(text.split()) < 4 and self.history.items:  # short follow-up: borrow previous question keywords
             prev = next((m["content"] for m in reversed(self.history.items) if m["role"] == "user"), "")
             q = f"{prev} {text}"
         hits = [(n, s) for n, s in search(self.store.all(), q, self.settings.context_notes) if s >= MIN_SCORE]
-        return hits
+
+        mem_hits = [(r, s) for r, s in self.memory_store.search(text, limit=3) if s >= 1.5]
+        memories_ctx = [(r.category, r.text) for r, _ in mem_hits]
+
+        win = self.history.window()
+        win_contents = {m["content"] for m in win}
+        disk_hits = [h for h in self.history.search_disk(text, limit=4) if h.get("content") not in win_contents][:2]
+        history_ctx = [f"{h['role']}: {h['content'][:180]}" for h in disk_hits]
+
+        fb_hits = self.feedback.retrieve_lessons(text, limit=2)
+        feedback_ctx = [f"{f['topic']}: {f['corrected_response'][:220]}" for f in fb_hits]
+
+        kb_raw = [k for k in self.knowledge.search(text, k=2) if float(k.get("score") or 0) >= 2.0]
+        knowledge_ctx = [(f"{k['title']} [{k['trust']}]", k["content"][:320]) for k in kb_raw]
+
+        return {
+            "hits": hits,
+            "nodes": [n.id for n, _ in hits],
+            "notes_ctx": [(n.title, n.excerpt[:self.settings.context_chars]) for n, _ in hits],
+            "memories_ctx": memories_ctx,
+            "memory_ids": [r.id for r, _ in mem_hits],
+            "history_ctx": history_ctx,
+            "feedback_ctx": feedback_ctx,
+            "knowledge_ctx": knowledge_ctx,
+            "knowledge_sources": [{"source_id": k["source_id"], "title": k["title"], "trust": k["trust"]} for k in kb_raw],
+        }
+
+    def _context(self, text: str):
+        q = text
+        if len(text.split()) < 4 and self.history.items:
+            prev = next((m["content"] for m in reversed(self.history.items) if m["role"] == "user"), "")
+            q = f"{prev} {text}"
+        return [(n, s) for n, s in search(self.store.all(), q, self.settings.context_notes) if s >= MIN_SCORE]
+
+    async def _stream_llm_with_tts(
+        self,
+        msgs: list[dict],
+        *,
+        speak: bool,
+        cancel_event: asyncio.Event | None,
+        answer_out: list[str],
+    ) -> AsyncIterator[dict]:
+        """Single reusable token + sentence-chunked TTS streamer."""
+        chunker = StreamingSpeechBuffer()
+        buf = ""
+        async for piece in self.brain.stream(msgs):
+            if cancel_event and cancel_event.is_set():
+                self.speaker.stop()
+                answer_out.append(buf)
+                yield {"type": "interrupted"}
+                return
+            buf += piece
+            yield {"type": "token", "text": piece}
+            if speak:
+                for sentence in chunker.feed(piece):
+                    self.speaker.say_chunk(sentence, precleaned=True)
+        if speak:
+            for sentence in chunker.flush():
+                self.speaker.say_chunk(sentence, precleaned=True)
+        answer_out.append(buf)
+
+    async def _brain_complete(self, msgs: list[dict]) -> str:
+        parts: list[str] = []
+        async for piece in self.brain.stream(msgs):
+            parts.append(piece)
+        return "".join(parts).strip()
+
+    # ---- learning & training helpers -----------------------------------------------------------------
+    def learning_overview(self) -> dict:
+        sources = self.knowledge.list_sources()
+        builds = self.dataset_builder.list_builds()
+        jobs = self.training_manager.list_jobs()
+        evals = self.evaluator.list_reports(limit=10)
+        ollama_ps: list[dict] = []
+        return {
+            "enabled": self.settings.learning.enabled,
+            "policy": self.settings.learning.model_dump(),
+            "knowledge": self.knowledge.freshness(),
+            "knowledge_sources_count": len(sources),
+            "knowledge_sources": sources,
+            "feedback": self.feedback.summary(),
+            "datasets": self.dataset_manager.list_datasets(),
+            "dataset_builds": builds,
+            "jobs": jobs,
+            "evaluations": evals,
+            "registry": self.registry.summary(),
+            "hardware": self.training_manager.hardware_profile(ollama_ps=ollama_ps),
+            "scheduler": self.training_scheduler.evaluate_triggers(self.feedback, self.dataset_builder),
+            "audit_recent": self.learning_audit.recent(limit=25),
+        }
+
+    def prepare_training_dataset_from_feedback(self, *, target_format: str = "messages") -> dict:
+        snap = self.dataset_manager.import_approved_feedback(self.feedback)
+        report, valid_recs = self.dataset_validator.validate_file(
+            Path(snap["file"]),
+            dataset_id="approved-feedback",
+            version=snap["version"],
+            license_name=snap["license"],
+        )
+        self.dataset_manager.update_stage_report("approved-feedback", snap["version"], "validation", report.to_dict())
+        if not report.approved:
+            raise ValueError("; ".join(report.reasons) or "Dataset failed validation")
+        clean_rep, cleaned = self.dataset_cleaner.clean(valid_recs, dataset_id="approved-feedback", version=snap["version"])
+        self.dataset_manager.update_stage_report("approved-feedback", snap["version"], "cleaning", clean_rep.to_dict())
+        build_id = f"build-feedback-v{snap['version']}-{int(time.time())}"
+        built = self.dataset_builder.build(
+            cleaned,
+            build_id=build_id,
+            dataset_ids=[f"approved-feedback:v{snap['version']}"],
+            target_format=target_format,
+        )
+        return {"snapshot": snap, "validation": report.to_dict(), "cleaning": clean_rep.to_dict(), "build": built.to_dict()}
+
+    async def request_training_job(self, *, dataset_build_id: str, base_model: str | None = None, epochs: int = 1, max_seq_length: int = 512) -> dict:
+        h = await self.brain.health()
+        cfg = TrainingJobConfig(
+            base_model=base_model or self.brain.spec.model,
+            dataset_build_id=dataset_build_id,
+            epochs=epochs,
+            max_seq_length=max_seq_length,
+        )
+        return self.training_manager.create_job(cfg, ollama_ps=h.get("loaded") or [])
+
+    async def run_model_evaluation(self, candidate_version_id: str | None = None) -> dict:
+        reg = self.registry.summary()
+        base_ver = reg["versions"][-1] if reg["versions"] else None
+        base_model = (base_ver or {}).get("base_model") or self.brain.spec.model
+        cand_rec = None
+        if candidate_version_id:
+            cand_rec = next((v for v in reg["versions"] if v["version_id"] == candidate_version_id), None)
+        report = await self.evaluator.evaluate(
+            baseline_model=base_model,
+            baseline_fn=self._brain_complete,
+            candidate_model=cand_rec["ollama_tag"] if cand_rec else None,
+            candidate_fn=self._brain_complete if cand_rec else None,
+        )
+        rep_dict = report.to_dict()
+        if cand_rec:
+            self.registry.attach_evaluation(
+                cand_rec["version_id"],
+                evaluation_id=report.eval_id,
+                score=report.candidate_score if report.candidate_score is not None else report.baseline_score,
+                passed=report.passed,
+                reason="; ".join(report.reasons),
+            )
+        self.learning_audit.record("evaluation_completed", details={"eval_id": report.eval_id, "decision": report.decision, "baseline_score": report.baseline_score})
+        return rep_dict
+
+    def rollback_model(self, target_version_id: str | None = None) -> dict:
+        return rollback_active_model(self.registry, target_version_id=target_version_id, audit_log=self.learning_audit)
 
     async def _execute_tool(self, call: dict) -> tuple[str, list[dict]]:
         """Execute ONLY approved backend web tools; never shell, Python, or unapproved URLs."""
@@ -410,9 +630,10 @@ class Assistant:
                     }
                     return
 
-                hits = self._context(text)
-                nodes = [n.id for n, _ in hits]
-                notes_ctx = [(n.title, n.excerpt[:self.settings.context_chars]) for n, _ in hits]
+                ctx_bundle = self._gather_context(text)
+                hits = ctx_bundle["hits"]
+                nodes = ctx_bundle["nodes"]
+                notes_ctx = ctx_bundle["notes_ctx"]
                 today = datetime.datetime.now().strftime("%A %d %B %Y, %H:%M")
                 online = bool(self.settings.internet.enabled and audit.is_online_enabled())
                 web_sources: list[dict] = []
@@ -421,31 +642,46 @@ class Assistant:
                     "type": "meta",
                     "nodes": nodes,
                     "model": self.brain.spec.model,
+                    "provider": getattr(self.brain, "provider", "ollama"),
                     "sources": [n.title for n, _ in hits],
+                    "memory_ids": ctx_bundle["memory_ids"],
+                    "knowledge_sources": ctx_bundle["knowledge_sources"],
                     "online": online,
                     "web_sources": [],
                 }
 
                 # Local Mode (default): incremental sentence-level streaming LLM -> Piper TTS
                 if not online:
-                    msgs = build_messages(self.history.window(), text, notes_ctx, today, online=False)
-                    answer, chunker = "", StreamingSpeechBuffer()
-                    async for piece in self.brain.stream(msgs):
-                        if cancel_event and cancel_event.is_set():
-                            self.speaker.stop()
-                            yield {"type": "interrupted"}
+                    msgs = build_messages(
+                        self.history.window(),
+                        text,
+                        notes_ctx,
+                        today,
+                        online=False,
+                        memories=ctx_bundle["memories_ctx"] or None,
+                        history_hits=ctx_bundle["history_ctx"] or None,
+                        feedback_lessons=ctx_bundle["feedback_ctx"] or None,
+                        knowledge_hits=ctx_bundle["knowledge_ctx"] or None,
+                    )
+                    out_buf: list[str] = []
+                    async for ev in self._stream_llm_with_tts(msgs, speak=speak, cancel_event=cancel_event, answer_out=out_buf):
+                        yield ev
+                        if ev["type"] == "interrupted":
                             return
-                        answer += piece
-                        yield {"type": "token", "text": piece}
-                        if speak:
-                            for sentence in chunker.feed(piece):
-                                self.speaker.say_chunk(sentence, precleaned=True)
-                    if speak:
-                        for sentence in chunker.flush():
-                            self.speaker.say_chunk(sentence, precleaned=True)
+                    answer = out_buf[-1] if out_buf else ""
                 else:
                     # Online Assisted Mode: try Ollama tool calling first (if enabled), with deterministic fallback
-                    msgs = build_messages(self.history.window(), text, notes_ctx, today, online=True)
+                    msgs = build_messages(
+                        self.history.window(),
+                        text,
+                        notes_ctx,
+                        today,
+                        online=True,
+                        memories=ctx_bundle["memories_ctx"] or None,
+                        history_hits=ctx_bundle["history_ctx"] or None,
+                        feedback_lessons=ctx_bundle["feedback_ctx"] or None,
+                        knowledge_hits=ctx_bundle["knowledge_ctx"] or None,
+                    )
                     tools = _web_tools(self.settings.internet.allow_page_fetch) if self.settings.internet.tool_calling else None
                     answer, chunker = "", StreamingSpeechBuffer()
                     tool_calls: list[dict] = []
@@ -486,19 +722,12 @@ class Assistant:
                             tool_out, srcs = await self._execute_tool(c)
                             web_sources.extend(srcs)
                             msgs.append({"role": "tool", "content": tool_out})
-                        async for piece in self.brain.stream(msgs):
-                            if cancel_event and cancel_event.is_set():
-                                self.speaker.stop()
-                                yield {"type": "interrupted"}
+                        out_buf = []
+                        async for ev in self._stream_llm_with_tts(msgs, speak=speak, cancel_event=cancel_event, answer_out=out_buf):
+                            yield ev
+                            if ev["type"] == "interrupted":
                                 return
-                            answer += piece
-                            yield {"type": "token", "text": piece}
-                            if speak:
-                                for sentence in chunker.feed(piece):
-                                    self.speaker.say_chunk(sentence, precleaned=True)
-                        if speak:
-                            for sentence in chunker.flush():
-                                self.speaker.say_chunk(sentence, precleaned=True)
+                        answer = out_buf[-1] if out_buf else ""
                     elif (not tools_supported or not answer) or needs_web_intent(text, has_notes=bool(hits)):
                         if not tools_supported or needs_web_intent(text, has_notes=bool(hits)):
                             q = extract_web_query(text)
@@ -510,7 +739,18 @@ class Assistant:
                             try:
                                 res = await self.search.search(q)
                                 web_sources = res["results"]
-                                msgs = build_messages(self.history.window(), text, notes_ctx, today, online=True, web_results=web_sources)
+                                msgs = build_messages(
+                                    self.history.window(),
+                                    text,
+                                    notes_ctx,
+                                    today,
+                                    online=True,
+                                    web_results=web_sources,
+                                    memories=ctx_bundle["memories_ctx"] or None,
+                                    history_hits=ctx_bundle["history_ctx"] or None,
+                                    feedback_lessons=ctx_bundle["feedback_ctx"] or None,
+                                    knowledge_hits=ctx_bundle["knowledge_ctx"] or None,
+                                )
                             except SearchError as e:
                                 msgs = build_messages(
                                     self.history.window(),
@@ -519,20 +759,17 @@ class Assistant:
                                     today,
                                     online=True,
                                     web_results=[{"title": "Web search error", "url": "", "snippet": str(e)}],
+                                    memories=ctx_bundle["memories_ctx"] or None,
+                                    history_hits=ctx_bundle["history_ctx"] or None,
+                                    feedback_lessons=ctx_bundle["feedback_ctx"] or None,
+                                    knowledge_hits=ctx_bundle["knowledge_ctx"] or None,
                                 )
-                            async for piece in self.brain.stream(msgs):
-                                if cancel_event and cancel_event.is_set():
-                                    self.speaker.stop()
-                                    yield {"type": "interrupted"}
+                            out_buf = []
+                            async for ev in self._stream_llm_with_tts(msgs, speak=speak, cancel_event=cancel_event, answer_out=out_buf):
+                                yield ev
+                                if ev["type"] == "interrupted":
                                     return
-                                answer += piece
-                                yield {"type": "token", "text": piece}
-                                if speak:
-                                    for sentence in chunker.feed(piece):
-                                        self.speaker.say_chunk(sentence, precleaned=True)
-                            if speak:
-                                for sentence in chunker.flush():
-                                    self.speaker.say_chunk(sentence, precleaned=True)
+                            answer = out_buf[-1] if out_buf else ""
                         else:
                             if speak and answer.strip():
                                 self.speaker.say(answer)
@@ -559,6 +796,8 @@ class Assistant:
                     "answer": answer,
                     "nodes": nodes,
                     "paths": [n.path for n, _ in hits],
+                    "memory_ids": ctx_bundle["memory_ids"],
+                    "knowledge_sources": ctx_bundle["knowledge_sources"],
                     "web_sources": uniq_sources,
                     "command": None,
                     "ok": True,
@@ -596,6 +835,7 @@ class Assistant:
             "brain": {
                 "key": self.brain.current,
                 "model": self.brain.spec.model,
+                "provider": getattr(self.brain, "provider", "ollama"),
                 "thinking": self.brain.spec.thinking,
                 "num_ctx": self.brain.spec.num_ctx,
             },
@@ -626,8 +866,16 @@ class Assistant:
                 **{f"{k}_warm": v for k, v in self.warm_status.items()},
             },
             "notes": len(self.store.all()),
+            "memory": {"count": len(self.memory_store.list_all(include_pending=False)), "pending": len([r for r in self.memory_store.list_all(include_pending=True) if not r.confirmed])},
+            "tasks": {"recent": self.actions.tasks.list_recent(limit=5), "pending_approvals": len(self.actions.pending_approvals())},
+            "learning": {
+                "enabled": self.settings.learning.enabled,
+                "kb_chunks": self.knowledge.freshness().get("kb_chunks", 0),
+                "feedback": self.feedback.summary().get("by_status"),
+                "active_version_id": self.registry.summary().get("active_version_id"),
+            },
             "activity": self.activity,
-            "tts": {"enabled": self.settings.tts.enabled, "voice": self.settings.tts.voice},
+            "tts": {"enabled": self.settings.tts.enabled, "voice": self.settings.tts.voice, "speed": self.settings.tts.speed, "voices": len(self.tts.list_voices())},
             "offline_enforced": self.settings.offline_enforced,
             "mode": self.settings.mode,
             "internet": self.search.status(),

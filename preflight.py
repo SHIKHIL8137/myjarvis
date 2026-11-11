@@ -16,7 +16,7 @@ ROOT = Path(__file__).parent
 CFG = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
 BASE = f"http://127.0.0.1:{CFG['port']}"
 results = []
-VIEWER_FILES = ("index.html", "style.css", "js/api.js", "js/md.js", "js/galaxy.js", "js/panels.js", "js/main.js")
+VIEWER_FILES = ("index.html", "style.css", "js/api.js", "js/md.js", "js/galaxy.js", "js/panels.js", "js/learning.js", "js/main.js")
 
 
 def check(status, name, detail=""):
@@ -166,6 +166,36 @@ def main():
         check("PASS" if m.get("error") is None and st == "listening" else "WARN", "microphone opens and releases", f"state while on={st}, error={m.get('error')}")
     except Exception as e:
         check("WARN", "microphone", str(e))
+
+    # --- Phase 18 personal assistant, workspace, permissions, and learning pipeline checks
+    try:
+        mem = jreq("/api/memory/items")
+        check("PASS" if "items" in mem else "FAIL", "personal memory store", f"{len(mem.get('items', []))} items")
+        fs = jreq("/api/files/search?q=")
+        check("PASS" if "matches" in fs else "FAIL", "safe filesystem search", f"{len(fs.get('matches', []))} files in allowed roots")
+        # Permission enforcement check (outside root must return 403/400)
+        try:
+            jreq("/api/files/read?path=C:/Windows/System32/drivers/etc/hosts")
+            check("FAIL", "filesystem traversal guard", "outside root was allowed")
+        except urllib.error.HTTPError as he:
+            check("PASS" if he.code in (400, 403, 404) else "FAIL", "filesystem traversal guard", f"blocked with HTTP {he.code}")
+
+        v = jreq("/api/voices")
+        check("PASS" if v.get("voices") else "WARN", "Piper voice discovery", f"{len(v.get('voices', []))} voices (active={v.get('active')})")
+
+        ov = jreq("/api/learning/overview")
+        hw = ov.get("hardware") or {}
+        caps = hw.get("capabilities") or {}
+        check("PASS", "learning overview & knowledge index", f"chunks={ov.get('knowledge', {}).get('kb_chunks', 0)}, sources={ov.get('knowledge_sources_count', 0)}")
+        check(
+            "PASS" if caps.get("ready_for_peft_lora") else "WARN",
+            "optional LoRA training runtime",
+            "ready" if caps.get("ready_for_peft_lora") else f"missing optional pkgs: {', '.join(caps.get('missing_required', []))}; RAG + Feedback active",
+        )
+        reg = ov.get("registry") or {}
+        check("PASS" if reg.get("active_version_id") else "FAIL", "model registry & baseline pointer", f"active={reg.get('active_version_id')}")
+    except Exception as e:
+        check("FAIL", "workspace & learning subsystem", str(e))
 
     # --- network drill
     import drill

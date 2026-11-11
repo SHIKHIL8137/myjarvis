@@ -27,6 +27,9 @@ Logs: `logs\jarvis.log` (application), `logs\server.err` (startup errors), and `
 | 403 "missing X-Jarvis header" on API calls | Include `X-Jarvis: 1` header on POST/PUT/DELETE requests |
 | 403 "forbidden host" | Open the app as `http://127.0.0.1:4700/` or `http://localhost:4700/` |
 | A note was deleted by mistake | It is in `notes\.trash\`. Move the file back into a category folder |
+| Local fine-tuning job reports `blocked` (`missing optional packages`) | Intentional: `.venv` does not bundle heavy training packages (`torch`, `transformers`, `peft`), and 4B QLoRA exceeds 4 GB VRAM alongside Ollama. Keep RAG Knowledge Pipeline + Feedback Learning active locally or configure a GPU environment for smaller LoRA targets |
+| Filesystem read/search returns 403 Permission Denied | Path falls outside `filesystem.allowed_roots` or targets sensitive/excluded files (`.env`, `.git`, keys, system folders) |
+| Model promotion returns 403 (`evaluation is required`) | Run the fixed 12-category evaluation (`Run Evaluation`) first, and verify Ollama compatibility (`peft_lora` directories must be converted to GGUF/Modelfile before Ollama can load them) |
 
 ## Hardware Limitations (Ryzen 5 5600H + GTX 1650 4 GB + 16 GB RAM)
 - **4 GB VRAM budget**: `qwen3:4b-instruct` (~2.2 GB in VRAM + CPU split) occupies most of the GTX 1650, so Whisper runs on CPU (`int8`, 6 threads) and Piper runs on CPU.

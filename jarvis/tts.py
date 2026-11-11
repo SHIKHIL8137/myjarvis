@@ -20,16 +20,21 @@ SENT = re.compile(r"(?<=[.!?।॥…])\s+")
 _ABBR = re.compile(r"\b(?:Mr|Mrs|Ms|Dr|Prof|Sr|Jr|St|vs|etc|e\.g|i\.e|Fig|No|v\d+(?:\.\d+)?)\.$", re.I)
 
 
+def _strip_markdown_and_emoji(text: str) -> str:
+    t = re.sub(r"`([^`]*)`", r"\1", text)
+    t = re.sub(r"!?\[([^\]]*)\]\([^)]*\)", r"\1", t)
+    t = re.sub(r"https?://\S+", "", t)
+    t = EMOJI.sub("", t)
+    t = re.sub(r"(?m)^\s*(#{1,6}|[-*+>]|\d+[.)])\s+", "", t)
+    t = re.sub(r"[*_~#|]+", "", t)
+    return t
+
+
 def clean_for_speech(text: str) -> str:
     """Strip everything a human would not say: code, markdown, emoji, URLs."""
     had_code = "```" in text
     t = re.sub(r"```.*?(```|$)", " ", text, flags=re.S)
-    t = re.sub(r"`([^`]*)`", r"\1", t)
-    t = re.sub(r"!?\[([^\]]*)\]\([^)]*\)", r"\1", t)
-    t = re.sub(r"https?://\S+", "", t)
-    t = EMOJI.sub("", t)
-    t = re.sub(r"^\s*(#{1,6}|[-*+>]|\d+[.)])\s+", "", t, flags=re.M)
-    t = re.sub(r"[*_~#|]+", "", t)
+    t = _strip_markdown_and_emoji(t)
     t = re.sub(r"\s+", " ", t)
     t = re.sub(r"\s+([.,!?;:])", r"\1", t).strip()
     if had_code:
@@ -125,12 +130,7 @@ class StreamingSpeechBuffer:
         return out
 
     def _clean_piece(self, s: str) -> str:
-        t = re.sub(r"`([^`]*)`", r"\1", s)
-        t = re.sub(r"!?\[([^\]]*)\]\([^)]*\)", r"\1", t)
-        t = re.sub(r"https?://\S+", "", t)
-        t = EMOJI.sub("", t)
-        t = re.sub(r"(?m)^\s*(#{1,6}|[-*+>]|\d+[.)])\s+", "", t)
-        t = re.sub(r"[*_~#|]+", "", t)
+        t = _strip_markdown_and_emoji(s)
         t = re.sub(r"\n{2,}", ". ", t)
         t = re.sub(r"\s+", " ", t)
         return t
@@ -204,6 +204,10 @@ class StreamingSpeechBuffer:
         return self._emit_ready(flush=True)
 
 
+_VOICE_POOL: dict[str, tuple[object, threading.Lock]] = {}
+_POOL_LOCK = threading.Lock()
+
+
 class PiperTTS:
     def __init__(self, spec: TTSSpec):
         self.spec = spec
@@ -215,12 +219,75 @@ class PiperTTS:
     def ready(self) -> bool:
         return (ROOT / "models" / "piper" / f"{self.spec.voice}.onnx").exists()
 
+    @classmethod
+    def list_voices(cls) -> list[dict]:
+        """Discover installed Piper ONNX voices and parse language/speaker/quality metadata."""
+        import json as _json
+        pdir = ROOT / "models" / "piper"
+        if not pdir.exists():
+            return []
+        voices = []
+        for p in sorted(pdir.glob("*.onnx")):
+            stem = p.stem
+            parts = stem.split("-")
+            lang = parts[0] if len(parts) >= 1 else "unknown"
+            speaker = parts[1] if len(parts) >= 2 else stem
+            quality = parts[2] if len(parts) >= 3 else "standard"
+            sr = 22050
+            cfg_file = p.with_suffix(".onnx.json")
+            if cfg_file.exists():
+                try:
+                    meta = _json.loads(cfg_file.read_text(encoding="utf-8"))
+                    sr = int(meta.get("audio", {}).get("sample_rate") or sr)
+                    lang_info = meta.get("language", {})
+                    if isinstance(lang_info, dict) and lang_info.get("code"):
+                        lang = lang_info["code"]
+                except Exception:
+                    pass
+            voices.append({"name": stem, "language": lang, "speaker": speaker, "quality": quality, "sample_rate": sr, "ready": True})
+        return voices
+
+    def switch_voice(self, query: str) -> dict:
+        """Select an installed Piper voice by exact name, speaker, or language substring."""
+        q = (query or "").strip().lower()
+        avail = self.list_voices()
+        if not avail:
+            raise FileNotFoundError("No Piper voices are installed under models/piper/")
+        match = next((v for v in avail if v["name"].lower() == q), None)
+        if not match:
+            match = next((v for v in avail if q and (v["speaker"].lower() == q or q in v["name"].lower() or q in v["language"].lower())), None)
+        if not match:
+            raise KeyError(f"Voice {query!r} not found. Available: {', '.join(v['name'] for v in avail)}")
+        with self._lock:
+            self.spec.voice = match["name"]
+            self._voice = None  # force clean load on next synthesis
+        return {**match, "speed": self.spec.speed, "current": True}
+
+    def set_rate(self, speed: float) -> float:
+        if not 0.5 <= float(speed) <= 2.0:
+            raise ValueError("Speaking rate must be between 0.5 and 2.0")
+        self.spec.speed = round(float(speed), 2)
+        return self.spec.speed
+
+    def health(self) -> dict:
+        return {"ready": self.ready, "voice": self.spec.voice, "speed": self.spec.speed, "enabled": self.spec.enabled, "installed_count": len(self.list_voices())}
+
     def load(self):
         with self._lock:
+            voice_key = self.spec.voice
+            with _POOL_LOCK:
+                pooled = _VOICE_POOL.get(voice_key)
+            if pooled is not None:
+                self._voice = pooled[0]
+                return self._voice
             if self._voice is None:
                 from piper import PiperVoice
-                self._voice = PiperVoice.load(ROOT / "models" / "piper" / f"{self.spec.voice}.onnx")
-                log.info("piper voice loaded: %s", self.spec.voice)
+                v = PiperVoice.load(ROOT / "models" / "piper" / f"{voice_key}.onnx")
+                with _POOL_LOCK:
+                    if voice_key not in _VOICE_POOL:
+                        _VOICE_POOL[voice_key] = (v, threading.Lock())
+                    self._voice = _VOICE_POOL[voice_key][0]
+                log.info("piper voice loaded: %s", voice_key)
         return self._voice
 
     def synth(self, text: str) -> tuple[int, np.ndarray]:
@@ -232,9 +299,11 @@ class PiperTTS:
             with wave.open(str(f)) as w:
                 return w.getframerate(), np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16)
         v = self.load()
+        with _POOL_LOCK:
+            v_lock = _VOICE_POOL.get(self.spec.voice, (v, self._lock))[1]
         cfg = SynthesisConfig(length_scale=1.0 / self.spec.speed)
         parts, sr = [], 22050
-        with self._lock:  # Piper voices are not thread-safe
+        with v_lock:  # Piper voices are not thread-safe
             for ch in v.synthesize(text, syn_config=cfg):
                 sr = ch.sample_rate
                 parts.append(ch.audio_int16_array)

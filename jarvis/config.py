@@ -27,6 +27,8 @@ PROVIDER_ENV_VARS = {
     "brave": "JARVIS_BRAVE_API_KEY",
     "serper": "JARVIS_SERPER_API_KEY",
     "searxng": "JARVIS_SEARXNG_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
 }
 _LANG_RE = re.compile(r"^(auto|none|[a-z]{2,3}(?:-[A-Za-z]{2,4})?)$")
 
@@ -202,6 +204,70 @@ class InternetSpec(BaseModel):
         return v.rstrip("/")
 
 
+class MemorySpec(BaseModel):
+    enabled: bool = True
+    duplicate_threshold: float = Field(0.85, ge=0.5, le=1.0)
+    confirm_inferred: bool = True
+    max_temporary_items: int = Field(30, ge=5, le=200)
+    backup_dir: str = "data/memory/backups"
+
+
+class FilesystemSpec(BaseModel):
+    allowed_roots: list[str] = Field(default_factory=lambda: [str(ROOT / "notes")])
+    excluded_dirs: list[str] = Field(default_factory=lambda: [".git", ".venv", "venv", "node_modules", "__pycache__", ".pytest_cache", ".trash", "Windows", "Program Files", "System32"])
+    max_file_bytes: int = Field(512_000, ge=10_000, le=5_000_000)
+    max_results: int = Field(40, ge=5, le=200)
+    allow_write: bool = True
+
+
+class ActionsSpec(BaseModel):
+    enabled: bool = True
+    allowed_apps: dict[str, list[str]] = Field(default_factory=lambda: {
+        "notepad": ["notepad.exe"],
+        "calculator": ["calc.exe"],
+        "calc": ["calc.exe"],
+        "explorer": ["explorer.exe"],
+        "vscode": ["code"],
+        "code": ["code"],
+    })
+    allowed_commands: list[str] = Field(default_factory=lambda: ["pytest", "python", "git status", "ollama list", "ollama ps"])
+    confirm_levels: list[str] = Field(default_factory=lambda: ["MODIFY", "DESTRUCTIVE", "SYSTEM"])
+
+
+class ProvidersSpec(BaseModel):
+    allow_cloud: bool = False  # Never silently switch to cloud in Local Mode
+    openai_base_url: str = "https://api.openai.com/v1"
+    openai_model: str = "gpt-4o-mini"
+    anthropic_base_url: str = "https://api.anthropic.com/v1"
+    anthropic_model: str = "claude-3-5-sonnet-latest"
+
+
+class LearningSpec(BaseModel):
+    enabled: bool = True
+    automatic_knowledge_updates: bool = True
+    automatic_feedback_collection: bool = True
+    automatic_training: bool = False
+    require_training_approval: bool = True
+    minimum_examples: int = Field(500, ge=1, le=100_000)
+    evaluation_required: bool = True
+    auto_promote: bool = False
+    rollback_enabled: bool = True
+    require_verified_license: bool = True
+    allowed_licenses: list[str] = Field(default_factory=lambda: [
+        "apache-2.0", "mit", "bsd-3-clause", "bsd-2-clause", "cc-by-4.0", "cc-by-sa-4.0", "cc0-1.0", "unlicense", "isc",
+    ])
+    allowed_knowledge_hosts: list[str] = Field(default_factory=lambda: [
+        "huggingface.co", "datasets-server.huggingface.co", "docs.python.org", "raw.githubusercontent.com",
+    ])
+    knowledge_sources: list[dict] = Field(default_factory=list)
+    dataset_sources: list[dict] = Field(default_factory=list)
+    max_download_bytes: int = Field(50_000_000, ge=100_000, le=500_000_000)
+    update_interval_hours: int = Field(24, ge=1, le=720)
+    embedding_model: str = ""  # Optional Ollama embedding tag e.g. "nomic-embed-text"
+    training_backend: str = "peft_lora"  # "peft_lora" | "qlora" | "remote"
+    remote_worker_url: str = ""
+
+
 class Settings(BaseModel):
     model_config = ConfigDict(extra="allow")
     host: str = "127.0.0.1"
@@ -219,6 +285,11 @@ class Settings(BaseModel):
     wake: WakeSpec = WakeSpec()
     audio: AudioSpec = AudioSpec()
     internet: InternetSpec = InternetSpec()
+    memory: MemorySpec = MemorySpec()
+    filesystem: FilesystemSpec = FilesystemSpec()
+    actions: ActionsSpec = ActionsSpec()
+    providers: ProvidersSpec = ProvidersSpec()
+    learning: LearningSpec = LearningSpec()
 
     @property
     def notes_path(self) -> Path:

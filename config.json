@@ -41,7 +41,7 @@
     "min_silence_duration_ms": 450,
     "min_speech_duration_ms": 120,
     "speech_pad_ms": 300,
-    "vocab_hints": "Jarvis, Ollama, FastAPI, VRAM, quantization",
+    "vocab_hints": "Jarvis, sir, Ollama, FastAPI, VRAM, quantization",
     "preserve_punctuation": true
   },
   "translation": {
@@ -89,6 +89,17 @@
     "max_redirects": 3,
     "respect_robots": true,
     "tool_calling": true
+  },
+  "learning": {
+    "enabled": true,
+    "automatic_knowledge_updates": true,
+    "automatic_feedback_collection": true,
+    "automatic_training": false,
+    "require_training_approval": true,
+    "minimum_examples": 500,
+    "evaluation_required": true,
+    "auto_promote": false,
+    "rollback_enabled": true
   },
   "min_free_ram_gb": 2.0,
   "min_vram_gb": 3.0

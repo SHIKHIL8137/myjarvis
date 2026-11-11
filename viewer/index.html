@@ -52,6 +52,8 @@
   <span class="sep"></span>
   <button id="v-notes" aria-controls="notes">Notes</button>
   <button id="v-chat" aria-controls="chat">Chat</button>
+  <button id="v-learning" aria-controls="learning">Learning</button>
+  <button id="v-workspace" aria-controls="workspace">Memory &amp; Files</button>
   <button id="v-settings" aria-controls="settings">System</button>
 </nav>
 
@@ -166,7 +168,7 @@
         </select></label>
         <label class="check"><input type="checkbox" id="s-web-fetch"> Allow webpage content retrieval</label>
         <label class="check"><input type="checkbox" id="s-web-tools"> Model tool calling (with fallback)</label>
-        <label id="s-searxng-row" hidden>SearXNG URL <input id="s-searxng-url" type="url" placeholder="https://search.example.org"></label>
+        <label id="s-searxng-row" hidden>SearXNG URL <input id="s-searxng-url" type="url" placeholder="SearXNG HTTPS endpoint"></label>
         <label>Provider API key
           <span class="inline-row">
             <input id="s-api-key" type="password" placeholder="Stored locally, never returned" autocomplete="new-password">
@@ -254,6 +256,38 @@
       </div>
     </div>
   </div>
+</section>
+
+<section id="learning" class="drawer glass" hidden aria-label="Brain and Learning Dashboard">
+  <header>
+    <h3>Brain &amp; Learning</h3>
+    <div class="l-tabs">
+      <button type="button" data-ltab="overview" aria-pressed="true">Overview</button>
+      <button type="button" data-ltab="knowledge" aria-pressed="false">Knowledge</button>
+      <button type="button" data-ltab="datasets" aria-pressed="false">Training Data</button>
+      <button type="button" data-ltab="training" aria-pressed="false">Training Jobs</button>
+      <button type="button" data-ltab="evaluation" aria-pressed="false">Evaluation</button>
+      <button type="button" data-ltab="registry" aria-pressed="false">Versions</button>
+    </div>
+    <span class="grow"></span>
+    <button class="ghost close" aria-label="Close">×</button>
+  </header>
+  <div id="l-body" class="l-body"></div>
+</section>
+
+<section id="workspace" class="drawer glass" hidden aria-label="Personal Memory, Files and Actions">
+  <header>
+    <h3>Memory &amp; Workspace</h3>
+    <div class="l-tabs">
+      <button type="button" data-wtab="memory" aria-pressed="true">Personal Memory</button>
+      <button type="button" data-wtab="history" aria-pressed="false">History</button>
+      <button type="button" data-wtab="files" aria-pressed="false">Local Files</button>
+      <button type="button" data-wtab="actions" aria-pressed="false">Actions &amp; Tasks</button>
+    </div>
+    <span class="grow"></span>
+    <button class="ghost close" aria-label="Close">×</button>
+  </header>
+  <div id="w-body" class="l-body"></div>
 </section>
 
 <div id="toast" role="alert" hidden></div>

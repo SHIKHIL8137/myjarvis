@@ -8,7 +8,9 @@ from typing import AsyncIterator
 
 import httpx
 
-from .config import BrainSpec, Settings
+from . import audit
+from .config import BrainSpec, Settings, get_provider_api_key, has_provider_api_key
+from .netsec import NetworkSecurityError, safe_request
 
 log = logging.getLogger("jarvis.brain")
 
@@ -70,6 +72,27 @@ class Brain:
     def host(self) -> str:
         return self.spec.base_url.rsplit("/v1", 1)[0]
 
+    @property
+    def provider(self) -> str:
+        p = getattr(self.spec, "provider", None)
+        if p:
+            return str(p).lower()
+        if str(self.current).startswith("openai:"):
+            return "openai"
+        if str(self.current).startswith("anthropic:"):
+            return "anthropic"
+        return "ollama"
+
+    def _cloud_allowed(self, prov: str) -> str:
+        if self.settings.offline_enforced and not (self.settings.internet.enabled and audit.is_online_enabled()):
+            raise BrainError(f"Cloud model {prov!r} is blocked in Local Mode. Enable Online Assisted Mode and providers.allow_cloud first.")
+        if not self.settings.providers.allow_cloud:
+            raise BrainError(f"Cloud provider {prov!r} is disabled (providers.allow_cloud=false). Local mode remains active.")
+        key = get_provider_api_key(prov)
+        if not key:
+            raise BrainError(f"API key for cloud provider {prov!r} is not configured.")
+        return key
+
     # ---- ollama state --------------------------------------------------------------------------------
     async def _get(self, path: str, timeout: float = 5):
         try:
@@ -93,16 +116,80 @@ class Brain:
             return {"up": False, "error": str(e)}
 
     async def catalogue(self) -> list[dict]:
-        """Every selectable model: configured brains first, then other installed Ollama models."""
+        """Every selectable model: configured local brains, installed Ollama models, and optional cloud entries."""
         inst = await self.installed()
-        out = [{"key": k, "model": s.model, "thinking": s.thinking, "installed": s.model in inst, "current": k == self.current}
-               for k, s in self.settings.brains.items()]
+        out = [{
+            "key": k,
+            "model": s.model,
+            "provider": getattr(s, "provider", "ollama"),
+            "local": True,
+            "thinking": s.thinking,
+            "tools": True,
+            "installed": s.model in inst,
+            "current": k == self.current,
+        } for k, s in self.settings.brains.items()]
         known = {s.model for s in self.settings.brains.values()}
-        out += [{"key": m, "model": m, "thinking": False, "installed": True, "current": m == self.current} for m in inst if m not in known]
+        out += [{
+            "key": m,
+            "model": m,
+            "provider": "ollama",
+            "local": True,
+            "thinking": False,
+            "tools": True,
+            "installed": True,
+            "current": m == self.current,
+        } for m in inst if m not in known]
+
+        p = self.settings.providers
+        if has_provider_api_key("openai"):
+            k = f"openai:{p.openai_model}"
+            out.append({"key": k, "model": p.openai_model, "provider": "openai", "local": False, "thinking": False, "tools": True,
+                        "installed": bool(p.allow_cloud and self.settings.internet.enabled), "current": self.current == k})
+        if has_provider_api_key("anthropic"):
+            k = f"anthropic:{p.anthropic_model}"
+            out.append({"key": k, "model": p.anthropic_model, "provider": "anthropic", "local": False, "thinking": False, "tools": True,
+                        "installed": bool(p.allow_cloud and self.settings.internet.enabled), "current": self.current == k})
         return out
 
+    async def resolve_choice(self, want: str) -> str | None:
+        """Resolve natural alias ('fast', 'reasoning', 'best installed reasoning', 'llama', 'openai', etc.)."""
+        q = (want or "").strip().lower()
+        aliases = {
+            "fast": "local", "quick": "local", "default": self.settings.boot_brain, "normal": "local",
+            "instruct": "local", "local": "local", "thinking": "local_thinking", "reasoning": "local_thinking",
+            "deep": "local_thinking", "smart": "local_thinking", "best reasoning": "local_thinking",
+            "best installed reasoning model": "local_thinking",
+        }
+        if q in aliases:
+            return aliases[q]
+        if q.startswith("openai") or q == "gpt":
+            return f"openai:{self.settings.providers.openai_model}"
+        if q.startswith("anthropic") or "claude" in q:
+            return f"anthropic:{self.settings.providers.anthropic_model}"
+        inst = await self.installed()
+        for m in inst:
+            if m.lower() == q:
+                return m
+        for m in inst:
+            if q and (m.lower().startswith(q) or q in m.lower()):
+                return m
+        return None
+
     async def switch(self, key_or_model: str) -> dict:
-        """Select a configured brain or any installed model. Unloads the previous one to free VRAM. Never pulls models."""
+        """Select a configured brain, installed Ollama model, or gated cloud adapter. Never pulls models."""
+        if key_or_model.startswith(("openai:", "anthropic:")):
+            prov, model_id = key_or_model.split(":", 1)
+            self._cloud_allowed(prov)
+            base_url = self.settings.providers.openai_base_url if prov == "openai" else self.settings.providers.anthropic_base_url
+            spec = BrainSpec(base_url=base_url, model=model_id, thinking=False)
+            setattr(spec, "provider", prov)
+            self.adhoc[key_or_model] = spec
+            if key_or_model != self.current:
+                if self.provider == "ollama":
+                    await self.unload(self.spec.model)
+                self.current = key_or_model
+            return {"key": key_or_model, "model": model_id, "provider": prov, "thinking": False, "local": False}
+
         inst = await self.installed()
         if key_or_model in self.settings.brains:
             key, spec = key_or_model, self.settings.brains[key_or_model]
@@ -115,9 +202,10 @@ class Brain:
         if spec.model not in inst:
             raise BrainError(f"Model {spec.model!r} is not installed. Run `ollama pull {spec.model}` first.")
         if key != self.current:
-            await self.unload(self.spec.model)
+            if self.provider == "ollama":
+                await self.unload(self.spec.model)
             self.current = key
-        return {"key": key, "model": spec.model, "thinking": spec.thinking}
+        return {"key": key, "model": spec.model, "provider": "ollama", "thinking": spec.thinking, "local": True}
 
     async def unload(self, model: str) -> None:
         try:
@@ -146,8 +234,50 @@ class Brain:
             body["tools"] = tools
         return body
 
+    async def _cloud_complete(self, prov: str, messages: list[dict]) -> AsyncIterator[dict]:
+        key = self._cloud_allowed(prov)
+        t0 = time.time()
+        try:
+            if prov == "openai":
+                url = self.settings.providers.openai_base_url.rstrip("/") + "/chat/completions"
+                res = await safe_request(
+                    "POST",
+                    url,
+                    json_body={"model": self.spec.model, "messages": messages, "max_tokens": self.spec.max_tokens},
+                    headers={"Authorization": f"Bearer {key}"},
+                    timeout_s=30.0,
+                )
+                data = json.loads(res.body.decode("utf-8"))
+                txt = data["choices"][0]["message"]["content"]
+            elif prov == "anthropic":
+                url = self.settings.providers.anthropic_base_url.rstrip("/") + "/messages"
+                sys_msg = "\n".join(m["content"] for m in messages if m["role"] == "system")
+                chat_msgs = [{"role": m["role"], "content": m["content"]} for m in messages if m["role"] != "system"]
+                res = await safe_request(
+                    "POST",
+                    url,
+                    json_body={"model": self.spec.model, "system": sys_msg, "messages": chat_msgs, "max_tokens": self.spec.max_tokens},
+                    headers={"x-api-key": key, "anthropic-version": "2023-06-01"},
+                    timeout_s=30.0,
+                )
+                data = json.loads(res.body.decode("utf-8"))
+                txt = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
+            else:
+                raise BrainError(f"Unsupported cloud provider: {prov}")
+        except (NetworkSecurityError, ConnectionError) as e:
+            raise BrainError(f"Cloud provider {prov} blocked by security policy: {e}") from e
+        except Exception as e:
+            raise BrainError(f"Cloud request failed: {e}") from e
+
+        self.last_stats = {"ttft": time.time() - t0, "tokens": len(txt.split()), "tps": 0.0, "total": time.time() - t0, "model": self.spec.model, "truncated": False}
+        yield {"type": "token", "text": txt}
+
     async def stream_events(self, messages: list[dict], tools: list[dict] | None = None) -> AsyncIterator[dict]:
-        """Stream `/api/chat` yielding {"type": "token", "text"} and {"type": "tool_calls", "calls"}."""
+        """Stream `/api/chat` (or gated cloud provider) yielding {"type": "token", "text"} and {"type": "tool_calls", "calls"}."""
+        if self.provider in ("openai", "anthropic"):
+            async for ev in self._cloud_complete(self.provider, messages):
+                yield ev
+            return
         flt, t0, first = ThinkFilter(), time.time(), None
         collected_calls: list[dict] = []
         try:

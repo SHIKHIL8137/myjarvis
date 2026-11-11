@@ -240,7 +240,7 @@ class VoiceLoop:
                 if self.audio_state in (VoiceState.WAKE_WORD, VoiceState.LISTENING):
                     self._transition(self._entry_state(), reason="mode_change")
 
-    def enable(self, mode: str | None = None):
+    def enable(self, mode: str | None = None, *, one_shot_ptt: bool = False):
         with self._ctl_lock:
             if mode is not None:
                 self.set_mode(mode)
@@ -252,10 +252,12 @@ class VoiceLoop:
             self._turn_gate.clear()
             self._turn_wake.set()
             if self._thread and self._thread.is_alive():
+                if one_shot_ptt:
+                    self._one_shot_ptt = True
                 if self.audio_state == VoiceState.PAUSED:
                     self._transition(self._entry_state(), reason="resumed")
                 return
-            self._one_shot_ptt = (self.mode == "ptt")
+            self._one_shot_ptt = bool(one_shot_ptt or self.mode == "ptt")
             self._drain_queue()
             self._run.set()
             self._thread = threading.Thread(target=self._loop, name="voice-loop", daemon=True)
@@ -340,15 +342,14 @@ class VoiceLoop:
         self.disable(join=join)
 
     def push_to_talk(self):
-        """Mode A manual capture: starts mic for one utterance (or skips wake word once)."""
+        """Mode A manual capture: opens mic for a single utterance without mutating configured voice_mode."""
         with self._ctl_lock:
             running = bool(self._thread and self._thread.is_alive())
             if not running:
-                self.mode = "ptt"
-                self._one_shot_ptt = True
-                self.enable(mode="ptt")
-            elif self.paused:
-                self.resume()
+                self.enable(one_shot_ptt=True)
+            else:
+                if self.paused:
+                    self.resume()
             self._ptt_trigger.set()
 
     def mark_generating(self, utt_id: int):
@@ -402,6 +403,7 @@ class VoiceLoop:
                 return
 
             if self._one_shot_ptt or self.mode == "ptt":
+                self._one_shot_ptt = False
                 self._run.clear()
                 self._transition(VoiceState.IDLE, reason="ptt_complete")
                 self._turn_wake.set()
@@ -770,7 +772,8 @@ class VoiceLoop:
                                 pre_roll.append(frame16.copy())
                                 noise = 0.97 * noise + 0.03 * min(rms, 2000.0)
                                 listen_idle_ms += frame_ms
-                                if self.mode == "ptt" and listen_idle_ms >= a.no_speech_timeout_s * 1000.0:
+                                if (self._one_shot_ptt or self.mode == "ptt") and listen_idle_ms >= a.no_speech_timeout_s * 1000.0:
+                                    self._one_shot_ptt = False
                                     self._run.clear()
                                     self._transition(VoiceState.IDLE, reason="ptt_timeout")
                             continue

@@ -59,7 +59,7 @@ def honest_list() -> list[str]:
         "ONLINE ASSISTED MODE (opt-in, internet.enabled=true): same local Qwen model + approved HTTPS search providers (jarvis/search.py) & SSRF-guarded page fetch.",
         "Setup only: `pip install` (PyPI), Whisper models (Hugging Face), Piper voice (Hugging Face), openWakeWord models (GitHub),",
         "            `ollama pull` for models, and the 3d-force-graph file (npm) vendored once into viewer/vendor/.",
-        "No cloud LLM exists in this build; all reasoning and translation still run locally in Ollama.",
+        "Cloud adapters (OpenAI/Anthropic) stay strictly disabled unless providers.allow_cloud + internet.enabled + API key are set; default reasoning & translation run locally in Ollama.",
     ]
 
 
@@ -97,6 +97,13 @@ def run() -> tuple[bool, list[str]]:
         say(f"3. /api/hear   {time.time() - t:.1f}s  heard: {heard['text'][:90]}...")
     except Exception as e:
         say(f"2/3. speech chain skipped: {e}")
+    # Verify remote dataset discovery is blocked in Local Mode without touching external hosts
+    try:
+        call("/api/learning/datasets/discover?q=python")
+        say("4. /learning/discover: FAIL - allowed remote discovery in Local Mode")
+        ok = False
+    except Exception as e:
+        say(f"4. /learning/discover blocked as expected in Local Mode: {e}")
     time.sleep(0.5)
     sampler.stop_ev.set()
     sampler.join(2)

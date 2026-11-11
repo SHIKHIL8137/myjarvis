@@ -1,0 +1,586 @@
+"""Centralized intent routing & deterministic command handling (Phases 1, 10, 11, 14):
+routes explicit voice/text commands, permission-checked actions, memory/history operations,
+voice/model switching, filesystem search/inspection, and learning/training lifecycle controls."""
+import re
+
+from . import audit
+from .actions import ActionPermissionError
+from .brain import BrainError
+from .filesystem import FilesystemPermissionError
+from .learning.feedback import is_correction_statement
+from .memory_store import infer_memory_category
+from .retrieval import search
+from .search import SearchOfflineError
+
+# Re-exported so existing callers referencing commands.WEB_EXPLICIT work seamlessly
+WEB_EXPLICIT = re.compile(
+    r"^\W*(?:hey\s+)?(?:jarvis\W+)?(?:please\s+)?(?:search\s+(?:the\s+)?(?:web|internet|online)|look\s+up\s+online|google)\b",
+    re.I,
+)
+REMEMBER = re.compile(
+    r"^\W*(?:hey\s+)?(?:jarvis\W+)?(?:please\s+)?(?:remember(?:\s+that|\s+this)?|save\s+(?:this\s+)?to\s+memory|note\s+that)\b[:\s-]*(.*)$",
+    re.I | re.S,
+)
+STOP = re.compile(r"^\W*(?:jarvis\W+)?(?:stop(?:\s+talking|\s+speaking)?|quiet|silence|shut\s+up|cancel)\W*$", re.I)
+PAUSE_VOICE = re.compile(r"^\W*(?:hey\s+)?(?:jarvis\W+)?(?:pause|mute)\s+(?:listening|voice|microphone|mic)\W*$", re.I)
+RESUME_VOICE = re.compile(r"^\W*(?:hey\s+)?(?:jarvis\W+)?(?:resume|unmute|start)\s+(?:listening|voice|microphone|mic)\W*$", re.I)
+
+VOICE_LIST = re.compile(r"^\W*(?:hey\s+)?(?:jarvis\W+)?(?:list|show|what)\s+(?:all\s+)?(?:available\s+)?voices\W*$", re.I)
+VOICE_SWITCH = re.compile(
+    r"^\W*(?:hey\s+)?(?:jarvis\W+)?(?:please\s+)?(?:switch|change|use|set)\s+(?:the\s+)?(?:tts\s+)?voice(?:\s+to)?\s+(.+)$",
+    re.I,
+)
+VOICE_RATE = re.compile(
+    r"^\W*(?:hey\s+)?(?:jarvis\W+)?(?:speak\s+(faster|slower)|(?:set\s+)?(?:voice|speech)\s+(?:rate|speed)\s+(?:to\s+)?([0-9]+(?:\.[0-9]+)?))\W*$",
+    re.I,
+)
+SWITCH_MODEL = re.compile(
+    r"^\W*(?:hey\s+)?(?:jarvis\W+)?(?:please\s+)?(?:switch|change|use)\s+(?:to\s+)?(?:the\s+)?(?!voice\b)(.+?)(?:\s+model)?\W*$",
+    re.I,
+)
+WHICH_MODEL = re.compile(r"^\W*(?:what|which)\s+model(?:\s+(?:is\s+(?:this|active)|are\s+you\s+using))?\W*$", re.I)
+COUNT_NOTES = re.compile(r"\bhow\s+many\s+(?:notes|memories)\b", re.I)
+SHOW_NOTES = re.compile(r"^\W*(?:show|open|list)\s+(?:all\s+|my\s+)?notes\W*$", re.I)
+FIND_NOTES = re.compile(
+    r"^\W*(?:find|search)\s+(?:my\s+)?(?:(?:notes|knowledge)(?:\s+(?:about|for|on))?\s*(.*)|information\s+(?:about|on|for)\s+(.+))$",
+    re.I,
+)
+
+# Phase 2 & 10 memory / history / correction commands
+UPDATE_MEMORY = re.compile(
+    r"^\W*(?:hey\s+)?(?:jarvis\W+)?update\s+memory\s+([a-z0-9_-]+)\s+(?:to|=|:)\s+(.+)$",
+    re.I | re.S,
+)
+FORGET_MEMORY = re.compile(
+    r"^\W*(?:hey\s+)?(?:jarvis\W+)?(?:forget(?:\s+about)?|delete\s+memory)\s+(.+)$",
+    re.I,
+)
+RECALL_MEMORY = re.compile(
+    r"^\W*(?:hey\s+)?(?:jarvis\W+)?(?:what\s+do\s+you\s+remember\s+about|search\s+(?:my\s+)?memory\s+(?:for|about)|recall)\s+(.+)$",
+    re.I,
+)
+SEARCH_HISTORY = re.compile(
+    r"^\W*(?:hey\s+)?(?:jarvis\W+)?(?:search\s+(?:conversation\s+)?history\s+(?:for|about)|what\s+did\s+we\s+discuss(?:\s+about)?)\s*(.*)$",
+    re.I,
+)
+CONFIRM_MEMORY = re.compile(
+    r"^\W*(?:hey\s+)?(?:jarvis\W+)?confirm\s+memory\s+([a-z0-9_-]+)\W*$",
+    re.I,
+)
+CORRECT_EXPLICIT = re.compile(
+    r"^\W*(?:hey\s+)?(?:jarvis\W+)?remember\s+this\s+correction[:\s-]*(.+)$",
+    re.I | re.S,
+)
+FEEDBACK_CONFIRM = re.compile(
+    r"^\W*(?:yes[,.\s]+)?(?:remember\s+(?:that|this)\s+correction|save\s+that\s+correction|approve\s+feedback(?:\s+([a-z0-9_-]+))?)\W*$",
+    re.I,
+)
+FEEDBACK_LIST = re.compile(r"^\W*(?:show|list)\s+(?:my\s+)?feedback\W*$", re.I)
+
+# Phase 11 & 14 filesystem & action confirmation commands
+CONFIRM_ACTION = re.compile(r"^\W*(?:confirm|approve)(?:\s+action)?(?:\s+([a-z0-9]+))?\W*$", re.I)
+REJECT_ACTION = re.compile(r"^\W*(?:reject|deny|abort)\s+action(?:\s+([a-z0-9]+))?\W*$", re.I)
+SEARCH_FILES = re.compile(
+    r"^\W*(?:hey\s+)?(?:jarvis\W+)?(?:search\s+(?:local\s+)?files(?:\s+for)?|find\s+file(?:s)?(?:\s+named|\s+for)?)\s+(.+)$",
+    re.I,
+)
+READ_DOC = re.compile(r"^\W*(?:hey\s+)?(?:jarvis\W+)?read\s+(?:file|document)\s+(.+)$", re.I)
+OPEN_FILE = re.compile(r"^\W*(?:hey\s+)?(?:jarvis\W+)?open\s+(?:file|document)\s+(.+)$", re.I)
+OPEN_APP = re.compile(r"^\W*(?:hey\s+)?(?:jarvis\W+)?(?:open|launch)\s+(?:app(?:lication)?\s+)?([a-z0-9_ .-]+?)\W*$", re.I)
+INSPECT_PROJECT = re.compile(r"^\W*(?:hey\s+)?(?:jarvis\W+)?(?:inspect|analyze)\s+(?:my\s+|the\s+)?(?:project|codebase)(?:\s+at\s+(.+))?\W*$", re.I)
+
+# Phase 10 learning & training lifecycle commands
+KNOWLEDGE_SYNC = re.compile(
+    r"^\W*(?:hey\s+)?(?:jarvis\W+)?(?:update|sync)\s+(?:your\s+)?knowledge(?:\s+(?:from|about|on)\s+(.+))?\W*$|^\W*learn\s+the\s+latest\s+(?:information\s+)?(?:about|on)\s+(.+)$",
+    re.I,
+)
+LEARNING_STATUS = re.compile(
+    r"^\W*(?:hey\s+)?(?:jarvis\W+)?(?:what\s+have\s+you\s+learned\s+recently|learning\s+status|knowledge\s+status)\W*$",
+    re.I,
+)
+PREPARE_DATASET = re.compile(
+    r"^\W*(?:hey\s+)?(?:jarvis\W+)?(?:prepare|build)\s+(?:the\s+)?(?:training\s+)?dataset(?:\s+from\s+approved\s+feedback)?\W*$",
+    re.I,
+)
+TRAIN_REQUEST = re.compile(
+    r"^\W*(?:hey\s+)?(?:jarvis\W+)?(?:train\s+on\s+approved\s+feedback|start\s+training|prepare\s+fine[- ]?tuning)\W*$",
+    re.I,
+)
+TRAINING_CONTROL = re.compile(
+    r"^\W*(?:hey\s+)?(?:jarvis\W+)?(pause|resume|cancel|status)\s+training(?:\s+([a-z0-9_-]+))?\W*$|^\W*training\s+status\W*$",
+    re.I,
+)
+EVAL_CMD = re.compile(r"^\W*(?:hey\s+)?(?:jarvis\W+)?(?:evaluate|run\s+evaluation\s+on)\s+(?:the\s+)?(?:candidate|active|baseline)?\s*model\W*$", re.I)
+PROMOTE_CMD = re.compile(r"^\W*(?:hey\s+)?(?:jarvis\W+)?promote\s+(?:the\s+)?(?:candidate\s+)?model(?:\s+([a-z0-9_-]+))?\W*$", re.I)
+ROLLBACK_CMD = re.compile(r"^\W*(?:hey\s+)?(?:jarvis\W+)?roll\s*back(?:\s+to(?:\s+the)?\s+previous)?\s+model(?:\s+([a-z0-9_-]+))?\W*$", re.I)
+
+
+def _res(name: str, reply: str, *, nodes=None, note=None, paths=None, ui=None, ok=True, speak=True, **extra) -> dict:
+    return {
+        "name": name,
+        "reply": reply,
+        "nodes": nodes or [],
+        "note": note,
+        "paths": paths or ([note] if note else []),
+        "ui": ui,
+        "ok": ok,
+        "speak": speak,
+        **extra,
+    }
+
+
+async def route_intent(a, text: str) -> dict | None:
+    """Central intent router executed before calling the LLM. Returns None when a turn should go to the LLM."""
+    text = (text or "").strip()
+    if not text:
+        return None
+
+    # Allow genuine web queries to flow to stream_turn when online; refuse honestly in Local Mode
+    if WEB_EXPLICIT.match(text):
+        if not (a.settings.internet.enabled and audit.is_online_enabled()):
+            return _res(
+                "web_offline",
+                "Jarvis is in Local Mode (internet access is disabled). Enable Online Assisted Mode to search the web.",
+                ok=False,
+            )
+        return None
+
+    if STOP.match(text):
+        a.speaker.stop()
+        if hasattr(a, "actions"):
+            a.actions.tasks.cancel_active()
+        return _res("stop", "Stopped.", speak=False)
+
+    if PAUSE_VOICE.match(text):
+        a.voice.pause()
+        return _res("pause_voice", "Voice listening paused.", ui={"voice": "paused"})
+
+    if RESUME_VOICE.match(text):
+        a.voice.resume()
+        return _res("resume_voice", "Resuming voice listening.", ui={"voice": "listening"})
+
+    # Voice listing / switching / speech rate (must precede SWITCH_MODEL)
+    if VOICE_LIST.match(text):
+        voices = a.tts.list_voices()
+        if not voices:
+            return _res("list_voices", "No Piper voices found in models/piper.", ok=False)
+        names = ", ".join(f"{v['name']} ({v['language']})" for v in voices)
+        return _res("list_voices", f"Installed voices ({len(voices)}): {names}. Active: {a.settings.tts.voice}.", voices=voices)
+
+    if m := VOICE_SWITCH.match(text):
+        want = m.group(1).strip(" .?!\"'")
+        try:
+            switched = a.tts.switch_voice(want)
+            a.settings.tts.voice = switched["name"]
+            a.bus.publish({"type": "voice_changed", **switched})
+            return _res(
+                "switch_voice",
+                f"Voice switched to {switched.get('speaker') or switched['name']} ({switched['name']}, {switched['language']}).",
+                ui={"voice": switched["name"]},
+                voice=switched,
+            )
+        except Exception as e:
+            return _res("switch_voice", f"Could not switch voice to {want}: {e}", ok=False)
+
+    if m := VOICE_RATE.match(text):
+        word, num = m.group(1), m.group(2)
+        if num:
+            new_speed = float(num)
+        elif (word or "").lower() == "faster":
+            new_speed = min(1.8, round(a.settings.tts.speed + 0.15, 2))
+        else:
+            new_speed = max(0.6, round(a.settings.tts.speed - 0.15, 2))
+        try:
+            applied = a.tts.set_rate(new_speed)
+            return _res("set_voice_rate", f"Speech speed set to {applied:.2f}x.", ui={"tts_speed": applied})
+        except Exception as e:
+            return _res("set_voice_rate", f"Invalid speech speed: {e}", ok=False)
+
+    if WHICH_MODEL.match(text):
+        return _res(
+            "which_model",
+            f"Active model is {a.brain.spec.model} ({a.brain.current}, provider: {a.brain.provider}).",
+        )
+
+    if m := SWITCH_MODEL.match(text):
+        want = m.group(1).strip(" .?!\"'")
+        # Clarification if user was completely ambiguous
+        if want.lower() in ("model", "models", "another", "a"):
+            opts = ", ".join(f"{k} ({b.model})" for k, b in a.settings.brains.items())
+            return _res("clarify_model", f"Which model would you like me to switch to: {opts}?", ok=False)
+        key = await a.brain.resolve_choice(want)
+        if not key:
+            return _res("switch", f"I have no model called {want}.", ok=False)
+        try:
+            res = await a.brain.switch(key)
+            a.warm_status["brain"] = True
+            mdl = res.get("model") or a.brain.spec.model
+            return _res("switch", f"Switched to {a.brain.current} ({mdl}).", ui={"brain": a.brain.current})
+        except BrainError as e:
+            return _res("switch", str(e), ok=False)
+
+    # Feedback & corrections (check before generic action confirm)
+    if m := CORRECT_EXPLICIT.match(text):
+        corr = m.group(1).strip()
+        if hasattr(a, "feedback") and corr:
+            prev_u = next((h["content"] for h in reversed(a.history.items) if h["role"] == "user"), "")
+            prev_a = next((h["content"] for h in reversed(a.history.items) if h["role"] == "assistant"), "")
+            try:
+                rec = a.feedback.record(
+                    input_text=prev_u or text,
+                    previous_response=prev_a,
+                    corrected_response=corr,
+                    category="correction",
+                    source="confirmed_correction",
+                    approved=True,
+                )
+                return _res("feedback_record", f"Saved and approved correction [{rec.id}] for topic '{rec.topic}'.", feedback=rec.to_dict())
+            except ValueError as e:
+                return _res("feedback_record", str(e), ok=False)
+
+    if m := FEEDBACK_CONFIRM.match(text):
+        if hasattr(a, "feedback"):
+            fid = m.group(1)
+            if not fid:
+                pend = a.feedback.list_records(status="pending", limit=1)
+                fid = pend[0].id if pend else ""
+            if not fid:
+                return _res("feedback_confirm", "There is no pending correction waiting for approval.", ok=False)
+            try:
+                rec = a.feedback.approve(fid)
+                return _res("feedback_confirm", f"Approved feedback lesson [{rec.id}] for future reference.", feedback=rec.to_dict())
+            except Exception as e:
+                return _res("feedback_confirm", f"Could not approve feedback: {e}", ok=False)
+
+    if m := CONFIRM_MEMORY.match(text):
+        if hasattr(a, "memory_store"):
+            rec_id = m.group(1).strip()
+            try:
+                rec = a.memory_store.confirm_pending(rec_id, approved=True)
+                return _res("confirm_memory", f"Confirmed memory {rec.id}: {rec.text}", memory=rec.to_dict())
+            except Exception as e:
+                return _res("confirm_memory", f"Could not confirm memory {rec_id}: {e}", ok=False)
+
+    # Action confirmation / rejection commands
+    if m := CONFIRM_ACTION.match(text):
+        if hasattr(a, "actions"):
+            tok = (m.group(1) or "").strip()
+            pending = a.actions.pending_approvals()
+            if not tok and len(pending) == 1:
+                tok = pending[0]["token"]
+            if not tok:
+                if len(pending) > 1:
+                    list_str = ", ".join(f"{p['token']} ({p['action']})" for p in pending[:4])
+                    return _res("confirm_action", f"Multiple actions await approval: {list_str}. Please specify which token.", ok=False)
+                return _res("confirm_action", "There are no pending actions awaiting confirmation.", ok=False)
+            try:
+                out = a.actions.confirm(tok)
+                return _res("confirm_action", f"Confirmed and executed action {tok}.", action_result=out)
+            except Exception as e:
+                return _res("confirm_action", f"Action confirmation failed: {e}", ok=False)
+
+    if m := REJECT_ACTION.match(text):
+        if hasattr(a, "actions"):
+            tok = (m.group(1) or "").strip()
+            pending = a.actions.pending_approvals()
+            if not tok and len(pending) == 1:
+                tok = pending[0]["token"]
+            try:
+                out = a.actions.reject(tok)
+                return _res("reject_action", f"Cancelled pending action {tok}.", action_result=out)
+            except Exception as e:
+                return _res("reject_action", f"Could not cancel action: {e}", ok=False)
+
+    if FEEDBACK_LIST.match(text) and hasattr(a, "feedback"):
+        s = a.feedback.summary()
+        bs = s.get("by_status") or {}
+        return _res(
+            "feedback_list",
+            f"Feedback store: {s['total']} total ({bs.get('approved', 0)} approved, {bs.get('pending', 0)} pending, {bs.get('rejected', 0)} rejected).",
+            feedback_summary=s,
+        )
+
+    # Note count / show notes / find notes (must stay exact for compatibility)
+    if COUNT_NOTES.search(text):
+        return _res("count", f"I have {len(a.store.all())} saved notes in memory.")
+
+    if SHOW_NOTES.match(text):
+        a.store.refresh()
+        return _res("show_notes", f"Showing all {len(a.store.all())} notes.", ui={"open": "notes"})
+
+    if m := FIND_NOTES.match(text):
+        q = (m.group(1) or m.group(2) or "").strip(" .?!")
+        if not q:
+            return _res("find", "Search ready.", ui={"focus": "search"})
+        a.store.refresh()
+        hits = [(n, s) for n, s in search(a.store.all(), q, 5) if s >= 1.5]
+        if not hits:
+            return _res("find", f"I found nothing about {q}.", ok=False)
+        titles = ", ".join(n.title for n, _ in hits)
+        return _res("find", f"Found {len(hits)}: {titles}.", nodes=[n.id for n, _ in hits], paths=[n.path for n, _ in hits], ui={"search": q})
+
+    # Memory save / update / forget / recall / history search
+    if m := REMEMBER.match(text):
+        body = m.group(1).strip()
+        if not body:
+            return _res("remember", "What should I remember? Please share the fact or preference.", ok=False)
+        try:
+            res = a.store.add(body)
+            mem_rec = None
+            if hasattr(a, "memory_store"):
+                cat, top = infer_memory_category(body)
+                mem_rec, _ = a.memory_store.add(
+                    body,
+                    category=cat,
+                    topic=top,
+                    note_path=res.path,
+                    confirmed=True,
+                )
+            return _res(
+                "remember",
+                f"Noted as {res.title}.",
+                nodes=[res.id],
+                note=res.path,
+                memory=mem_rec.to_dict() if mem_rec else None,
+            )
+        except Exception as e:
+            return _res("remember", f"I could not save that note: {e}", ok=False)
+
+    if m := UPDATE_MEMORY.match(text):
+        if hasattr(a, "memory_store"):
+            rec_id, new_txt = m.group(1).strip(), m.group(2).strip()
+            try:
+                rec = a.memory_store.update(rec_id, new_txt)
+                return _res("update_memory", f"Updated memory {rec.id}.", memory=rec.to_dict())
+            except Exception as e:
+                return _res("update_memory", f"Could not update memory {rec_id}: {e}", ok=False)
+
+    if m := FORGET_MEMORY.match(text):
+        if hasattr(a, "memory_store"):
+            q = m.group(1).strip(" .?!")
+            # Try exact id first
+            try:
+                rem = a.memory_store.delete(q)
+                return _res("forget_memory", f"Removed memory {rem.id} ({rem.text[:60]}).")
+            except KeyError:
+                hits = a.memory_store.search(q, limit=5)
+                if not hits:
+                    return _res("forget_memory", f"No personal memory matched '{q}'.", ok=False)
+                if len(hits) == 1:
+                    rem = a.memory_store.delete(hits[0][0].id)
+                    return _res("forget_memory", f"Forgot memory: {rem.text[:80]}.")
+                choices = ", ".join(f"{r.id}: {r.text[:35]}" for r, _ in hits[:3])
+                return _res("forget_memory", f"Multiple memories matched '{q}'. Say 'forget memory <id>' for: {choices}.", ok=False)
+
+    if m := RECALL_MEMORY.match(text):
+        if hasattr(a, "memory_store"):
+            q = m.group(1).strip(" .?!")
+            mem_hits = a.memory_store.search(q, limit=4)
+            hist_hits = a.history.search_disk(q, limit=3)
+            if not mem_hits and not hist_hits:
+                return _res("recall_memory", f"I found no stored personal memories or past turns about '{q}'.", ok=False)
+            parts = []
+            if mem_hits:
+                parts.append("Personal memories: " + "; ".join(f"[{r.category}] {r.text}" for r, _ in mem_hits))
+            if hist_hits:
+                parts.append("Past conversation: " + "; ".join(h["content"][:120] for h in hist_hits))
+            return _res("recall_memory", " ".join(parts))
+
+    if m := SEARCH_HISTORY.match(text):
+        q = m.group(1).strip(" .?!")
+        hits = a.history.search_disk(q, limit=5)
+        if not hits:
+            return _res("search_history", f"No past conversation turns matched '{q}'.", ok=False)
+        snippets = " | ".join(f"{h['role']}: {h['content'][:100]}" for h in hits[:3])
+        return _res("search_history", f"Found {len(hits)} past turns: {snippets}", history_hits=hits)
+
+    # Filesystem & action execution commands
+    if m := SEARCH_FILES.match(text):
+        if hasattr(a, "filesystem"):
+            q = m.group(1).strip(" .?!\"'")
+            try:
+                matches = a.filesystem.search(q, limit=10)
+                if not matches:
+                    return _res("search_files", f"No files or folders matched '{q}' inside allowed directories.", ok=False)
+                listed = ", ".join(x["name"] for x in matches[:5])
+                return _res("search_files", f"Found {len(matches)} matching files: {listed}.", files=matches)
+            except FilesystemPermissionError as e:
+                return _res("search_files", str(e), ok=False)
+
+    if m := READ_DOC.match(text):
+        if hasattr(a, "filesystem"):
+            target = m.group(1).strip(" .?!\"'")
+            try:
+                doc = a.filesystem.read_document(target, max_chars=2500)
+                preview = doc["content"][:600].replace("\n", " ").strip()
+                return _res("read_file", f"{doc['path']} ({doc['chars']} chars): {preview}", document=doc)
+            except Exception as e:
+                return _res("read_file", f"Could not read {target}: {e}", ok=False)
+
+    if m := OPEN_FILE.match(text):
+        if hasattr(a, "actions"):
+            target = m.group(1).strip(" .?!\"'")
+            try:
+                out = a.actions.request_or_execute("open_file", {"path": target})
+                return _res("open_file", f"Opened {out.get('opened', target)}.", action_result=out)
+            except Exception as e:
+                return _res("open_file", f"Could not open {target}: {e}", ok=False)
+
+    if m := OPEN_APP.match(text):
+        app_name = m.group(1).strip().lower()
+        if hasattr(a, "actions") and app_name in a.settings.actions.allowed_apps:
+            try:
+                out = a.actions.request_or_execute("open_app", {"app": app_name})
+                return _res("open_app", f"Launched {app_name}.", action_result=out)
+            except Exception as e:
+                return _res("open_app", f"Could not launch {app_name}: {e}", ok=False)
+
+    if m := INSPECT_PROJECT.match(text):
+        if hasattr(a, "filesystem"):
+            target = m.group(1).strip(" .?!\"'") if m.group(1) else None
+            try:
+                summary = a.filesystem.inspect_project(target)
+                langs = ", ".join(f"{k}: {v}" for k, v in summary.get("languages", {}).items())
+                return _res("inspect_project", f"Project has {summary['total_files']} files ({langs}).", project=summary)
+            except Exception as e:
+                return _res("inspect_project", f"Project inspection failed: {e}", ok=False)
+
+    # Learning & training lifecycle NLP commands (Phase 10)
+    if m := KNOWLEDGE_SYNC.match(text):
+        if hasattr(a, "knowledge"):
+            topic = (m.group(1) or m.group(2) or "").strip(" .?!") or None
+            try:
+                res = await a.knowledge.sync(topic_filter=topic)
+                return _res(
+                    "knowledge_sync",
+                    f"Knowledge sync complete: checked {res.get('sources_checked', 0)} sources, "
+                    f"{res.get('new_documents_found', 0)} updated, {res.get('failed_documents', 0)} failed.",
+                    knowledge=res,
+                    ui={"open": "learning"},
+                )
+            except SearchOfflineError as e:
+                return _res("knowledge_sync", str(e), ok=False)
+            except Exception as e:
+                return _res("knowledge_sync", f"Knowledge sync failed: {e}", ok=False)
+
+    if LEARNING_STATUS.match(text) and hasattr(a, "knowledge"):
+        ov = a.learning_overview()
+        kf = ov["knowledge"]
+        fb = ov["feedback"]
+        bs = fb.get("by_status") or {}
+        reg = ov["registry"]
+        return _res(
+            "learning_status",
+            f"Knowledge index has {kf.get('kb_chunks', 0)} chunks across {ov.get('knowledge_sources_count', 0)} sources. "
+            f"Feedback has {bs.get('approved', 0)} approved / {bs.get('pending', 0)} pending lessons. "
+            f"Active model version: {reg['active_version_id']} ({a.brain.spec.model}).",
+            overview=ov,
+            ui={"open": "learning"},
+        )
+
+    if PREPARE_DATASET.match(text) and hasattr(a, "dataset_manager"):
+        try:
+            prep = a.prepare_training_dataset_from_feedback()
+            b = prep["build"]
+            return _res(
+                "prepare_dataset",
+                f"Prepared dataset build {b['build_id']}: {b['train_count']} train / {b['val_count']} val / {b['test_count']} test (0 leakage).",
+                prepared=prep,
+                ui={"open": "learning"},
+            )
+        except Exception as e:
+            return _res("prepare_dataset", f"Dataset preparation failed: {e}", ok=False)
+
+    if TRAIN_REQUEST.match(text) and hasattr(a, "training_manager"):
+        try:
+            builds = a.dataset_builder.list_builds()
+            if not builds:
+                return _res("training_request", "No prepared dataset builds found. Say 'prepare training dataset' first.", ok=False)
+            job = await a.request_training_job(dataset_build_id=builds[0]["build_id"])
+            est = job["estimate"]
+            msg = (
+                f"Created training job {job['job_id']} (state: {job['state']}). "
+                f"Estimated VRAM: {est['estimated_vram_gb']} GB / available {est['hardware']['total_vram_gb']} GB. "
+                + (f"Blockers: {'; '.join(est['blockers'])}" if est["blockers"] else "Ready for approval in Learning Dashboard.")
+            )
+            return _res("training_request", msg, job=job, ui={"open": "learning"})
+        except Exception as e:
+            return _res("training_request", f"Could not create training job: {e}", ok=False)
+
+    if m := TRAINING_CONTROL.match(text):
+        if hasattr(a, "training_manager"):
+            action = (m.group(1) or "status").lower()
+            jid = m.group(2)
+            jobs = a.training_manager.list_jobs()
+            if not jid and jobs:
+                jid = jobs[0]["job_id"]
+            if action == "status" or not jid:
+                if not jobs:
+                    return _res("training_status", "No training jobs have been created yet.")
+                j = jobs[0]
+                return _res("training_status", f"Latest job {j['job_id']}: {j['state']}.", job=j, ui={"open": "learning"})
+            try:
+                fn = {"pause": a.training_manager.pause_job, "resume": a.training_manager.resume_job, "cancel": a.training_manager.cancel_job}[action]
+                j = fn(jid)
+                return _res("training_control", f"Job {jid} -> {j['state']}.", job=j)
+            except Exception as e:
+                return _res("training_control", f"Training {action} failed: {e}", ok=False)
+
+    if EVAL_CMD.match(text) and hasattr(a, "evaluator"):
+        try:
+            rep = await a.run_model_evaluation()
+            return _res(
+                "evaluate_model",
+                f"Evaluation {rep['eval_id']}: baseline score {rep['baseline_score']:.2f}, decision={rep['decision']}.",
+                evaluation=rep,
+                ui={"open": "learning"},
+            )
+        except Exception as e:
+            return _res("evaluate_model", f"Evaluation failed: {e}", ok=False)
+
+    if m := PROMOTE_CMD.match(text):
+        if hasattr(a, "registry"):
+            vid = (m.group(1) or "").strip()
+            if not vid:
+                cands = [v["version_id"] for v in a.registry.summary()["versions"] if v["status"] == "candidate"]
+                vid = cands[0] if cands else ""
+            if not vid:
+                return _res("promote_model", "No candidate model version is registered.", ok=False)
+            try:
+                installed = await a.brain.installed()
+                rec = a.registry.promote(vid, installed_ollama_models=installed)
+                return _res("promote_model", f"Promoted model version {rec['version_id']}.", version=rec)
+            except Exception as e:
+                return _res("promote_model", f"Promotion blocked: {e}", ok=False)
+
+    if m := ROLLBACK_CMD.match(text):
+        if hasattr(a, "rollback_model"):
+            target = (m.group(1) or "").strip() or None
+            try:
+                res = a.rollback_model(target)
+                return _res("rollback_model", f"Rolled back active model to {res['active_version_id']}.", rollback=res)
+            except Exception as e:
+                return _res("rollback_model", f"Rollback failed: {e}", ok=False)
+
+    # Check non-explicit user correction (ask confirmation via feedback pending state in stream_turn or route notice)
+    if hasattr(a, "feedback") and is_correction_statement(text) and len(a.history.items) >= 2:
+        prev_u = next((h["content"] for h in reversed(a.history.items) if h["role"] == "user"), "")
+        prev_a = next((h["content"] for h in reversed(a.history.items) if h["role"] == "assistant"), "")
+        try:
+            rec = a.feedback.record(
+                input_text=prev_u or text,
+                previous_response=prev_a,
+                corrected_response=text,
+                category="correction",
+                source="explicit_user",
+                approved=False,
+            )
+            return _res(
+                "feedback_pending",
+                f"Got it — I've noted that correction as [{rec.id}]. Remember that correction for future answers? (Say 'yes, remember that correction' to approve it.)",
+                feedback=rec.to_dict(),
+            )
+        except ValueError as e:
+            return _res("feedback_pending", f"I noted your message cleanly, but refused storing sensitive credentials ({e}).", ok=False)
+
+    return None

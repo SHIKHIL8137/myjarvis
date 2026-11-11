@@ -4,7 +4,7 @@ import { galaxy } from "./galaxy.js";
 import { mdInto } from "./md.js";
 
 // ---------- drawer manager: one open at a time, Esc closes ----------
-const DRAWERS = ["chat", "notes", "settings"];
+const DRAWERS = ["chat", "notes", "learning", "workspace", "settings"];
 export function openDrawer(name) {
   DRAWERS.forEach((d) => { $("#" + d).hidden = d !== name; $("#v-" + d).setAttribute("aria-pressed", String(d === name)); });
   emit("drawer", name);

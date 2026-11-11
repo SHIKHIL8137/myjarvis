@@ -188,3 +188,24 @@ button.danger:hover{border-color:var(--bad)!important;color:var(--bad)!important
   #notes,#settings{top:12px;transform:translateX(-50%);height:calc(100vh - 136px)}}
 @media (prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important}}
 :root[data-motion=reduce] *,:root[data-motion=reduce] *::before{animation:none!important;transition:none!important}
+
+/* ---- learning & workspace drawers ---- */
+#learning,#workspace{left:50%;top:50%;transform:translate(-50%,-52%);width:min(1080px,calc(100vw - 32px));height:min(82vh,800px);animation:none}
+.l-tabs{display:flex;flex-wrap:wrap;gap:6px;margin-left:10px}
+.l-tabs button{font-size:11.5px;padding:4px 10px;border-radius:99px}
+.l-tabs button[aria-pressed=true]{border-color:var(--accent);color:var(--accent);background:rgba(39,211,255,.1)}
+.l-body{flex:1;overflow:auto;padding:16px 18px;display:flex;flex-direction:column;gap:12px}
+.l-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:10px}
+.l-list{display:grid;gap:8px}
+.l-card{display:grid;gap:6px}
+.l-actions{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.l-badges{display:flex;flex-wrap:wrap;gap:5px}
+.l-pill{font:500 10px var(--mono);padding:2px 8px;border-radius:99px;border:1px solid var(--line2);color:var(--accent);background:rgba(39,211,255,.07)}
+.l-pill.warn{border-color:var(--warn);color:var(--warn);background:rgba(255,190,60,.08)}
+.l-pill.ok{border-color:var(--ok);color:var(--ok);background:rgba(60,235,140,.08)}
+.l-pill.bad{border-color:var(--bad);color:var(--bad);background:rgba(255,90,110,.08)}
+.l-form{gap:8px}.l-form textarea{width:100%;font:12px var(--mono)}
+.l-log{background:#04080f;border:1px solid var(--line);border-radius:8px;padding:10px;max-height:220px;overflow:auto;font:11.5px/1.4 var(--mono);color:var(--text);white-space:pre-wrap}
+.l-cat-grid{display:flex;flex-wrap:wrap;gap:5px}
+.l-note{font-size:12px;line-height:1.45}
+@media (max-width:720px){#learning,#workspace{top:12px;transform:translateX(-50%);height:calc(100vh - 136px)}}

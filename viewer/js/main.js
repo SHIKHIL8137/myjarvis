@@ -3,6 +3,7 @@ import { $, $$, api, chatStream, colorOf, el, emit, listen, on, store, toast } f
 import { galaxy } from "./galaxy.js";
 import { mdInto } from "./md.js";
 import { closeDrawers, openDrawer, openNote } from "./panels.js";
+import "./learning.js";
 
 const S = {
   voice: "off",
@@ -282,6 +283,9 @@ function turn() {
         if (meta.sources?.length) { const s = el("button", null, "from: " + meta.sources.join(", ")); s.onclick = () => galaxy.focus(ev.paths); info.append(s); }
         m.append(info); hideBubble();
         if (ev.ui?.open === "notes") openDrawer("notes");
+        if (ev.ui?.open === "learning") openDrawer("learning");
+        if (ev.ui?.open === "workspace") openDrawer("workspace");
+        if (ev.ui?.voice) refreshStatus();
         if (ev.ui?.focus === "search") { document.body.classList.remove("left-closed", "focus"); $("#search").focus(); }
         if (ev.ui?.search) { $("#search").value = ev.ui.search; }
         if (ev.paths?.length) await galaxy.focus(ev.paths, ev.command === "remember", ev.command === "find");  // small talk has no paths: the camera stays put
@@ -419,7 +423,7 @@ listen(async (ev) => {
       }
       break;
     case "graph_changed": await galaxy.refresh(ev.new || []); break;
-    case "model": refreshStatus(); break;
+    case "model": case "voice_changed": refreshStatus(); break;
   }
   render();
 }, (up) => { if (up) refreshStatus(); else { S.backend = false; render(); $("#st-backend").classList.remove("ok"); $("#h-online").classList.remove("ok"); $("#h-online b").textContent = "BACKEND DOWN"; } });

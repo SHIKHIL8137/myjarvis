@@ -131,9 +131,8 @@ def test_hands_free_end_to_end_wake_hear_think_speak(tmp_path, monkeypatch):
             events.append(ev)
             if ev["type"] in ("done", "error"):
                 break
-        await asyncio.sleep(1.0)
+        await asyncio.to_thread(a.speaker.wait_idle, 30)
         a.voice.disable()
-        a.speaker.wait_idle(30)
         await a.stop()
         return events, time.time() - t0
     events, secs = asyncio.run(go())

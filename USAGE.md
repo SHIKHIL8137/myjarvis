@@ -11,7 +11,7 @@
 |---|---|
 | Centre | The 3D knowledge galaxy: every note is a star, coloured by folder, linked by real `[[wikilinks]]` and title mentions |
 | Left rail | Search, inspector for the selected note, top hubs, category filter, statistics, force sliders, display options, and `LOCAL MODE` / `ONLINE` status |
-| Top bar | **Fit**, **Reset** (camera), and the **Notes**, **Chat** and **System** drawers |
+| Top bar | **Fit**, **Reset** (camera), and the **Notes**, **Chat**, **Learning**, **Memory & Files**, and **System** drawers |
 | Right HUD | Jarvis reactor, status chips (`OLLAMA OK`, `LOCAL` / `ONLINE ASSISTED`, active model), live STT config, and five mode buttons |
 | Bottom | The command bar (stays available whatever else is open) |
 
@@ -76,3 +76,12 @@ Jarvis starts in **Local Mode** (`internet.enabled: false`), blocking all extern
 | "Switch to the thinking model" / "… the fast model" | Switches local Ollama model |
 | "Which model are you using?", "How many notes do you have?" | Answered directly from local system state |
 | "Stop" | Stops speaking |
+| "Switch voice to <name>" / "List voices" | Switches Piper TTS voice independently of the active LLM model |
+| "Search files for <query>" / "Read file <path>" / "Inspect project" | Searches and inspects allowlisted local directories safely |
+| "What do you remember about <topic>" / "Search conversation history for <query>" | Recalls structured personal memory & searches full disk `history.jsonl` |
+| "Update your knowledge" / "Learning status" | Syncs local/approved knowledge chunks or opens Brain & Learning dashboard |
+| "Prepare training dataset" / "Run model evaluation" / "Roll back to the previous model" | Builds validated splits from approved feedback, evaluates 12 categories, or rolls back registry |
+
+## Personal Memory, Local Files & Learning Dashboard
+- **Memory & Files Drawer**: Filter personal memories by category (`explicit`, `preference`, `project`, `temporary`, `feedback`), approve inferred memories, create backups, search full on-disk conversation history, browse allowlisted files, and approve/reject pending `MODIFY`/`DESTRUCTIVE` actions.
+- **Brain & Learning Drawer**: View active model version and hardware capacity, trigger incremental knowledge updates (RAG chunks only — never modifies weights), validate/clean/split datasets with zero prompt leakage, create approval-gated training jobs, run the 12-category evaluation gate, and promote or atomically roll back registered versions.
