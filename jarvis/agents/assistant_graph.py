@@ -69,13 +69,15 @@ def build_assistant_graph(
 
     def export_doc(state: AssistantGraphState) -> dict:
         p = state.get("payload") or {}
+        skills_used = [s.get("skill_id") for s in (state.get("selected_skills") or []) if s.get("skill_id")]
         res = docs.generate(
             p.get("format", "pdf"),
             filename=p.get("filename", "jarvis-report"),
             title=p.get("title", state.get("goal", "Report")),
             payload=p,
         )
-        return {"artifact": res, "status": "completed", "summary": f"Generated {res['name']} ({res['bytes']} bytes)."}
+        note = f" [skills={','.join(skills_used)}]" if (skills_used and state.get("skill_prompt_block")) else ""
+        return {"artifact": res, "status": "completed", "summary": f"Generated {res['name']} ({res['bytes']} bytes).{note}"}
 
     def create_rem(state: AssistantGraphState) -> dict:
         p = state.get("payload") or {}
@@ -119,7 +121,9 @@ def build_assistant_graph(
 
     def summarize(state: AssistantGraphState) -> dict:
         hits = state.get("context_hits") or []
-        return {"status": "completed", "summary": f"Gathered {len(hits)} relevant personal/experience items."}
+        skills_used = [s.get("skill_id") for s in (state.get("selected_skills") or []) if s.get("skill_id")]
+        note = f" Skills active: {', '.join(skills_used)}." if (skills_used and state.get("skill_prompt_block")) else ""
+        return {"status": "completed", "summary": f"Gathered {len(hits)} relevant personal/experience items.{note}"}
 
     g = StateGraph(AssistantGraphState)
     g.add_node("gather_context", gather_context)

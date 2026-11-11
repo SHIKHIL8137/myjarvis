@@ -19,5 +19,6 @@ services:
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=128m
       - /home/jarvis/.local/state:rw,nosuid,size=32m
+      - /home/jarvis/.config:rw,nosuid,size=16m
     working_dir: /workspace
 

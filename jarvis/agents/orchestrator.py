@@ -10,6 +10,7 @@ from ..config import DATA, SECRETS_PATH, Settings
 from ..core.event_bus import EventBus
 from ..db.engine import DatabaseManager
 from ..db.models import AgentRunRow, AgentStepRow, WorktreeRow
+from ..decision.calibration import DecisionCalibrationService
 from ..decision.router import DecisionEngine
 from ..departments.assistant.documents import DocumentService
 from ..departments.assistant.productivity import EmailDraftService, LocalCalendarService
@@ -73,7 +74,11 @@ class AgentOrchestrator:
             default_max_context_chars=settings.skills.max_context_chars,
             default_max_skills=settings.skills.max_skills_per_run,
         )
-        self.decision = DecisionEngine(settings)
+        self.decision = DecisionEngine(settings, data_dir=self.data_dir)
+        cal_dir = Path(settings.laya.calibration_dir)
+        if not cal_dir.is_absolute():
+            cal_dir = self.data_dir / "decision" / "calibration"
+        self.decision_calibration = DecisionCalibrationService(calibration_dir=cal_dir, approvals=self.approvals)
         self.gateway = ModelGateway(brain, db=self.db, settings=settings) if brain is not None else None
         self.sandbox_tokens = ScopedGatewayTokenManager()
 
@@ -167,7 +172,22 @@ class AgentOrchestrator:
         interrupted = "__interrupt__" in res
         state = "awaiting_approval" if interrupted else res.get("status", "completed")
         self._update_run(run_id, state, res.get("summary") or state)
-        self._log_step(run_id, 1, task_kind, state, {"artifact": res.get("artifact"), "approval_token": res.get("approval_token")})
+        self._log_step(
+            run_id,
+            1,
+            task_kind,
+            state,
+            {"artifact": res.get("artifact"), "approval_token": res.get("approval_token"), "selected_skills": res.get("selected_skills")},
+        )
+        for sk in res.get("selected_skills") or []:
+            self.skills.record_invocation_metric(
+                sk["skill_id"],
+                agent_role=sk.get("agent_role") or ("document_producer" if task_kind == "document_export" else "assistant_coordinator"),
+                run_id=run_id,
+                task_kind=f"assistant:{task_kind}",
+                success=(state not in ("failed", "rejected", "blocked")),
+                token_overhead=max(1, len(res.get("skill_prompt_block") or "") // 4),
+            )
         self.bus.publish({"type": "agent_run_update", "run_id": run_id, "workflow": "assistant", "state": state})
         return {"run_id": run_id, "thread_id": thread_id, "state": state, "interrupted": interrupted, "result": self._safe_res(res)}
 

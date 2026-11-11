@@ -331,6 +331,14 @@ def test_p10_12_3_4_5_skills_lifecycle_security_compat_routing_metrics_and_api(t
     assert "https://github.com/cloudflare/security-audit-skill" in repo_urls
     assert "https://github.com/affaan-m/everything-claude-code" in repo_urls
 
+    def _mock_opencode(prompt: str, *, workdir, **kwargs):
+        from pathlib import Path as _P
+        assert (Path(workdir) / ".opencode" / "skills" / "mattpocock-tdd" / "SKILL.md").exists()
+        (_P(workdir) / "test_api_route.py").write_text("def test_ok(): assert True\n", encoding="utf-8")
+        return {"ok": True, "returncode": 0, "final_text": "Implemented API tests.", "events": [], "isolation": {"backend": "mock"}}
+
+    monkeypatch.setattr("jarvis.integrations.opencode_adapter.run_opencode_task", _mock_opencode)
+
     a = Assistant(settings, data_dir=tmp_path / "skills_data", brain=fake_brain)
     reg = a.orchestrator.skills
     router = a.orchestrator.capability_router
@@ -446,6 +454,16 @@ def test_p10_12_3_4_5_skills_lifecycle_security_compat_routing_metrics_and_api(t
         headers=H,
     )
     assert prev.status_code == 200 and any(s["skill_id"] == "mattpocock-tdd" for s in prev.json()["selected"])
+
+    repo = _init_git_repo(tmp_path, "skills_wf_repo")
+    proj = a.orchestrator.projects.register(name="skills_wf_proj", root_path=repo, test_cmd="python -m pytest -q")
+    res_wf = client.post(
+        "/api/v2/workforce/runs",
+        json={"project_id": proj["id"], "task_prompt": "Implement API unit test using TDD workflow", "qa_command": ["python", "-c", "print('ok')"]},
+        headers=H,
+    )
+    assert res_wf.status_code == 200 and res_wf.json()["state"] in ("awaiting_approval", "completed")
+    assert reg.skill_metrics_summary("mattpocock-tdd")["mattpocock-tdd"]["invocations"] >= 1
 
     # React dist contains SKILLS control panel cleanly
     dist_assets = list((ROOT / "apps" / "frontend" / "dist" / "assets").glob("*.js"))

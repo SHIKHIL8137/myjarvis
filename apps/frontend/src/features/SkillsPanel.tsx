@@ -1,6 +1,15 @@
 import React, { useEffect, useState } from "react";
 import { apiFetch } from "../api/client";
 
+interface LifecycleStates {
+  audited: boolean;
+  approved: boolean;
+  installed: boolean;
+  enabled: boolean;
+  assigned: boolean;
+  successfully_executed: boolean;
+}
+
 interface SkillItem {
   skill_id: string;
   name: string;
@@ -17,6 +26,8 @@ interface SkillItem {
   execution_mode: string;
   enabled: boolean;
   verification_status: string;
+  audit_classification?: string;
+  lifecycle_states?: LifecycleStates;
   last_used_at?: number | null;
   runtime_compat?: Record<string, { compatible: boolean; mode: string; reason: string }>;
   assignments?: Array<{ id: string; agent_role: string; priority: number }>;
@@ -41,6 +52,8 @@ interface CatalogAuditItem {
   jarvis_compatibility: string;
   recommendation: string;
   policy_verdict: string;
+  lifecycle_states?: LifecycleStates;
+  lifecycle_defaults?: LifecycleStates;
 }
 
 interface SkillAuditEntry {
@@ -165,10 +178,17 @@ export const SkillsPanel: React.FC<{ onNotify: (msg: string) => void }> = ({ onN
               <div>
                 <strong>{sk.name}</strong> <span className="dim">({sk.skill_id} v{sk.version})</span>{" "}
                 <span className="pill">{sk.category}</span>{" "}
-                <span className={`pill ${sk.verification_status === "verified" ? "ok" : sk.verification_status === "blocked" ? "danger" : "warn"}`}>
-                  {sk.verification_status}
+                <span className={`pill ${sk.audit_classification === "approved" || sk.verification_status === "verified" ? "ok" : sk.verification_status === "blocked" ? "danger" : "warn"}`}>
+                  {sk.audit_classification || sk.verification_status}
                 </span>{" "}
-                <span className={`pill ${sk.enabled ? "ok" : "danger"}`}>{sk.enabled ? "ENABLED" : "DISABLED"}</span>
+                <span className={`pill ${sk.lifecycle_states?.approved ? "ok" : "warn"}`}>
+                  {sk.lifecycle_states?.approved ? "APPROVED" : "UNAPPROVED"}
+                </span>{" "}
+                <span className={`pill ${sk.enabled ? "ok" : "danger"}`}>{sk.enabled ? "ENABLED" : "DISABLED"}</span>{" "}
+                <span className="pill">{(sk.lifecycle_states?.assigned ?? (sk.assignments || []).length > 0) ? "ASSIGNED" : "UNASSIGNED"}</span>{" "}
+                <span className={`pill ${sk.lifecycle_states?.successfully_executed ? "ok" : ""}`}>
+                  {sk.lifecycle_states?.successfully_executed ? "EXECUTED" : "NOT EXECUTED"}
+                </span>
               </div>
               <div className="row" style={{ flexWrap: "wrap" }}>
                 <button className="ghost" onClick={() => inspectDetails(sk)}>Details</button>
@@ -275,16 +295,32 @@ export const SkillsPanel: React.FC<{ onNotify: (msg: string) => void }> = ({ onN
 
       <div className="card">
         <h3>AUDITED EXTERNAL SKILL SOURCES ({catalog.length})</h3>
-        {catalog.map((c) => (
+        {catalog.map((c) => {
+          const st = c.lifecycle_states || c.lifecycle_defaults || { audited: true, approved: false, installed: false, enabled: false, assigned: false, successfully_executed: false };
+          const verdictClass =
+            c.policy_verdict === "do_not_install" || c.policy_verdict === "blocked" || c.policy_verdict === "incompatible"
+              ? "danger"
+              : c.policy_verdict === "approved" || c.policy_verdict === "approved_with_restrictions"
+              ? "ok"
+              : "warn";
+          return (
           <div key={c.source_id} style={{ padding: "8px 0", borderBottom: "1px solid rgba(255,255,255,0.08)" }}>
             <div className="row" style={{ justifyContent: "space-between", flexWrap: "wrap" }}>
               <div>
                 <strong>{c.source_id}</strong> <span className="pill">{c.license.toUpperCase()}</span>{" "}
-                <span className={`pill ${c.policy_verdict === "do_not_install_framework" ? "danger" : c.policy_verdict.includes("approve") ? "ok" : "warn"}`}>
+                <span className={`pill ${verdictClass}`}>
                   {c.policy_verdict}
                 </span>
               </div>
               <span className="dim">Commit: <code>{c.pinned_commit.slice(0, 12)}</code> ({c.tracked_files} files)</span>
+            </div>
+            <div className="row" style={{ gap: 6, flexWrap: "wrap", marginTop: 4, fontSize: 11 }}>
+              <span className="pill ok">AUDITED</span>
+              <span className={`pill ${st.approved ? "ok" : "warn"}`}>{st.approved ? "APPROVED" : "NOT APPROVED"}</span>
+              <span className={`pill ${st.installed ? "ok" : ""}`}>{st.installed ? "INSTALLED" : "NOT INSTALLED"}</span>
+              <span className={`pill ${st.enabled ? "ok" : ""}`}>{st.enabled ? "ENABLED" : "DISABLED"}</span>
+              <span className={`pill ${st.assigned ? "ok" : ""}`}>{st.assigned ? "ASSIGNED" : "UNASSIGNED"}</span>
+              <span className={`pill ${st.successfully_executed ? "ok" : ""}`}>{st.successfully_executed ? "EXECUTED" : "NOT EXECUTED"}</span>
             </div>
             <div className="dim" style={{ fontSize: 12, marginTop: 2 }}>{c.repo}</div>
             <div style={{ marginTop: 4 }}>{c.recommendation}</div>
@@ -295,7 +331,8 @@ export const SkillsPanel: React.FC<{ onNotify: (msg: string) => void }> = ({ onN
               <div className="dim" style={{ fontSize: 12, marginTop: 2 }}>Security Notes: {c.security_findings.join(" | ")}</div>
             )}
           </div>
-        ))}
+          );
+        })}
       </div>
 
       <div className="card">

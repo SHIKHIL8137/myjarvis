@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useState } from "react";
 import { apiFetch, streamChat } from "./api/client";
 import { GalaxyCanvas, type GraphLink, type GraphNode } from "./components/GalaxyCanvas";
 import { AssistantPanel } from "./features/AssistantPanel";
+import { DecisionPanel } from "./features/DecisionPanel";
 import { GatewayPanel } from "./features/GatewayPanel";
 import { LearningPanel } from "./features/LearningPanel";
 import { MemoryPanel } from "./features/MemoryPanel";
@@ -9,7 +10,7 @@ import { RecoveryPanel } from "./features/RecoveryPanel";
 import { SkillsPanel } from "./features/SkillsPanel";
 import { WorkforcePanel } from "./features/WorkforcePanel";
 
-type Tab = "chat" | "assistant" | "workforce" | "skills" | "memory" | "gateway" | "learning" | "recovery";
+type Tab = "chat" | "assistant" | "decision" | "workforce" | "skills" | "memory" | "gateway" | "learning" | "recovery";
 
 export const App: React.FC = () => {
   const [tab, setTab] = useState<Tab>("chat");
@@ -102,7 +103,7 @@ export const App: React.FC = () => {
         </div>
 
         <nav className="nav-tabs">
-          {(["chat", "assistant", "workforce", "skills", "memory", "gateway", "learning", "recovery"] as Tab[]).map((t) => (
+          {(["chat", "assistant", "decision", "workforce", "skills", "memory", "gateway", "learning", "recovery"] as Tab[]).map((t) => (
             <button key={t} className={`tab-btn ${tab === t ? "active" : ""}`} onClick={() => setTab(t)}>
               {t.toUpperCase()}
             </button>
@@ -161,6 +162,7 @@ export const App: React.FC = () => {
           )}
 
           {tab === "assistant" && <AssistantPanel onNotify={notify} />}
+          {tab === "decision" && <DecisionPanel onNotify={notify} />}
           {tab === "workforce" && (
             <WorkforcePanel
               onNotify={notify}

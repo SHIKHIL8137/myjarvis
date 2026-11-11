@@ -320,7 +320,7 @@ class Assistant:
         self.registry.spec = new.learning
         if hasattr(self, "orchestrator"):
             self.orchestrator.settings = new
-            self.orchestrator.decision.settings = new
+            self.orchestrator.decision.refresh_settings(new)
 
     # ---- turns ---------------------------------------------------------------------------------------
     def _schedule_voice_queue(self):

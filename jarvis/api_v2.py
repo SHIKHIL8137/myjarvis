@@ -9,6 +9,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from .api_deps import make_assistant_dep
+from .api_decision import create_decision_subrouter
 from .api_skills import create_skills_subrouter
 from .departments.assistant.documents import parse_document
 from .gateway.gateway import CloudGatewayError
@@ -523,5 +524,6 @@ def create_v2_router(fallback=None) -> APIRouter:
             raise HTTPException(403 if e.category in ("paid_blocked", "secret_blocked", "privacy_blocked") else 400, str(e)) from e
 
     router.include_router(create_skills_subrouter(fallback))
+    router.include_router(create_decision_subrouter(fallback))
     return router
 

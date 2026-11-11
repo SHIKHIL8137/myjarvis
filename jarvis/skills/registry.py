@@ -7,6 +7,7 @@ from ..agents.approvals import ApprovalService
 from ..db.engine import DatabaseManager
 from ..db.models import AuditEventRow, SkillAssignmentRow, SkillMetricRow, SkillRow, SkillVersionRow
 from .metadata import SkillManifest, compute_directory_sha256, normalize_skill_id
+from .recommended_audit import map_verification_to_classification
 from .validator import SkillValidationError, validate_skill_package
 
 
@@ -72,6 +73,7 @@ class SkillRegistryService:
             "approval_required": bool(r.approval_required),
             "enabled": bool(r.enabled),
             "verification_status": r.verification_status,
+            "audit_classification": map_verification_to_classification(r.verification_status, runtime_compat=m.get("runtime_compat") or {}),
             "install_path": r.install_path,
             "installed_at": r.installed_at,
             "updated_at": r.updated_at,

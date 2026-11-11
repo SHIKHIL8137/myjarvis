@@ -5,7 +5,8 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from .api_deps import make_assistant_dep
-from .skills.discovery import discover_curated_catalog, discover_local_skills
+from .skills.discovery import discover_local_skills
+from .skills.recommended_audit import enrich_catalog_with_registry
 from .skills.registry import SkillValidationError
 
 
@@ -70,17 +71,28 @@ def create_skills_subrouter(fallback=None) -> APIRouter:
         for asn in assignments:
             by_skill_assign.setdefault(asn["skill_id"], []).append(asn)
         for it in items:
-            it["metrics"] = metrics.get(it["skill_id"]) or {"invocations": 0, "quality_assessment": "inconclusive"}
-            it["assignments"] = by_skill_assign.get(it["skill_id"]) or []
+            m_info = metrics.get(it["skill_id"]) or {"invocations": 0, "quality_assessment": "inconclusive"}
+            asn_list = by_skill_assign.get(it["skill_id"]) or []
+            it["metrics"] = m_info
+            it["assignments"] = asn_list
+            it["lifecycle_states"] = {
+                "audited": True,
+                "approved": bool(it.get("verification_status") != "blocked"),
+                "installed": True,
+                "enabled": bool(it.get("enabled")),
+                "assigned": len(asn_list) > 0,
+                "successfully_executed": int(m_info.get("invocations") or 0) > 0 and float(m_info.get("success_rate") or 0.0) > 0.0,
+            }
         return {
             "skills": items,
-            "catalog": discover_curated_catalog(),
+            "catalog": enrich_catalog_with_registry(items, assignments, metrics),
             "audit": reg.recent_audit(limit=30),
         }
 
     @router.get("/skills/catalog/{source_id}")
-    async def get_catalog_audit(source_id: str):
-        for item in discover_curated_catalog():
+    async def get_catalog_audit(source_id: str, a=Depends(get_a)):
+        reg = a.orchestrator.skills
+        for item in enrich_catalog_with_registry(reg.list_skills(), reg.list_assignments(), reg.skill_metrics_summary()):
             if item["source_id"] == source_id:
                 return item
         raise HTTPException(404, f"Unknown catalog source {source_id!r}")

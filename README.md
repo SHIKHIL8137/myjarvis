@@ -69,7 +69,16 @@ Jarvis runs local-first on Windows (Ollama local LLM inference, `faster-whisper`
 
 ## 4B. Agent Skills & Capabilities Manager
 
-- **Central Registry (`SKILLS` tab & `/api/v2/skills/*`)**: Validates external skills before owner-approved installation (license allowlist, deterministic SHA-256 checksum, malicious script & policy-override scanner, runtime compatibility across `jarvis_native`, `opencode`, `claude_code`, `codex`), isolates files in `data/skills/installed/`, tracks version history with atomic rollback, enforces context-budgeted dynamic selection (`AgentCapabilityRouter`), and strictly preserves system-policy precedence over all skill instructions.
+- **Central Registry (`SKILLS` tab & `/api/v2/skills/*`)**: Validates external skills before owner-approved installation (license allowlist, deterministic SHA-256 checksum, malicious script & policy-override scanner, runtime compatibility across `jarvis_native`, `opencode`, `claude_code`, `codex`), isolates files in `data/skills/installed/`, tracks version history with atomic rollback, enforces context-budgeted dynamic selection (`AgentCapabilityRouter`), strictly preserves system-policy precedence over all skill instructions, and separates `audited`, `approved`, `installed`, `enabled`, `assigned`, and `successfully_executed` states under the strict 6-class taxonomy (`approved`, `approved_with_restrictions`, `needs_manual_review`, `blocked`, `incompatible`, `do_not_install`).
+
+## 4C. Experimental Laya Decision Engine Adapter (`DECISION` Tab)
+
+- **Isolated Sidecar (`disabled` by default)**: Runs [`laya`](https://github.com/NandhaKishorM/laya) (`convaiinnovations/laya-multilingual` or `vegaml`) strictly inside an isolated virtualenv (`data/laya_iso_venv`) over loopback (`127.0.0.1:4710`, `POST /internal/decision/classify`) so heavy ML dependencies (`torch`, `transformers`, `vegaml`) remain isolated from core `.venv`:
+  ```powershell
+  $env:HF_HOME = "d:\projects\myjarvis\data\laya_hf_cache"
+  .\data\laya_iso_venv\Scripts\python.exe -m jarvis.decision.laya_service --host 127.0.0.1 --port 4710 --checkpoint multilingual --device cpu --preload
+  ```
+- **Safe Rollout & Security**: Supports `disabled`, `shadow` (default when enabled), `laya_primary`, and `laya_with_heuristic_fallback` modes with timeouts, circuit breakers, strict enum schema validation, and hard security policy overrides (classifiers cannot authorize shell commands, file deletion, DB migrations/restores, git merges, deployments, credentials, network overrides, skill installs, or privileges). See `P10_13_LAYA_BENCHMARK_REPORT.md` for measured CPU benchmark tradeoffs before enabling beyond `shadow`.
 
 ---
 
@@ -89,6 +98,7 @@ Jarvis runs local-first on Windows (Ollama local LLM inference, `faster-whisper`
 | `JARVIS_PROD_DATABASE_URL` / `JARVIS_DEV_DATABASE_URL` | Registered remote production / dev PostgreSQL targets protected by `DatabaseTargetRegistry` |
 | `JARVIS_PG_TEST_URL` / `JARVIS_PG_SCRATCH_URL` | Optional live PostgreSQL + `pgvector` and scratch restore DB URLs for `@pytest.mark.pg` integration tests |
 | `OLLAMA_HOST` | Loopback Ollama bind address (`127.0.0.1:11434`) |
+| `JARVIS_LAYA_ENABLED` / `JARVIS_LAYA_MODE` / `JARVIS_LAYA_BASE_URL` | Optional isolated Laya decision classifier settings (`false`, `shadow`, `http://127.0.0.1:4710`) |
 | `OPENROUTER_API_KEY` / `GEMINI_API_KEY` / `HF_TOKEN` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | Optional provider API keys (also storable in DPAPI-encrypted `data/secrets.json`) |
 
 ---

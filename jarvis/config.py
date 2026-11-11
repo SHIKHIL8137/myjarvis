@@ -301,6 +301,38 @@ class GatewaySpec(BaseModel):
     max_queue_size: int = Field(16, ge=2, le=100)
 
 
+class LayaSpec(BaseModel):
+    """Isolated optional Laya System 1 Layer 2 Decision Classifier configuration (`disabled` by default)."""
+
+    enabled: bool = False
+    mode: str = Field("shadow", pattern="^(disabled|shadow|laya_primary|laya_with_heuristic_fallback)$")
+    service_mode: str = Field("http", pattern="^(http|subprocess)$")
+    base_url: str = "http://127.0.0.1:4710"
+    python_bin: str = "data/laya_iso_venv/Scripts/python.exe"
+    checkpoint: str = Field("multilingual", pattern="^(english|multilingual|typed-decisions|vegaml)$")
+    device: str = Field("cpu", pattern="^(cpu|cuda|auto)$")
+    timeout_ms: int = Field(1500, ge=100, le=30000)
+    max_concurrency: int = Field(1, ge=1, le=8)
+    max_resident_models: int = Field(1, ge=1, le=3)
+    confidence_threshold: float = Field(0.70, ge=0.1, le=0.99)
+    abstain_enabled: bool = True
+    circuit_breaker_failures: int = Field(3, ge=1, le=20)
+    circuit_breaker_cooldown_s: float = Field(30.0, ge=2.0, le=600.0)
+    cache_enabled: bool = True
+    calibration_dir: str = "data/decision/calibration"
+
+    @field_validator("base_url")
+    @classmethod
+    def _loopback_base_url(cls, v: str) -> str:
+        s = (v or "").strip().rstrip("/")
+        if not s:
+            return "http://127.0.0.1:4710"
+        host = (urlsplit(s).hostname or "").lower()
+        if host not in ("127.0.0.1", "localhost", "::1"):
+            raise ValueError(f"Laya service base_url must remain loopback-only; got {v!r}")
+        return s
+
+
 class WorkforceSpec(BaseModel):
     enabled: bool = True
     opencode_bin: str = "opencode"
@@ -409,6 +441,7 @@ class Settings(BaseModel):
     learning: LearningSpec = LearningSpec()
     database: DatabaseSpec = DatabaseSpec()
     gateway: GatewaySpec = GatewaySpec()
+    laya: LayaSpec = LayaSpec()
     workforce: WorkforceSpec = WorkforceSpec()
     recovery: RecoverySpec = RecoverySpec()
     skills: SkillsSpec = SkillsSpec()
@@ -436,12 +469,42 @@ def _deep_merge(a: dict, b: dict) -> dict:
     return out
 
 
+def _apply_laya_env_overrides(raw: dict) -> dict:
+    """Apply explicit `JARVIS_LAYA_*` environment variables when configured."""
+    laya_cfg = dict(raw.get("laya") or {})
+    env_bools = {"JARVIS_LAYA_ENABLED": "enabled", "JARVIS_LAYA_ABSTAIN_ENABLED": "abstain_enabled", "JARVIS_LAYA_CACHE_ENABLED": "cache_enabled"}
+    for ek, fk in env_bools.items():
+        if ek in os.environ:
+            laya_cfg[fk] = os.environ[ek].strip().lower() in ("1", "true", "yes", "on")
+    env_strs = {
+        "JARVIS_LAYA_MODE": "mode",
+        "JARVIS_LAYA_SERVICE_MODE": "service_mode",
+        "JARVIS_LAYA_BASE_URL": "base_url",
+        "JARVIS_LAYA_PYTHON_BIN": "python_bin",
+        "JARVIS_LAYA_CHECKPOINT": "checkpoint",
+        "JARVIS_LAYA_DEVICE": "device",
+        "JARVIS_LAYA_CALIBRATION_DIR": "calibration_dir",
+    }
+    for ek, fk in env_strs.items():
+        if val := os.environ.get(ek, "").strip():
+            laya_cfg[fk] = val
+    for ek, fk in (("JARVIS_LAYA_TIMEOUT_MS", "timeout_ms"), ("JARVIS_LAYA_MAX_CONCURRENCY", "max_concurrency"), ("JARVIS_LAYA_MAX_RESIDENT_MODELS", "max_resident_models")):
+        if val := os.environ.get(ek, "").strip():
+            laya_cfg[fk] = int(val)
+    if val := os.environ.get("JARVIS_LAYA_CONFIDENCE_THRESHOLD", "").strip():
+        laya_cfg["confidence_threshold"] = float(val)
+    if laya_cfg:
+        raw["laya"] = laya_cfg
+    return raw
+
+
 def load_settings(config_path: Path | None = None, overrides_path: Path | None = None) -> Settings:
     config_path = config_path or ROOT / "config.json"
     overrides_path = overrides_path or DATA / "settings.json"
     raw = json.loads(config_path.read_text(encoding="utf-8"))
     if overrides_path.exists():
         raw = _deep_merge(raw, json.loads(overrides_path.read_text(encoding="utf-8")))
+    raw = _apply_laya_env_overrides(raw)
     return Settings.model_validate(raw)
 
 
