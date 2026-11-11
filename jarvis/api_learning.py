@@ -79,6 +79,12 @@ class TrainingJobCreateIn(BaseModel):
     max_seq_length: int = Field(512, ge=128, le=4096)
 
 
+class TrainingStartIn(BaseModel):
+    override: bool = False
+    override_reason: str = ""
+    actor: str = "ui_user"
+
+
 class CandidateRegisterIn(BaseModel):
     base_model: str = Field(..., min_length=1, max_length=120)
     artifact_type: str = Field("ollama_tag", pattern="^(ollama_tag|gguf_adapter|peft_lora)$")
@@ -269,11 +275,24 @@ def create_learning_router(fallback=None) -> APIRouter:
         return a.training_manager.approve_job(job_id, approver="ui_user")
 
     @router.post("/api/learning/training/jobs/{job_id}/start")
-    async def start_training_job(job_id: str, a=Depends(get_a)):
+    async def start_training_job(job_id: str, body: TrainingStartIn | None = None, a=Depends(get_a)):
+        b = body or TrainingStartIn()
         try:
-            return a.training_manager.start_job(job_id)
+            h = await a.brain.health()
+            return a.training_manager.start_job(
+                job_id,
+                force_spawn_even_if_blocked=False,
+                override=b.override,
+                override_reason=b.override_reason,
+                actor=b.actor,
+                ollama_ps=h.get("loaded") or [],
+            )
+        except FileNotFoundError as e:
+            raise HTTPException(404, str(e)) from e
         except PermissionError as e:
             raise HTTPException(403, str(e)) from e
+        except RuntimeError as e:
+            raise HTTPException(409, str(e)) from e
 
     @router.post("/api/learning/training/jobs/{job_id}/pause")
     async def pause_training_job(job_id: str, a=Depends(get_a)):

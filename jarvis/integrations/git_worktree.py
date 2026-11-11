@@ -1,4 +1,4 @@
-"""Isolated Git worktree lifecycle, execution policy sandbox, and full-change manifest builder."""
+"""Isolated Git worktree lifecycle, execution policy sandbox (Docker/restricted), process tracking, & complete manifest builder."""
 from dataclasses import dataclass, field
 import hashlib
 import json
@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import uuid
 
@@ -32,15 +33,84 @@ _QA_RELEVANT_EXTS = {
     ".py", ".ts", ".tsx", ".js", ".jsx", ".sql", ".json", ".toml", ".yml", ".yaml",
     ".ps1", ".sh", ".env", ".cfg", ".ini", ".dockerfile",
 }
+DEFAULT_MAX_SCAN_FILE_BYTES = 2 * 1024 * 1024  # 2 MB hard safety bound; oversized changed text files fail review
+
+_PROC_LOCK = threading.Lock()
+_ACTIVE_RUN_PROCS: dict[str, list[dict]] = {}
 
 
 class GitWorktreeError(RuntimeError):
     """Raised when a Git worktree operation, manifest check, or sandbox policy fails."""
 
 
+def register_run_process(run_id: str | None, proc: subprocess.Popen, *, container_cid_file: Path | None = None) -> None:
+    if not run_id:
+        return
+    with _PROC_LOCK:
+        _ACTIVE_RUN_PROCS.setdefault(run_id, []).append({"proc": proc, "cid_file": container_cid_file})
+
+
+def unregister_run_process(run_id: str | None, proc: subprocess.Popen) -> None:
+    if not run_id:
+        return
+    with _PROC_LOCK:
+        items = _ACTIVE_RUN_PROCS.get(run_id) or []
+        _ACTIVE_RUN_PROCS[run_id] = [it for it in items if it.get("proc") is not proc]
+        if not _ACTIVE_RUN_PROCS[run_id]:
+            _ACTIVE_RUN_PROCS.pop(run_id, None)
+
+
+def _terminate_proc_tree(proc: subprocess.Popen, cid_file: Path | None = None) -> None:
+    if cid_file and cid_file.exists():
+        try:
+            cid = cid_file.read_text(encoding="utf-8", errors="ignore").strip()
+            if cid and (docker_exe := shutil.which("docker")):
+                subprocess.run([docker_exe, "rm", "-f", cid], capture_output=True, timeout=10, shell=False)
+        except Exception:
+            pass
+    if proc.poll() is not None:
+        return
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True, timeout=10, shell=False)
+        else:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def cancel_run_processes(run_id: str) -> int:
+    """Terminate all active coding/QA child processes and containers registered under `run_id`."""
+    with _PROC_LOCK:
+        entries = list(_ACTIVE_RUN_PROCS.get(run_id) or [])
+    killed = 0
+    for ent in entries:
+        _terminate_proc_tree(ent["proc"], ent.get("cid_file"))
+        killed += 1
+    return killed
+
+
+def is_docker_available() -> bool:
+    docker_exe = shutil.which("docker")
+    if not docker_exe:
+        return False
+    try:
+        r = subprocess.run([docker_exe, "info", "--format", "{{.ServerVersion}}"], capture_output=True, text=True, timeout=4, shell=False)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
 @dataclass
 class ExecutionPolicy:
-    """Configurable worktree execution policy with honest capability reporting."""
+    """Configurable worktree & OpenCode execution sandbox policy with Docker support & honest limitations."""
 
     allowed_workdirs: list[Path] = field(default_factory=list)
     allowed_executables: set[str] = field(default_factory=lambda: set(_DEFAULT_ALLOWED_BINS))
@@ -48,35 +118,45 @@ class ExecutionPolicy:
     timeout_s: int = 120
     max_memory_mb: int = 1024
     cpu_seconds: int = 120
+    cpus: float = 2.0
     env_allowlist: set[str] = field(default_factory=lambda: set(_SAFE_ENV_KEYS))
     network_mode: str = "none"  # "none" | "host"
     permissions: set[str] = field(default_factory=lambda: {"read", "write", "execute"})
     sandbox_backend: str = "restricted_subprocess"  # "restricted_subprocess" | "docker"
     docker_image: str = "python:3.12-slim"
+    allow_host_fallback: bool = False
+    read_only_root_fs: bool = True
 
-    def capabilities(self) -> dict:
-        docker_exe = shutil.which("docker")
-        using_docker = self.sandbox_backend == "docker" and bool(docker_exe)
+    def capabilities(self, *, docker_ready: bool | None = None) -> dict:
+        ready = is_docker_available() if docker_ready is None else docker_ready
+        using_docker = self.sandbox_backend == "docker" and ready
         if using_docker:
             return {
                 "backend": "docker",
+                "requested_backend": self.sandbox_backend,
                 "directory_scoping": True,
                 "env_filtering": True,
                 "executable_allowlist": True,
                 "os_filesystem_isolation": True,
                 "os_network_isolation": self.network_mode == "none",
+                "read_only_root_fs": self.read_only_root_fs,
+                "cap_drop_all": True,
+                "no_host_secrets_mounted": True,
                 "memory_limit_mb": self.max_memory_mb,
                 "cpu_seconds_limit": self.cpu_seconds,
+                "cpus": self.cpus,
                 "limitations": [],
             }
-        limitations = [
-            "Directory scoping, executable allowlisting, and environment filtering active; "
-            + (
-                "OS-level network/filesystem namespace isolation requires Docker backend on Windows."
+        degraded_note = (
+            "Docker backend requested but Docker daemon is unavailable; fell back to restricted_subprocess (OS isolation NOT active)."
+            if self.sandbox_backend == "docker"
+            else (
+                "Directory scoping, executable allowlisting, and environment filtering active; "
+                "OS-level network/filesystem namespace isolation is NOT enforced on native Windows without Docker."
                 if os.name == "nt"
-                else "POSIX RLIMIT CPU/memory enforced; full network jail requires Docker backend."
+                else "Directory scoping, env filtering, and POSIX RLIMIT CPU/memory active; network jail requires Docker."
             )
-        ]
+        )
         return {
             "backend": "restricted_subprocess",
             "requested_backend": self.sandbox_backend,
@@ -85,9 +165,12 @@ class ExecutionPolicy:
             "executable_allowlist": True,
             "os_filesystem_isolation": False,
             "os_network_isolation": False,
+            "read_only_root_fs": False,
+            "cap_drop_all": False,
+            "no_host_secrets_mounted": True,
             "memory_limit_mb": self.max_memory_mb if os.name != "nt" else None,
             "cpu_seconds_limit": self.cpu_seconds if os.name != "nt" else None,
-            "limitations": limitations,
+            "limitations": [degraded_note],
         }
 
     def validate_access(self, target_dir: Path, required_perm: str, exe_name: str | None = None) -> Path:
@@ -105,6 +188,46 @@ class ExecutionPolicy:
             if self.allowed_executables and stem not in {a.lower() for a in self.allowed_executables}:
                 raise GitWorktreeError(f"Executable {exe_name!r} is not allowlisted by execution policy")
         return resolved
+
+
+def build_docker_run_cmd(
+    workdir: Path,
+    argv: list[str],
+    policy: ExecutionPolicy,
+    *,
+    cid_file: Path,
+    extra_env: dict[str, str] | None = None,
+) -> list[str]:
+    """Construct strict unprivileged container invocation mounting ONLY worktree RW and never host secrets."""
+    docker_exe = shutil.which("docker") or "docker"
+    wd = Path(workdir).resolve()
+    net = "none" if policy.network_mode != "host" else "host"
+    cmd = [
+        docker_exe,
+        "run",
+        "--rm",
+        "--init",
+        "--cidfile",
+        str(cid_file),
+        f"--network={net}",
+        "--memory",
+        f"{int(policy.max_memory_mb)}m",
+        "--cpus",
+        str(float(policy.cpus)),
+        "--cap-drop=ALL",
+        "--security-opt=no-new-privileges:true",
+    ]
+    if policy.read_only_root_fs:
+        cmd.extend(["--read-only", "--tmpfs", "/tmp:rw,noexec,nosuid,size=128m"])
+    filtered_env = {k: v for k, v in os.environ.items() if k.upper() in policy.env_allowlist and k.upper() not in {"PATH", "HOME", "USERPROFILE", "COMSPEC"}}
+    if extra_env:
+        for k, v in extra_env.items():
+            if k.upper() in policy.env_allowlist:
+                filtered_env[k] = v
+    for k, v in sorted(filtered_env.items()):
+        cmd.extend(["-e", f"{k}={v}"])
+    cmd.extend(["-v", f"{wd}:/workspace:rw", "-w", "/workspace", policy.docker_image, *argv])
+    return cmd
 
 
 def _run_git(cwd: Path, args: list[str], timeout_s: int = 30) -> subprocess.CompletedProcess:
@@ -183,7 +306,7 @@ def create_worktree(
     *,
     ensure_unique: bool = False,
 ) -> dict:
-    """Create a strictly isolated task-specific branch + worktree without overwriting existing worktrees."""
+    """Create a strictly isolated branch + worktree and capture immutable original `base_sha`."""
     root = _validate_repo_root(repo_root)
     if ".." in Path(worktree_root_name).parts or Path(worktree_root_name).is_absolute():
         raise GitWorktreeError("Invalid worktree root directory name")
@@ -203,18 +326,21 @@ def create_worktree(
     if _branch_exists(root, branch):
         raise GitWorktreeError(f"Worktree branch '{branch}' already exists; refusing overwrite")
 
+    base_sha = git_head_sha(root)
     wt_base.mkdir(parents=True, exist_ok=True)
-    proc = _run_git(root, ["worktree", "add", "-b", branch, str(wt_path), "HEAD"])
+    proc = _run_git(root, ["worktree", "add", "-b", branch, str(wt_path), base_sha or "HEAD"])
     if proc.returncode != 0:
         raise GitWorktreeError(f"git worktree add failed: {proc.stderr.strip() or proc.stdout.strip()}")
 
+    head_sha = git_head_sha(wt_path)
     info = {
         "repo_root": str(root),
         "worktree_path": str(wt_path),
         "branch": branch,
         "slug": slug,
         "task_id": task_id,
-        "head_sha": git_head_sha(wt_path),
+        "base_sha": base_sha or head_sha,
+        "head_sha": head_sha,
         "created_at": round(time.time(), 3),
     }
     _write_owner(wt_base, slug, info)
@@ -260,7 +386,7 @@ def _parse_porcelain_z(raw_z: str) -> list[dict]:
 
 
 def _parse_diff_raw(raw_z: str) -> dict[str, dict]:
-    """Map path -> {old_mode, new_mode, status} from `git diff HEAD --raw -z`."""
+    """Map path -> {old_mode, new_mode, status, old_path} from `git diff ... --raw -z -M`."""
     modes: dict[str, dict] = {}
     parts = [p for p in raw_z.split("\0") if p != ""]
     i = 0
@@ -272,99 +398,138 @@ def _parse_diff_raw(raw_z: str) -> dict[str, dict]:
             new_m = toks[1] if len(toks) > 1 else ""
             st = toks[4] if len(toks) > 4 else ""
             if st.startswith(("R", "C")) and i + 2 < len(parts):
-                p = parts[i + 2]
+                old_p = parts[i + 1]
+                new_p = parts[i + 2]
+                modes[new_p] = {"old_mode": old_m, "new_mode": new_m, "git_status": st, "old_path": old_p}
                 i += 3
             else:
                 p = parts[i + 1]
+                modes[p] = {"old_mode": old_m, "new_mode": new_m, "git_status": st, "old_path": None}
                 i += 2
-            modes[p] = {"old_mode": old_m, "new_mode": new_m, "git_status": st}
         else:
             i += 1
     return modes
 
 
 def _parse_numstat_z(raw_z: str) -> dict[str, bool]:
-    """Detect Git-flagged binary files via `git diff HEAD --numstat -z`."""
+    """Detect Git-flagged binary files via `git diff ... --numstat -z`."""
     bins: dict[str, bool] = {}
-    for rec in raw_z.split("\0"):
+    tokens = raw_z.split("\0")
+    i = 0
+    while i < len(tokens):
+        rec = tokens[i]
         if "\t" not in rec:
+            i += 1
             continue
         cols = rec.split("\t", 2)
         if len(cols) == 3:
             added, removed, fpath = cols
+            if not fpath and i + 2 < len(tokens):
+                # `-z` rename record: `adds\trem\t\0old\0new`
+                fpath = tokens[i + 2]
+                i += 2
             bins[fpath] = (added == "-" and removed == "-")
+        i += 1
     return bins
 
 
-def build_change_manifest(worktree_path: Path) -> dict:
-    """Build complete change manifest covering staged, unstaged, untracked, renamed, deleted, binary, mode, & symlink files."""
+def _git_status_map(raw_z: str) -> dict[str, dict]:
+    out: dict[str, dict] = {}
+    for item in _parse_porcelain_z(raw_z):
+        out[item["path"]] = item
+    return out
+
+
+def build_change_manifest(
+    worktree_path: Path,
+    base_sha: str | None = None,
+    *,
+    max_scan_file_bytes: int = DEFAULT_MAX_SCAN_FILE_BYTES,
+) -> dict:
+    """Build complete change manifest from original `base_sha` through current `HEAD` + working tree + untracked files.
+    Detects committed secrets/files, staged/unstaged/untracked changes, renames (old+new), deletions, symlinks, modes, & binary files."""
     wt = Path(worktree_path).resolve()
     if not wt.exists():
         raise GitWorktreeError(f"Worktree does not exist: {wt}")
 
+    owner = _read_owner(wt.parent, wt.name) or {}
+    cur_head = git_head_sha(wt)
+    orig_base = (base_sha or owner.get("base_sha") or cur_head).strip()
+
+    # 1. Committed range diff: orig_base -> HEAD
+    committed_raw = _run_git(wt, ["diff", orig_base, "HEAD", "--raw", "-z", "-M"]) if orig_base and cur_head and orig_base != cur_head else subprocess.CompletedProcess([], 0, "", "")
+    committed_num = _run_git(wt, ["diff", orig_base, "HEAD", "--numstat", "-z", "-M"]) if orig_base and cur_head and orig_base != cur_head else subprocess.CompletedProcess([], 0, "", "")
+    committed_diff = _run_git(wt, ["diff", orig_base, "HEAD"]) if orig_base and cur_head and orig_base != cur_head else subprocess.CompletedProcess([], 0, "", "")
+
+    # 2. Cumulative base -> working tree + untracked
     st_z = _run_git(wt, ["status", "--porcelain=v1", "-z", "-uall"])
-    raw_z = _run_git(wt, ["diff", "HEAD", "--raw", "-z"])
-    num_z = _run_git(wt, ["diff", "HEAD", "--numstat", "-z"])
+    wt_raw = _run_git(wt, ["diff", "HEAD", "--raw", "-z", "-M"])
+    wt_num = _run_git(wt, ["diff", "HEAD", "--numstat", "-z", "-M"])
     df = _run_git(wt, ["diff", "HEAD"])
     df_cached = _run_git(wt, ["diff", "--cached"])
 
-    porcelain = _parse_porcelain_z(st_z.stdout)
-    mode_map = _parse_diff_raw(raw_z.stdout)
-    bin_map = _parse_numstat_z(num_z.stdout)
+    committed_modes = _parse_diff_raw(committed_raw.stdout)
+    committed_bins = _parse_numstat_z(committed_num.stdout)
+    wt_modes = _parse_diff_raw(wt_raw.stdout)
+    wt_bins = _parse_numstat_z(wt_num.stdout)
+    porcelain_map = _git_status_map(st_z.stdout)
 
+    all_paths = sorted(set(committed_modes) | set(wt_modes) | set(porcelain_map))
     entries: list[dict] = []
-    untracked_corpus_parts: list[str] = []
     changed_files: list[str] = []
     untracked_files: list[str] = []
 
-    for item in porcelain:
-        xy = item["xy"]
-        rel = item["path"]
-        old_rel = item["old_path"]
-        mode_info = mode_map.get(rel, {})
-        abs_p = (wt / rel).resolve()
-        contained = abs_p == wt or wt in abs_p.parents
+    for rel in all_paths:
+        c_info = committed_modes.get(rel)
+        w_info = wt_modes.get(rel)
+        p_info = porcelain_map.get(rel)
+
+        xy = p_info["xy"] if p_info else "  "
+        old_rel = (p_info["old_path"] if p_info else None) or (w_info or {}).get("old_path") or (c_info or {}).get("old_path")
+        mode_info = w_info or c_info or {}
+        committed_changed = c_info is not None
 
         if xy == "??":
             change_type = "untracked"
             untracked_files.append(rel)
-        elif "D" in xy:
-            change_type = "deleted"
-            changed_files.append(rel)
-        elif "R" in xy:
-            change_type = "renamed"
-            changed_files.append(rel)
-        elif "A" in xy:
-            change_type = "added"
-            changed_files.append(rel)
-        elif "T" in xy:
-            change_type = "typechange"
-            changed_files.append(rel)
         else:
-            change_type = "modified"
+            st_char = (p_info["xy"].strip() if p_info else "") or (mode_info.get("git_status") or "")
+            if "D" in xy or st_char.startswith("D"):
+                change_type = "deleted"
+            elif "R" in xy or st_char.startswith("R"):
+                change_type = "renamed"
+            elif "A" in xy or st_char.startswith("A"):
+                change_type = "added"
+            elif "T" in xy or st_char.startswith("T"):
+                change_type = "typechange"
+            else:
+                change_type = "modified"
             changed_files.append(rel)
 
         staged = xy[0] not in (" ", "?")
         unstaged = xy[1] not in (" ", "?")
+        abs_p = (wt / rel).resolve()
+        contained = abs_p == wt or wt in abs_p.parents
         is_symlink = abs_p.is_symlink() or mode_info.get("new_mode") == "120000"
-        is_binary = bool(bin_map.get(rel, False))
+        is_binary = bool(wt_bins.get(rel) or committed_bins.get(rel))
+        size_bytes = 0
+        oversized = False
         content_hash = "deleted"
         mode_changed = bool(
             mode_info.get("old_mode")
             and mode_info.get("new_mode")
-            and mode_info["old_mode"] != "000000"
+            and mode_info["old_mode"] not in ("000000", "")
             and mode_info["old_mode"] != mode_info["new_mode"]
         )
 
         if change_type != "deleted" and contained and abs_p.exists() and not is_symlink and abs_p.is_file():
+            size_bytes = int(abs_p.stat().st_size)
             content_hash = _sha256_file(abs_p)
             prefix = abs_p.read_bytes()[:4096]
             if b"\x00" in prefix:
                 is_binary = True
-            elif change_type in ("untracked", "added"):
-                # Explicitly include untracked & newly staged files so scanning never skips them
-                txt = abs_p.read_text(encoding="utf-8", errors="replace")[:65_536]
-                untracked_corpus_parts.append(f"--- NEW_FILE: {rel}\n{txt}")
+            elif size_bytes > max_scan_file_bytes:
+                oversized = True
         elif is_symlink:
             try:
                 content_hash = hashlib.sha256(str(os.readlink(abs_p)).encode("utf-8", errors="replace")).hexdigest()
@@ -378,6 +543,7 @@ def build_change_manifest(worktree_path: Path) -> dict:
                 "old_path": old_rel,
                 "change_type": change_type,
                 "porcelain_xy": xy,
+                "committed": committed_changed,
                 "staged": staged,
                 "unstaged": unstaged,
                 "old_mode": mode_info.get("old_mode", ""),
@@ -385,6 +551,8 @@ def build_change_manifest(worktree_path: Path) -> dict:
                 "mode_changed": mode_changed,
                 "is_binary": is_binary,
                 "is_symlink": is_symlink,
+                "size_bytes": size_bytes,
+                "oversized": oversized,
                 "contained_in_worktree": contained,
                 "content_hash": content_hash,
                 "qa_relevant": (ext in _QA_RELEVANT_EXTS) or ("test" in rel.lower()),
@@ -396,27 +564,34 @@ def build_change_manifest(worktree_path: Path) -> dict:
 
     entries.sort(key=lambda e: e["path"])
     digest_basis = json.dumps(
-        [(e["path"], e["change_type"], e["new_mode"], e["content_hash"], e["is_symlink"]) for e in entries],
+        [(e["path"], e["old_path"], e["change_type"], e["committed"], e["new_mode"], e["content_hash"], e["is_symlink"]) for e in entries],
         sort_keys=True,
     ).encode("utf-8")
     manifest_sha256 = hashlib.sha256(digest_basis).hexdigest()
+    full_diff_bytes = (committed_diff.stdout + "\n" + df.stdout).encode("utf-8", errors="replace")
+    diff_hash = hashlib.sha256(full_diff_bytes).hexdigest()
+    approval_fingerprint = hashlib.sha256(f"{orig_base}:{cur_head}:{manifest_sha256}:{diff_hash}".encode("utf-8")).hexdigest()
 
     st_short = _run_git(wt, ["status", "--short"])
     return {
+        "base_sha": orig_base,
+        "head_sha": cur_head,
         "status_short": st_short.stdout.strip(),
+        "committed_diff": committed_diff.stdout,
         "diff": df.stdout[:40_000],
         "cached_diff": df_cached.stdout[:20_000],
         "changed_files": changed_files,
         "untracked_files": untracked_files,
         "manifest": entries,
         "manifest_sha256": manifest_sha256,
-        "untracked_corpus": "\n".join(untracked_corpus_parts),
+        "diff_hash": diff_hash,
+        "approval_fingerprint": approval_fingerprint,
     }
 
 
-def worktree_diff(worktree_path: Path) -> dict:
-    """Inspect all tracked + untracked + mode + binary changes inside the isolated worktree."""
-    return build_change_manifest(worktree_path)
+def worktree_diff(worktree_path: Path, base_sha: str | None = None) -> dict:
+    """Inspect all committed + staged + unstaged + untracked + mode + binary changes inside the worktree."""
+    return build_change_manifest(worktree_path, base_sha=base_sha)
 
 
 def _posix_limits_fn(policy: ExecutionPolicy):
@@ -438,8 +613,10 @@ def run_worktree_command(
     *,
     timeout_s: int | None = None,
     policy: ExecutionPolicy | None = None,
+    run_id: str | None = None,
+    cancel_check=None,
 ) -> dict:
-    """Execute an allowlisted verification/lint command strictly inside the worktree under ExecutionPolicy."""
+    """Execute an allowlisted verification/lint command inside `worktree_path` under `ExecutionPolicy`."""
     if not argv:
         raise GitWorktreeError("Empty command argv")
     pol = policy or ExecutionPolicy(allowed_workdirs=[Path(worktree_path).resolve()])
@@ -449,35 +626,18 @@ def run_worktree_command(
 
     exe_name = Path(argv[0]).stem.lower()
     eff_timeout = int(timeout_s or pol.timeout_s)
-    caps = pol.capabilities()
+    docker_ok = is_docker_available() if pol.sandbox_backend == "docker" else False
+    if pol.sandbox_backend == "docker" and not docker_ok and not pol.allow_host_fallback:
+        raise GitWorktreeError("Docker sandbox backend requested for QA execution, but Docker daemon is unavailable.")
+    caps = pol.capabilities(docker_ready=docker_ok)
 
+    cid_file: Path | None = None
     if caps["backend"] == "docker":
-        docker_exe = shutil.which("docker") or "docker"
-        cmd = [
-            docker_exe,
-            "run",
-            "--rm",
-            f"--network={pol.network_mode}",
-            "--memory",
-            f"{pol.max_memory_mb}m",
-            "-v",
-            f"{wt}:/workspace",
-            "-w",
-            "/workspace",
-            pol.docker_image,
-            *argv,
-        ]
+        cid_file = wt.parent / f".qa-{uuid.uuid4().hex[:8]}.cid"
+        cmd = build_docker_run_cmd(wt, argv, pol, cid_file=cid_file)
         env = {k: v for k, v in os.environ.items() if k.upper() in pol.env_allowlist}
-        proc = subprocess.run(
-            cmd,
-            env=env,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=eff_timeout,
-            shell=False,
-        )
+        cwd_arg = None
+        preexec = None
     else:
         venv_sibling = Path(sys.executable).with_name(f"{exe_name}.exe" if os.name == "nt" else exe_name)
         if exe_name in ("python", "python3"):
@@ -486,28 +646,47 @@ def run_worktree_command(
             resolved = str(venv_sibling)
         else:
             resolved = shutil.which(f"{argv[0]}.exe") or shutil.which(f"{argv[0]}.cmd") or shutil.which(argv[0]) or argv[0]
+        cmd = [resolved, *argv[1:]]
         env = {k: v for k, v in os.environ.items() if k.upper() in pol.env_allowlist}
         env["PYTHONUTF8"] = "1"
+        cwd_arg = str(wt)
         preexec = _posix_limits_fn(pol)
-        proc = subprocess.run(
-            [resolved, *argv[1:]],
-            cwd=str(wt),
-            env=env,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=eff_timeout,
-            preexec_fn=preexec,
-            shell=False,
-        )
+
+    proc = subprocess.Popen(
+        cmd,
+        cwd=cwd_arg,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        preexec_fn=preexec,
+        shell=False,
+    )
+    register_run_process(run_id, proc, container_cid_file=cid_file)
+    deadline = time.monotonic() + eff_timeout
+    try:
+        while proc.poll() is None:
+            if cancel_check and cancel_check():
+                _terminate_proc_tree(proc, cid_file)
+                raise GitWorktreeError("Execution cancelled cleanly by operator.")
+            if time.monotonic() > deadline:
+                _terminate_proc_tree(proc, cid_file)
+                raise subprocess.TimeoutExpired(cmd, eff_timeout)
+            time.sleep(0.1)
+        stdout, stderr = proc.communicate(timeout=2)
+    finally:
+        unregister_run_process(run_id, proc)
+        if cid_file and cid_file.exists():
+            cid_file.unlink(missing_ok=True)
 
     return {
         "argv": argv,
         "returncode": proc.returncode,
         "passed": proc.returncode == 0,
-        "stdout": proc.stdout[:12_000],
-        "stderr": proc.stderr[:6_000],
+        "stdout": (stdout or "")[:12_000],
+        "stderr": (stderr or "")[:6_000],
         "isolation": caps,
     }
 
@@ -525,7 +704,7 @@ def commit_worktree_changes(worktree_path: Path, message: str) -> dict:
 
 
 def merge_worktree(repo_root: Path, branch_name: str, worktree_path: Path, commit_msg: str = "Jarvis verified coding task") -> dict:
-    """Commit worktree changes cleanly and merge into target repository HEAD (call ONLY after human approval + passed QA!)."""
+    """Commit remaining worktree changes cleanly and merge into target repository HEAD (call ONLY after passed QA + scan + pinned approval!)."""
     root = _validate_repo_root(repo_root)
     wt = Path(worktree_path).resolve()
     commit_res = commit_worktree_changes(wt, commit_msg)
@@ -602,6 +781,7 @@ def recover_orphaned_worktrees(repo_root: Path, worktree_root_name: str = ".jarv
                 "path": str(entry),
                 "task_id": owner.get("task_id"),
                 "branch": owner.get("branch"),
+                "base_sha": owner.get("base_sha"),
                 "has_uncommitted": bool(dirty),
             }
         )

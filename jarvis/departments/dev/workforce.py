@@ -1,4 +1,4 @@
-"""Multi-project registry & Dev Workforce verification, manifest scanning, and sandbox services."""
+"""Multi-project registry & Dev Workforce verification, streaming manifest scanning, and sandbox services."""
 from pathlib import Path
 import re
 import time
@@ -25,19 +25,65 @@ _EXTRA_SECRET_PATTERNS = [
 _SENSITIVE_FILENAMES = re.compile(r"(?:^|/)(?:\.env(?:\.[^/]+)?|secrets\.json|id_rsa|id_ed25519|.*\.pem|.*\.key|.*\.pfx)$", re.IGNORECASE)
 
 
-def _scan_text_block(text: str, file_hint: str = "") -> tuple[list[dict], list[str]]:
+def _scan_text_block(text: str, file_hint: str = "", *, line_offset: int = 0) -> tuple[list[dict], list[str]]:
     """Scan a text block without ever placing raw secret values into findings."""
     findings: list[dict] = []
     warnings: list[str] = []
     if sec := detect_secret(text):
-        findings.append({"severity": "critical", "type": "secret_leak", "file": file_hint, "detail": f"{sec} (redacted)"})
+        findings.append({"severity": "critical", "type": "secret_leak", "file": file_hint, "line_offset": line_offset, "detail": f"{sec} (redacted)"})
     for label, pat in _EXTRA_SECRET_PATTERNS:
         if pat.search(text):
-            findings.append({"severity": "critical", "type": label, "file": file_hint, "detail": f"Detected {label} pattern (redacted)"})
+            findings.append({"severity": "critical", "type": label, "file": file_hint, "line_offset": line_offset, "detail": f"Detected {label} pattern (redacted)"})
     for label, pat in _UNSAFE_CODE_PATTERNS:
         if pat.search(text):
-            findings.append({"severity": "warning", "type": label, "file": file_hint, "detail": f"Added code matches {label}"})
+            findings.append({"severity": "warning", "type": label, "file": file_hint, "line_offset": line_offset, "detail": f"Added code matches {label}"})
             warnings.append(f"{file_hint or 'diff'}: {label}")
+    return findings, warnings
+
+
+def _scan_file_streaming(
+    fp: Path,
+    file_hint: str,
+    *,
+    max_bytes: int = git_worktree.DEFAULT_MAX_SCAN_FILE_BYTES,
+    chunk_chars: int = 65_536,
+    overlap_chars: int = 512,
+) -> tuple[list[dict], list[str]]:
+    """Stream-scan complete text files up to `max_bytes` (no silent 100 KB truncation!).
+    Blocks oversized changed text files rather than skipping trailing bytes."""
+    sz = fp.stat().st_size
+    if sz > max_bytes:
+        return (
+            [
+                {
+                    "severity": "critical",
+                    "type": "oversized_unscanned_file",
+                    "file": file_hint,
+                    "detail": f"Changed text file ({sz} bytes) exceeds security scan limit ({max_bytes} bytes); blocked for manual review.",
+                }
+            ],
+            [],
+        )
+
+    findings: list[dict] = []
+    warnings: list[str] = []
+    line_num = 0
+    buf = ""
+    with fp.open("r", encoding="utf-8", errors="replace") as fh:
+        while True:
+            piece = fh.read(chunk_chars)
+            if not piece:
+                break
+            chunk = buf + piece
+            f_list, w_list = _scan_text_block(chunk, file_hint=file_hint, line_offset=line_num)
+            findings.extend(f_list)
+            warnings.extend(w_list)
+            line_num += piece.count("\n")
+            buf = chunk[-overlap_chars:] if len(chunk) > overlap_chars else chunk
+    if not findings and buf:
+        f_list, w_list = _scan_text_block(buf, file_hint=file_hint, line_offset=line_num)
+        findings.extend(f_list)
+        warnings.extend(w_list)
     return findings, warnings
 
 
@@ -132,6 +178,7 @@ class ProjectRegistryService:
             "default_branch": r.default_branch,
             "test_cmd": r.test_cmd,
             "lint_cmd": r.lint_cmd,
+            "privacy_level": getattr(r, "privacy_level", "private"),
             "tech_stack": r.tech_stack or {},
             "graphify_status": r.graphify_status,
             "graphify_last_built_at": r.graphify_last_built_at,
@@ -139,7 +186,7 @@ class ProjectRegistryService:
 
 
 class DevWorkforceService:
-    """Supervises isolated worktrees, execution policies, QA verification, and manifest security scans."""
+    """Supervises isolated worktrees, execution policies, QA verification, & complete manifest security scans."""
 
     def __init__(self, db: DatabaseManager, projects: ProjectRegistryService):
         self.db = db
@@ -200,18 +247,27 @@ class DevWorkforceService:
                 s.commit()
 
     def security_scan_diff(self, diff_text: str) -> dict:
-        """Scan unified git diff for hardcoded credentials or unsafe execution patterns before merge approval."""
+        """Scan unified git diff (committed + unstaged) without printing secret values."""
         added_lines = [ln[1:] for ln in (diff_text or "").splitlines() if ln.startswith("+") and not ln.startswith("+++")]
         joined = "\n".join(added_lines)
         findings, warnings = _scan_text_block(joined, file_hint="diff")
         return {"clean": not any(f["severity"] == "critical" for f in findings), "findings": findings, "warnings": warnings}
 
-    def security_scan_worktree(self, diff_info: dict, worktree_path: Path | None = None) -> dict:
-        """Scan EVERY changed/untracked/renamed/symlink/mode-changed file in the unified manifest cleanly."""
+    def security_scan_worktree(
+        self,
+        diff_info: dict,
+        worktree_path: Path | None = None,
+        *,
+        max_scan_file_bytes: int = git_worktree.DEFAULT_MAX_SCAN_FILE_BYTES,
+    ) -> dict:
+        """Scan ALL committed (`base..HEAD`), staged, unstaged, untracked, renamed, mode & symlink entries completely."""
         all_findings: list[dict] = []
         all_warnings: list[str] = []
 
-        diff_scan = self.security_scan_diff(diff_info.get("diff", "") + "\n" + diff_info.get("cached_diff", ""))
+        combined_diff = "\n".join(
+            part for part in (diff_info.get("committed_diff", ""), diff_info.get("diff", ""), diff_info.get("cached_diff", "")) if part
+        )
+        diff_scan = self.security_scan_diff(combined_diff)
         all_findings.extend(diff_scan["findings"])
         all_warnings.extend(diff_scan["warnings"])
 
@@ -220,23 +276,23 @@ class DevWorkforceService:
 
         for entry in manifest:
             rel = entry.get("path", "")
+            old_rel = entry.get("old_path") or ""
             efindings: list[dict] = []
 
             if entry.get("is_symlink"):
                 efindings.append({"severity": "critical", "type": "symlink_blocked", "file": rel, "detail": "Symlink changes are blocked"})
             if not entry.get("contained_in_worktree", True):
                 efindings.append({"severity": "critical", "type": "path_traversal", "file": rel, "detail": "File outside worktree bounds"})
-            if _SENSITIVE_FILENAMES.search(rel) and entry.get("change_type") != "deleted":
+            if (_SENSITIVE_FILENAMES.search(rel) or (old_rel and _SENSITIVE_FILENAMES.search(old_rel))) and entry.get("change_type") != "deleted":
                 efindings.append({"severity": "critical", "type": "sensitive_filename", "file": rel, "detail": f"Sensitive file pattern {rel!r} cannot be added"})
             if entry.get("mode_changed") and str(entry.get("new_mode", "")).endswith("755"):
                 all_warnings.append(f"{rel}: executable file mode 100755 set")
 
-            # Scan untracked or newly created non-binary file contents directly so `git diff HEAD` never misses them
-            if wt and not entry.get("is_binary") and not entry.get("is_symlink") and entry.get("change_type") in ("untracked", "added", "modified", "renamed"):
+            # Scan complete file content via streaming scanner (covers committed files + large files > 100 KB!)
+            if wt and not entry.get("is_binary") and not entry.get("is_symlink") and entry.get("change_type") != "deleted":
                 fp = (wt / rel).resolve()
                 if fp.exists() and fp.is_file() and wt in fp.parents:
-                    txt = fp.read_text(encoding="utf-8", errors="replace")[:100_000]
-                    f_list, w_list = _scan_text_block(txt, file_hint=rel)
+                    f_list, w_list = _scan_file_streaming(fp, rel, max_bytes=max_scan_file_bytes)
                     efindings.extend(f_list)
                     all_warnings.extend(w_list)
 
@@ -246,7 +302,6 @@ class DevWorkforceService:
             entry["security_result"] = "critical" if has_crit else ("warning" if efindings else "clean")
             all_findings.extend(efindings)
 
-        # Deduplicate warnings while preserving order
         seen_w: set[str] = set()
         dedup_warnings: list[str] = []
         for w in all_warnings:
@@ -259,7 +314,11 @@ class DevWorkforceService:
             "findings": all_findings,
             "warnings": dedup_warnings,
             "manifest": manifest,
+            "base_sha": diff_info.get("base_sha", ""),
+            "head_sha": diff_info.get("head_sha", ""),
+            "diff_hash": diff_info.get("diff_hash", ""),
             "manifest_sha256": diff_info.get("manifest_sha256", ""),
+            "approval_fingerprint": diff_info.get("approval_fingerprint", ""),
         }
 
     def list_worktrees(self, project_id: str | None = None) -> list[dict]:

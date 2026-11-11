@@ -5,21 +5,30 @@ Every command and measurement below was actually executed after the final code c
 
 ---
 
-## 1. Commands Executed & Observed Outcomes
+## 1. Commands Executed & Observed Outcomes (Post-P10.11 Hardening)
 
 | Command | Outcome | Result Summary |
 |---|---|---|
-| `.\.venv\Scripts\pytest.exe -v` | **Exit 0** | **156 passed, 1 skipped, 0 failed** in `187.01 s` (`0:03:07`), `99` third-party warnings (`langsmith`, `sounddevice`). |
-| `.\.venv\Scripts\python.exe preflight.py` (with `server.py` running) | **Exit 0** | **33 pass, 0 fail, 1 warn** (`torch`/`transformers`/`peft` optional LoRA pkgs absent); voice budget `11.2 s` (`hear 1.3s`, `think 9.5s`, `speak 0.4s`); `drill.py` `0` non-local hosts, `0` external URLs in `viewer/` & `apps/frontend/dist/`, watcher blocked `api.anthropic.com`. |
-| `.\.venv\Scripts\ruff.exe check ...` (P10 & modified modules/tests) | **Exit 0** | **All checks passed!** |
-| `.\.venv\Scripts\mypy.exe --follow-imports=silent ...` (58 P0–P10 files) | **Exit 0** | **Success: no issues found in 58 source files**. |
-| `.\.venv\Scripts\pip.exe check` & `.\.venv\Scripts\pip-audit.exe --local` | **Exit 0** | `No broken requirements found.` and `No known vulnerabilities found`. |
-| Alembic `upgrade head -> downgrade base -> upgrade head` (temp DB) | **Exit 0** | `ALEMBIC_P10_ROUNDTRIP=0,0,0` (`0001_initial_schema` <-> `0002_p10_hardening`). |
-| `apps/frontend`: `npm run build` (`tsc --noEmit && vite build`) | **Exit 0** | `35 modules transformed`, `dist/assets/index-DUIc-MgF.css` (`3.87 kB`), `dist/assets/index-DaALhkLZ.js` (`173.15 kB`), built in `783 ms`. |
+| `.\.venv\Scripts\python.exe -m pytest -v` | **Exit 0** | **164 passed, 3 skipped, 0 failed** in `227.40 s` (`0:03:47`), `98` third-party warnings (`langsmith`, `sounddevice`) across `167` collected tests. |
+| `.\.venv\Scripts\python.exe preflight.py` (with `server.py` running) | **Exit 0** | **32 pass, 0 fail, 2 warn** (`ram: 1.5 GB free of 15.3 GB`, `torch`/`transformers`/`peft` optional LoRA pkgs absent); voice budget `11.7 s` (`hear 1.6s`, `think 9.6s`, `speak 0.4s`); `drill.py` `0` non-local hosts, `0` external URLs in `viewer/` & `apps/frontend/dist/`, watcher blocked `api.anthropic.com`. |
+| `.\.venv\Scripts\python.exe -m ruff check ...` (12 changed P10.11 `jarvis/` files + `test_p10_11_hardening.py`) | **Exit 0** | **All checks passed!** (Note: repo-wide `ruff check jarvis tests` shows pre-existing style notices in earlier legacy modules `aec.py`, `commands.py`, `intent.py`, `search.py`, etc.). |
+| `.\.venv\Scripts\python.exe -m mypy --follow-imports=silent ...` (12 changed P10.11 source files) | **Exit 0** | **Success: no issues found in 12 source files** (`27` pre-existing type errors remain in 7 earlier legacy modules when running unfiltered `mypy jarvis`). |
+| `.\.venv\Scripts\python.exe -m pip check` & `pip_audit --local` | **Exit 0** | `No broken requirements found.` and `No known vulnerabilities found`. |
+| Alembic `upgrade head -> downgrade base -> upgrade head` (temp SQLite DB) | **Exit 0** | `alembic_exit_codes=0,0,0` (`0001_initial_schema` <-> `0002_p10_hardening`). |
+| `apps/frontend`: `npm run build` (`tsc --noEmit && vite build`) | **Exit 0** | `35 modules transformed`, `dist/assets/index-DUIc-MgF.css` (`3.87 kB`), `dist/assets/index-DaALhkLZ.js` (`173.15 kB`), built in `1.01 s`. |
 
 ---
 
-## 2. Detailed Coverage by P10 Domain
+## 2. Detailed Coverage by Domain & P10.11 Hardening Suite
+
+### P10.11 Critical Security & Reliability Hardening (`tests/test_p10_11_hardening.py`: `8 passed, 2 skipped`)
+- **P10.11.1 (`test_p10_11_1_committed_secret_and_after_approval_commit_block_merge` + `test_p10_11_1_rename_delete_binary_streaming_over_100kb_and_oversized_block`)**: Proves committed `base_sha..HEAD` secrets cannot bypass scan; post-review commits invalidate 5-field approval fingerprint and block merge; renames (`old_path`/`new_path`), deletions, binary hashes, `>200 KB` trailing secrets (zero silent 100 KB truncation), and `>max_scan_file_bytes` oversized files are caught and blocked cleanly. (**PASSED**)
+- **P10.11.2 (`test_p10_11_2_docker_policy_no_silent_fallback_and_restricted_env`)**: Verifies hardened Docker CLI (`--network=none`, `--read-only`, `--cap-drop=ALL`, `--security-opt=no-new-privileges:true`, `--memory`, `--cpus`, worktree-only `:rw` bind, filtered env), fail-closed refusal when Docker is unavailable (`allow_host_fallback=False`), and secret env scrubbing / executable deny list under `restricted_subprocess`. (**PASSED**; `test_p10_11_2_live_docker_sandbox_isolation` **SKIPPED** because Docker daemon is stopped).
+- **P10.11.3 (`test_p10_11_3_pg_restore_security_pgpass_exit_on_error_and_prod_guard`)**: Verifies `PGPASSFILE` creation/cleanup, zero password args on CLI, password scrubbing from errors, `--exit-on-error` flag, non-zero `pg_restore` failure rejection, production DB guard, `pgvector` + row-count verification failure detection, and refusal to mark unverified PG dumps `verified_restore=True`. (**PASSED** using mocked PG CLI/conn; `test_p10_11_3_live_postgres_backup_and_scratch_restore` **SKIPPED** without `JARVIS_PG_TEST_URL` / `JARVIS_PG_SCRATCH_URL`).
+- **P10.11.4 (`test_p10_11_4_training_blockers_override_concurrency_and_qlora_worker`)**: Verifies `force_spawn_even_if_blocked=False` default, un-overridable package requirements, worker blocking silent FP32 fallback for 4-bit QLoRA, audited hardware override requirement, `worker.pid` duplicate/concurrency blocking (`max_concurrent_jobs=1`), and child PID termination on cancel. (**PASSED**)
+- **P10.11.5 (`test_p10_11_5_mid_execution_cancel_kills_process_keeps_event_loop_responsive_and_blocks_merge`)**: Spawns active sleeping coder subprocess inside `/api/v2/workforce/runs` (`asyncio.to_thread`), confirms concurrent `/api/v2/system/overview` remains responsive (`<2s`), cancels live run (`POST /cancel`), terminates subprocess early, preserves worktree (`cancelled_preserved`), and blocks subsequent approval/merge (`409`). (**PASSED**)
+- **P10.11.6 (`test_p10_11_6_gateway_streaming_context_window_and_explicit_rejection`)**: Confirms `require_streaming` filtering, `est_prompt_tokens + max_tokens <= max_ctx` checking, and explicit `CloudGatewayError(category="no_eligible_model")` rejection without silently executing `req.model_key`. (**PASSED**)
+- **P10.11.7 (`test_p10_11_7_dr_scope_tracking_and_full_git_tracked_untracked_restore`)**: Verifies DB-only (`repositories_included=False`, `database_and_app_state_only`) vs full repo backup (`repositories_included=True`, `full_recovery_complete=True`), tracked uncommitted diffs + untracked file restoration into cloned Git repo, `HEAD` verification, and `overwrite_existing=False` guard. (**PASSED**)
 
 ### Workforce Safety (`tests/test_p10_workforce_safety.py` + `tests/test_ai_os_agents_workforce_dr.py`)
 - `test_state_machine_rejects_invalid_transitions`: Enforces `QA_FAILED -> MERGING` and `PLANNING -> COMPLETED` raise `ValueError`. (**PASSED**)
@@ -55,9 +64,12 @@ Every command and measurement below was actually executed after the final code c
 ## 3. Failed, Skipped & Unavailable Infrastructure Summary
 
 - **Failed Tests (final post-edit suite)**: **0**
-- **Skipped Tests**: **1** (`tests/test_p10_pgvector_memory.py::test_live_postgres_pgvector_crud_hnsw_expiry_and_migration`, requires `JARVIS_PG_TEST_URL`)
+- **Skipped Tests**: **3**
+  1. `tests/test_p10_11_hardening.py::test_p10_11_2_live_docker_sandbox_isolation` (Docker Desktop daemon not running locally)
+  2. `tests/test_p10_11_hardening.py::test_p10_11_3_live_postgres_backup_and_scratch_restore` (`JARVIS_PG_TEST_URL` and `JARVIS_PG_SCRATCH_URL` not configured)
+  3. `tests/test_p10_pgvector_memory.py::test_live_postgres_pgvector_crud_hnsw_expiry_and_migration` (`JARVIS_PG_TEST_URL` not configured)
 - **Unavailable Infrastructure / External Blocked Checks**:
-  1. **Live PostgreSQL + `pgvector`**: Set `$env:JARVIS_PG_TEST_URL = "postgresql+psycopg://jarvis:<pw>@127.0.0.1:5432/jarvis"` (or start Docker Desktop + `docker compose -f deploy/docker-compose.db.yml up -d`) and run `.\.venv\Scripts\pytest.exe -m pg -v`.
+  1. **Live PostgreSQL + `pgvector`**: Set `$env:JARVIS_PG_TEST_URL` and `$env:JARVIS_PG_SCRATCH_URL` and run `.\.venv\Scripts\pytest.exe -m pg -v`.
   2. **Live Docker Sandbox**: Start Docker Desktop and configure `workforce.sandbox_backend="docker"`.
   3. **Live Chrome DevTools UI click-through**: Enable Chrome remote debugging at `chrome://inspect/#remote-debugging` (`DevToolsActivePort`) and inspect `http://127.0.0.1:4700/` and `/legacy`.
   4. **Physical Wi-Fi Disconnect (`.\offline-test.ps1`)**: Not executed inside active AI coding session to preserve connection; run manually with Airplane Mode ON.

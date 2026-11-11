@@ -1,5 +1,6 @@
 """AgentOrchestrator: wires DB, DecisionEngine, ModelGateway, 5-Way Memory, Assistant/Dev LangGraphs & DR."""
 from pathlib import Path
+import threading
 import time
 import uuid
 
@@ -8,13 +9,14 @@ from langgraph.types import Command
 from ..config import DATA, SECRETS_PATH, Settings
 from ..core.event_bus import EventBus
 from ..db.engine import DatabaseManager
-from ..db.models import AgentRunRow, AgentStepRow
+from ..db.models import AgentRunRow, AgentStepRow, WorktreeRow
 from ..decision.router import DecisionEngine
 from ..departments.assistant.documents import DocumentService
 from ..departments.assistant.productivity import EmailDraftService, LocalCalendarService
 from ..departments.assistant.reminders import ReminderService
 from ..departments.dev.workforce import DevWorkforceService, ProjectRegistryService
 from ..gateway.gateway import ModelGateway
+from ..integrations import git_worktree
 from ..memory.five_way import FiveWayMemoryService
 from ..recovery.backup import DisasterRecoveryManager
 from .approvals import ApprovalService
@@ -56,6 +58,10 @@ class AgentOrchestrator:
 
         self.checkpointer = DBBackedCheckpointSaver(self.db)
         self._coder_runner = coder_runner
+        self._orch_lock = threading.Lock()
+        self._active_runs: set[str] = set()
+        self._cancel_events: dict[str, threading.Event] = {}
+        self._cancelled_reasons: dict[str, str] = {}
         self._assistant_graph = build_assistant_graph(
             memory=self.memory,
             docs=self.documents,
@@ -72,10 +78,24 @@ class AgentOrchestrator:
             approvals=self.approvals,
             workforce_spec=settings.workforce,
             coder_runner=coder_runner,
+            is_cancelled_fn=self.is_run_cancelled,
             graphify_bin=settings.workforce.graphify_bin,
             opencode_bin=settings.workforce.opencode_bin,
             checkpointer=self.checkpointer,
         )
+
+    def is_run_cancelled(self, run_id: str) -> tuple[bool, str]:
+        with self._orch_lock:
+            ev = self._cancel_events.get(run_id)
+            if ev is not None and ev.is_set():
+                return True, self._cancelled_reasons.get(run_id) or "Cancelled by owner"
+        with self.db.sync_session() as s:
+            row = s.get(AgentRunRow, run_id)
+            if row is not None:
+                payload = row.state_payload or {}
+                if row.state in ("cancelled", "cancelling") or payload.get("cancelled"):
+                    return True, str(payload.get("cancel_reason") or "Cancelled by owner")
+        return False, ""
 
     def _create_run(self, workflow_name: str, agent_role: str, summary: str, project_id: str | None = None) -> tuple[str, str]:
         run_id = uuid.uuid4().hex[:12]
@@ -136,6 +156,9 @@ class AgentOrchestrator:
         model: str | None = None,
     ) -> dict:
         run_id, thread_id = self._create_run("workforce", "coder_agent", task_prompt, project_id=project_id)
+        with self._orch_lock:
+            self._cancel_events.setdefault(run_id, threading.Event())
+            self._active_runs.add(run_id)
         cfg = {"configurable": {"thread_id": thread_id}}
         init_state = {
             "run_id": run_id,
@@ -148,22 +171,129 @@ class AgentOrchestrator:
             init_state["qa_command"] = qa_command
         if model:
             init_state["model"] = model
-        res = self._workforce_graph.invoke(init_state, cfg)
+        try:
+            res = self._workforce_graph.invoke(init_state, cfg)
+        finally:
+            with self._orch_lock:
+                self._active_runs.discard(run_id)
         self.checkpointer.persist_thread(thread_id)
-        interrupted = "__interrupt__" in res
-        state = "awaiting_approval" if interrupted else res.get("status", "completed")
-        self._update_run(run_id, state, res.get("summary") or state)
+        cancelled, cancel_reason = self.is_run_cancelled(run_id)
+        interrupted = "__interrupt__" in res and not cancelled
+        if cancelled:
+            state = "cancelled"
+            self.approvals.cancel_for_run(run_id, decided_by="system_cancelled_run")
+            summary = res.get("summary") or f"Cancelled cleanly: {cancel_reason}"
+        else:
+            state = "awaiting_approval" if interrupted else res.get("status", "completed")
+            summary = res.get("summary") or state
+        self._update_run(run_id, state, summary)
         self._log_step(
             run_id,
             1,
             "workforce_pipeline",
             state,
-            {"branch": res.get("branch_name"), "approval_token": res.get("approval_token"), "qa_result": res.get("qa_result")},
+            {"branch": res.get("branch_name"), "approval_token": res.get("approval_token"), "qa_result": res.get("qa_result"), "cancelled": cancelled},
         )
         self.bus.publish({"type": "agent_run_update", "run_id": run_id, "workflow": "workforce", "state": state})
-        return {"run_id": run_id, "thread_id": thread_id, "state": state, "interrupted": interrupted, "result": self._safe_res(res)}
+        return {"run_id": run_id, "thread_id": thread_id, "state": state, "interrupted": interrupted, "cancelled": cancelled, "result": self._safe_res(res)}
+
+    def cancel_workforce_run(
+        self,
+        run_id: str,
+        *,
+        reason: str = "Cancelled by owner",
+        actor: str = "owner",
+        authorize_cleanup: bool = False,
+    ) -> dict:
+        with self.db.sync_session() as s:
+            row = s.get(AgentRunRow, run_id)
+            if not row:
+                raise KeyError(run_id)
+            if row.state in ("completed", "failed", "rejected", "blocked_security"):
+                return {
+                    "ok": False,
+                    "run_id": run_id,
+                    "state": row.state,
+                    "detail": f"Run already finished with state={row.state}",
+                }
+            payload = dict(row.state_payload or {})
+            payload.update({
+                "cancelled": True,
+                "cancel_reason": reason,
+                "cancelled_by": actor,
+                "cancelled_at": round(time.time(), 3),
+                "authorize_cleanup": authorize_cleanup,
+            })
+            row.state_payload = payload
+            row.state = "cancelling"
+            row.output_summary = f"Cancelling: {reason}"[:1000]
+            s.commit()
+
+        with self._orch_lock:
+            ev = self._cancel_events.setdefault(run_id, threading.Event())
+            self._cancelled_reasons[run_id] = reason
+            ev.set()
+
+        killed = git_worktree.cancel_run_processes(run_id)
+        cancelled_approvals = self.approvals.cancel_for_run(run_id, decided_by=actor)
+
+        for _ in range(15):
+            with self._orch_lock:
+                if run_id not in self._active_runs:
+                    break
+            time.sleep(0.02)
+
+        with self._orch_lock:
+            still_active = run_id in self._active_runs
+
+        worktrees_handled: list[dict] = []
+        with self.db.sync_session() as s:
+            wt_rows = s.query(WorktreeRow).filter(WorktreeRow.run_id == run_id).all()
+            for wt_r in wt_rows:
+                wt_path = Path(wt_r.worktree_path)
+                if authorize_cleanup and not still_active:
+                    try:
+                        proj = self.projects.get(wt_r.project_id)
+                        git_worktree.cleanup_worktree(
+                            Path(proj["root_path"]),
+                            wt_path,
+                            wt_r.branch_name,
+                            authorized_uncommitted=True,
+                            expected_task_id=run_id,
+                        )
+                        wt_r.status = "cancelled_cleaned"
+                    except Exception:
+                        wt_r.status = "cancelled_preserved"
+                else:
+                    if wt_r.status not in ("merged", "cancelled_cleaned"):
+                        wt_r.status = "cancelled_preserved"
+                worktrees_handled.append({"worktree_path": wt_r.worktree_path, "status": wt_r.status, "preserved": wt_r.status == "cancelled_preserved"})
+            if wt_rows:
+                s.commit()
+
+        final_state = "cancelling" if still_active else "cancelled"
+        if not still_active:
+            self._update_run(run_id, "cancelled", f"Cancelled: {reason}")
+        self.bus.publish({"type": "agent_run_update", "run_id": run_id, "workflow": "workforce", "state": final_state})
+        return {
+            "ok": True,
+            "run_id": run_id,
+            "state": final_state,
+            "processes_terminated": killed,
+            "approvals_cancelled": cancelled_approvals,
+            "worktrees": worktrees_handled,
+            "worktree_preserved": all(w["preserved"] for w in worktrees_handled) if worktrees_handled else True,
+        }
 
     def resume_workflow_after_approval(self, *, token: str, approved: bool, decided_by: str = "owner") -> dict:
+        req = self.approvals.get(token)
+        req_run_id = req.get("run_id")
+        if req_run_id:
+            cancelled, cancel_reason = self.is_run_cancelled(req_run_id)
+            if cancelled:
+                self.approvals.cancel_for_run(req_run_id, decided_by="system_cancelled_run")
+                raise ValueError(f"Run {req_run_id} is cancelled ({cancel_reason}) and cannot be approved or merged.")
+
         dec = self.approvals.decide(token, approved=approved, decided_by=decided_by)
         run_id = dec.get("run_id")
         if not run_id:
@@ -174,9 +304,15 @@ class AgentOrchestrator:
                 return {"approval": dec, "resumed": False}
             wf = row.workflow_name
             tid = row.thread_id
+        with self._orch_lock:
+            self._active_runs.add(run_id)
         cfg = {"configurable": {"thread_id": tid}}
         graph = self._workforce_graph if wf == "workforce" else self._assistant_graph
-        res = graph.invoke(Command(resume={"approved": approved}), cfg)
+        try:
+            res = graph.invoke(Command(resume={"approved": approved}), cfg)
+        finally:
+            with self._orch_lock:
+                self._active_runs.discard(run_id)
         self.checkpointer.persist_thread(tid)
         final_state = res.get("status", "completed")
         self._update_run(run_id, final_state, res.get("summary") or final_state)

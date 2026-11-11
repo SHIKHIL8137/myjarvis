@@ -1,14 +1,15 @@
 # Test report
 
-Updated on 2026-11-11 after completing **P10 — Reliability, Security, Memory, Workforce & Autonomous Learning Hardening** on the target machine (`Ryzen 5 5600H`, `GTX 1650 4 GB`, `15.3 GB RAM`, `Windows 11`, `Python 3.14.6`, `Ollama 0.40.16`, `Node v24.16.0`).
-Every result below was directly observed; no unperformed, skipped, or mocked test is reported as live. See [P10_TEST_REPORT.md](P10_TEST_REPORT.md) and [P10_IMPLEMENTATION_REPORT.md](P10_IMPLEMENTATION_REPORT.md) for the complete P10 matrix.
+Updated on 2026-11-11 after completing **P10 — Reliability, Security, Memory, Workforce & Autonomous Learning Hardening** and **P10.11 — Final Critical Security and Reliability Corrections** on the target machine (`Ryzen 5 5600H`, `GTX 1650 4 GB`, `15.3 GB RAM`, `Windows 11`, `Python 3.14.6`, `Ollama 0.40.16`, `Node v24.16.0`).
+Every result below was directly observed; no unperformed, skipped, or mocked test is reported as live. See [P10_TEST_REPORT.md](P10_TEST_REPORT.md) and [P10_IMPLEMENTATION_REPORT.md](P10_IMPLEMENTATION_REPORT.md) for the complete matrix.
 
-## 1. Automated tests & static verification (post-P10 edits)
+## 1. Automated tests & static verification (post-P10.11 edits)
 
-Ran `.venv\Scripts\pytest.exe -v` after all P10 code edits (`187.01 s` / `0:03:07`): **156 passed, 1 skipped, 0 failed** (`99` external dependency deprecation warnings from `langsmith` and `sounddevice`; the single skipped test is `@pytest.mark.pg` `test_live_postgres_pgvector_crud_hnsw_expiry_and_migration`, skipped because `JARVIS_PG_TEST_URL` is not configured).
+Ran `.venv\Scripts\python.exe -m pytest -v` after all P10.11 code edits (`227.40 s` / `0:03:47`): **164 passed, 3 skipped, 0 failed** (`98` external dependency deprecation warnings from `langsmith` and `sounddevice`; skipped tests require live Docker daemon or `JARVIS_PG_TEST_URL` / `JARVIS_PG_SCRATCH_URL`).
 
 | File | Tests | Result | Scope |
 |---|---|---|---|
+| `tests/test_p10_11_hardening.py` | 10 | 8 passed, 2 skipped | Committed `base_sha..HEAD` secret block, post-review commit invalidation, rename/delete/binary/`>200 KB`/oversized scan, Docker CLI & no-silent-fallback + env stripping, `PGPASSFILE`/`--exit-on-error`/non-zero/prod-DB/pgvector checks (live PG & Docker skipped), training blockers/override/concurrency/QLoRA guard, real active subprocess cancellation & `asyncio.to_thread` responsiveness, gateway `require_streaming` + `prompt+max_tokens` context gate, DR DB-only vs full tracked+untracked repo restore & overwrite guard |
 | `tests/test_ai_os_agents_workforce_dr.py` | 6 | 6 passed | Document Engine (`PDF`/`DOCX`/`PPTX`/`XLSX`), Reminders/Calendar/Email, LangGraph + Git worktree + interrupt/restart resume, diff secret scan, DR backup/tamper, `/api/v2/*` & dist compliance |
 | `tests/test_ai_os_memory_decision_gateway.py` | 5 | 5 passed | Unicode Malayalam tokenization & PII/secret firewall, DPAPI + AES-256-GCM vault, 5-way memory & legacy migrator, 3-layer DecisionEngine & gateway guard, overview read-only / TTS prune / DI |
 | `tests/test_p10_workforce_safety.py` | 5 | 5 passed | State machine transition guard, failed QA/exhausted retries halt before approval/merge, untracked `.env`/binary/symlink manifest scan without leaking raw secret, post-review diff invalidation, worktree collision/ownership/uncommitted cleanup guard, `ExecutionPolicy` deny list |
@@ -32,13 +33,13 @@ Ran `.venv\Scripts\pytest.exe -v` after all P10 code edits (`187.01 s` / `0:03:0
 
 | Check | Result | Scope & Evidence |
 |---|---|---|
-| `ruff check` (P10 created/modified modules, scripts & tests) | **Passed** | `All checks passed!` |
-| `mypy --follow-imports=silent` (58 P0–P10 source files) | **Passed** | `Success: no issues found in 58 source files` |
+| `ruff check` (12 P10.11 changed `jarvis/` files + `test_p10_11_hardening.py`) | **Passed** | `All checks passed!` |
+| `mypy --follow-imports=silent` (12 P10.11 changed `jarvis/` files) | **Passed** | `Success: no issues found in 12 source files` (`27` pre-existing errors remain in 7 legacy files under unfiltered `mypy jarvis`) |
 | `pip check` & `pip-audit --local` | **Passed** | `No broken requirements found.` and `No known vulnerabilities found` |
 | Alembic migration roundtrip (temp SQLite DB) | **Passed** | `alembic upgrade head -> downgrade base -> upgrade head` exited `0,0,0` (`0001_initial_schema` -> `0002_p10_hardening`) |
-| React + TypeScript frontend (`apps/frontend`: `npm run build`) | **Passed** | `tsc --noEmit && vite build` transformed `35` modules in `783 ms` (`dist/assets/index-DaALhkLZ.js` `173.15 kB`) |
+| React + TypeScript frontend (`apps/frontend`: `npm run build`) | **Passed** | `tsc --noEmit && vite build` transformed `35` modules in `1.01 s` (`dist/assets/index-DaALhkLZ.js` `173.15 kB`) |
 
-**Live system verification (`preflight.py` & `drill.py`)**: Ran against live `server.py` on `127.0.0.1:4700` — **`33 pass, 0 fail, 1 warn`** (exit `0`; single warning for optional `torch`/`transformers`/`peft` packages not installed locally). Latency budget: `hear 1.3s` (`8/8` words), `think 9.5s` (`21.4 tok/s`, TTFT `6.14s`), `speak 0.4s` (`0.44s`, `265,772` bytes WAV) → **`11.2 s` total**. Offline drill: `0` external references across `viewer/` & `apps/frontend/dist/`, `0` non-local hosts in server logs and OS `netstat`, watcher blocked `api.anthropic.com`, and `/api/v2/system/overview` passed.
+**Live system verification (`preflight.py` & `drill.py`)**: Ran against live `server.py` on `127.0.0.1:4700` — **`32 pass, 0 fail, 2 warn`** (exit `0`; warnings for `1.5 GB free RAM` and optional `torch`/`transformers`/`peft` packages not installed locally). Latency budget: `hear 1.6s` (`8/8` words), `think 9.6s` (`21.5 tok/s`, TTFT `6.3s`), `speak 0.4s` (`0.40s`, `247,852` bytes WAV) → **`11.7 s` total**. Offline drill: `0` external references across `viewer/` & `apps/frontend/dist/`, `0` non-local hosts in server logs and OS `netstat`, watcher blocked `api.anthropic.com`, and `/api/v2/system/overview` passed.
 
 Executed directly against live external HTTPS endpoints with Online Assisted Mode enabled (`POST /api/internet/mode {"enabled": true}`):
 

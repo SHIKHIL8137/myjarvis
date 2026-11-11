@@ -14,7 +14,8 @@ import time
 import zipfile
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from sqlalchemy import select
+from sqlalchemy import select, text
+from sqlalchemy.engine import make_url
 
 from .. import audit
 from ..config import Settings
@@ -36,6 +37,14 @@ _ARCHIVE_MAGIC = b"JDRVAULT1"
 
 def _sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _rmtree_readonly_safe(path: Path) -> None:
+    def _onexc(func, p, exc_info):
+        os.chmod(p, 0o700)
+        func(p)
+
+    shutil.rmtree(path, onexc=_onexc)
 
 
 def _sha256_file(path: Path) -> str:
@@ -84,6 +93,63 @@ def _find_pg_tool(tool_name: str) -> str | None:
 
 def _pg_cli_url(sa_url: str) -> str:
     return sa_url.replace("postgresql+psycopg://", "postgresql://", 1).replace("postgresql+asyncpg://", "postgresql://", 1)
+
+
+def _pg_conn_spec(sa_url: str) -> dict[str, str]:
+    u = make_url(_pg_cli_url(sa_url))
+    return {
+        "host": str(u.host or "localhost"),
+        "port": str(u.port or 5432),
+        "username": str(u.username or "postgres"),
+        "password": str(u.password or ""),
+        "database": str(u.database or "postgres"),
+    }
+
+
+def _same_pg_target(url_a: str, url_b: str) -> bool:
+    if not url_a or not url_b:
+        return False
+    try:
+        a = _pg_conn_spec(url_a)
+        b = _pg_conn_spec(url_b)
+        ha = "localhost" if a["host"] in ("127.0.0.1", "::1", "localhost") else a["host"].lower()
+        hb = "localhost" if b["host"] in ("127.0.0.1", "::1", "localhost") else b["host"].lower()
+        return (ha, a["port"], a["database"]) == (hb, b["port"], b["database"])
+    except Exception:
+        return _pg_cli_url(url_a).split("@")[-1] == _pg_cli_url(url_b).split("@")[-1]
+
+
+def _scrub_pg_secrets(msg: str, password: str) -> str:
+    if not msg:
+        return ""
+    out = msg
+    if password:
+        out = out.replace(password, "***REDACTED***")
+    return out
+
+
+def _escape_pgpass(val: str) -> str:
+    return val.replace("\\", "\\\\").replace(":", "\\:")
+
+
+def _write_temp_pgpass(spec: dict[str, str]) -> Path | None:
+    if not spec.get("password"):
+        return None
+    fd, raw_path = tempfile.mkstemp(prefix="jarvis_pgpass_", suffix=".conf")
+    os.close(fd)
+    p = Path(raw_path)
+    line = f"{_escape_pgpass(spec['host'])}:{_escape_pgpass(spec['port'])}:{_escape_pgpass(spec['database'])}:{_escape_pgpass(spec['username'])}:{_escape_pgpass(spec['password'])}\n"
+    p.write_text(line, encoding="utf-8")
+    try:
+        os.chmod(p, 0o600)
+    except Exception:
+        pass
+    return p
+
+
+def _pg_cli_flags(spec: dict[str, str]) -> list[str]:
+    """Build passwordless CLI flags (`--host`, `--port`, `--username`, `--no-password`); secrets go via PGPASSFILE only."""
+    return ["--host", spec["host"], "--port", spec["port"], "--username", spec["username"], "--no-password"]
 
 
 def _manifest_hmac(manifest_canonical: bytes, salt: bytes, passphrase: str) -> str:
@@ -180,63 +246,112 @@ class DisasterRecoveryManager:
         ]
 
     def backup_postgresql(self, out_dir: Path) -> dict:
-        """Create real PostgreSQL dump via `pg_dump` with server version, schema & row counts."""
+        """Create real PostgreSQL dump via `pg_dump` using PGPASSFILE (never CLI passwords) with schema & row counts."""
         pg_dump = _find_pg_tool("pg_dump")
         if not pg_dump:
             raise FileNotFoundError("PostgreSQL backup failed: `pg_dump` CLI tool not found on system.")
         dump_path = out_dir / "db" / "postgres.dump"
         dump_path.parent.mkdir(parents=True, exist_ok=True)
-        uri = _pg_cli_url(self.db.sync_url)
-        proc = subprocess.run(
-            [pg_dump, "--format=custom", "--no-owner", "--file", str(dump_path), uri],
-            capture_output=True,
-            text=True,
-            timeout=300,
-            shell=False,
-        )
+        spec = _pg_conn_spec(self.db.sync_url)
+        pgpass_path = _write_temp_pgpass(spec)
+        env = dict(os.environ)
+        if pgpass_path is not None:
+            env["PGPASSFILE"] = str(pgpass_path)
+        argv = [pg_dump, "--format=custom", "--no-owner", *_pg_cli_flags(spec), "--dbname", spec["database"], "--file", str(dump_path)]
+        try:
+            proc = subprocess.run(argv, capture_output=True, text=True, timeout=300, shell=False, env=env)
+        finally:
+            if pgpass_path is not None:
+                pgpass_path.unlink(missing_ok=True)
         if proc.returncode != 0:
-            raise RuntimeError(f"pg_dump failed: {proc.stderr.strip() or proc.stdout.strip()}")
+            raise RuntimeError(_scrub_pg_secrets(f"pg_dump failed (rc={proc.returncode}): {proc.stderr.strip() or proc.stdout.strip()}", spec["password"]))
 
         with self.db.sync_engine.connect() as conn:
-            ver = conn.execute(__import__("sqlalchemy").text("SHOW server_version")).scalar()
+            ver = conn.execute(text("SHOW server_version")).scalar()
             tables = conn.execute(
-                __import__("sqlalchemy").text("SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename")
+                text("SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename")
             ).scalars().all()
             counts = {}
             for t in tables:
-                counts[t] = int(conn.execute(__import__("sqlalchemy").text(f'SELECT COUNT(*) FROM "{t}"')).scalar() or 0)
+                counts[t] = int(conn.execute(text(f'SELECT COUNT(*) FROM "{t}"')).scalar() or 0)
+            pgvector_ext = bool(conn.execute(text("SELECT 1 FROM pg_extension WHERE extname = 'vector'")).scalar())
 
-        meta = {"server_version": str(ver or ""), "tables": counts, "dump_file": "db/postgres.dump"}
+        meta = {"server_version": str(ver or ""), "tables": counts, "pgvector_installed": pgvector_ext, "dump_file": "db/postgres.dump"}
         (out_dir / "db" / "postgres_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
         return meta
 
-    def restore_postgresql(self, dump_path: Path, target_pg_url: str, *, expected_meta: dict | None = None) -> dict:
-        """Restore real PostgreSQL custom dump via `pg_restore` and verify version, schema & row counts."""
+    def restore_postgresql(
+        self,
+        dump_path: Path,
+        target_pg_url: str,
+        *,
+        expected_meta: dict | None = None,
+        allow_production_overwrite: bool = False,
+    ) -> dict:
+        """Restore PostgreSQL custom dump via `pg_restore --exit-on-error` (via PGPASSFILE) and verify schema, rows, pgvector & memory."""
+        if self.db.is_postgres and not allow_production_overwrite and _same_pg_target(self.db.sync_url, target_pg_url):
+            raise ValueError("Refusing PostgreSQL restore against live production database without explicit allow_production_overwrite=True.")
+
         pg_restore = _find_pg_tool("pg_restore")
         if not pg_restore:
             raise FileNotFoundError("PostgreSQL restore failed: `pg_restore` CLI tool not found.")
-        uri = _pg_cli_url(target_pg_url)
-        proc = subprocess.run(
-            [pg_restore, "--clean", "--if-exists", "--no-owner", "--dbname", uri, str(dump_path)],
-            capture_output=True,
-            text=True,
-            timeout=300,
-            shell=False,
-        )
-        if proc.returncode not in (0, 1):  # pg_restore returns 1 for benign clean/extension warnings sometimes
-            raise RuntimeError(f"pg_restore failed (rc={proc.returncode}): {proc.stderr.strip()}")
+        spec = _pg_conn_spec(target_pg_url)
+        pgpass_path = _write_temp_pgpass(spec)
+        env = dict(os.environ)
+        if pgpass_path is not None:
+            env["PGPASSFILE"] = str(pgpass_path)
+        argv = [
+            pg_restore,
+            "--exit-on-error",
+            "--clean",
+            "--if-exists",
+            "--no-owner",
+            *_pg_cli_flags(spec),
+            "--dbname",
+            spec["database"],
+            str(dump_path),
+        ]
+        try:
+            proc = subprocess.run(argv, capture_output=True, text=True, timeout=300, shell=False, env=env)
+        finally:
+            if pgpass_path is not None:
+                pgpass_path.unlink(missing_ok=True)
+        if proc.returncode != 0:
+            raise RuntimeError(
+                _scrub_pg_secrets(f"pg_restore failed (rc={proc.returncode}): {proc.stderr.strip() or proc.stdout.strip()}", spec["password"])
+            )
 
         target_db = DatabaseManager(target_pg_url)
+        pgvector_ok = False
+        memory_count = 0
+        vector_count = 0
+        checkpoints_count = 0
+        projects_count = 0
+        vector_probe_ok = False
         try:
             with target_db.sync_engine.connect() as conn:
                 tables = set(
                     conn.execute(
-                        __import__("sqlalchemy").text("SELECT tablename FROM pg_tables WHERE schemaname = 'public'")
+                        text("SELECT tablename FROM pg_tables WHERE schemaname = 'public'")
                     ).scalars().all()
                 )
                 restored_counts = {}
                 for t in tables:
-                    restored_counts[t] = int(conn.execute(__import__("sqlalchemy").text(f'SELECT COUNT(*) FROM "{t}"')).scalar() or 0)
+                    restored_counts[t] = int(conn.execute(text(f'SELECT COUNT(*) FROM "{t}"')).scalar() or 0)
+                pgvector_ok = bool(conn.execute(text("SELECT 1 FROM pg_extension WHERE extname = 'vector'")).scalar())
+
+            iso_mem = FiveWayMemoryService(target_db, settings=self.settings)
+            mems = iso_mem.list_personal_memories()
+            memory_count = len(mems)
+            vector_count = iso_mem.vectors.count()
+            if mems:
+                hits = iso_mem.search_personal_memory(mems[0]["content"][:40], k=3)
+                vector_probe_ok = len(hits) >= 1
+            else:
+                vector_probe_ok = True
+            with target_db.sync_session() as s:
+                checkpoints_count = len(s.scalars(select(AgentRunRow)).all())
+                projects_count = len(s.scalars(select(ProjectRow)).all())
         finally:
             target_db.sync_engine.dispose()
 
@@ -246,11 +361,20 @@ class DisasterRecoveryManager:
                 got_c = restored_counts.get(t, -1)
                 if got_c != exp_c:
                     mismatches[t] = (exp_c, got_c)
+
+        expected_pgvec = bool((expected_meta or {}).get("pgvector_installed", True))
+        pgvec_valid = (pgvector_ok or not expected_pgvec)
         return {
-            "ok": len(mismatches) == 0,
+            "ok": len(mismatches) == 0 and pgvec_valid and vector_probe_ok,
             "tables": restored_counts,
             "mismatches": mismatches,
-            "warnings": [proc.stderr.strip()] if proc.stderr.strip() else [],
+            "pgvector_installed": pgvector_ok,
+            "memory_count": memory_count,
+            "vector_count": vector_count,
+            "vector_probe_ok": vector_probe_ok,
+            "checkpoints_count": checkpoints_count,
+            "projects_count": projects_count,
+            "warnings": [_scrub_pg_secrets(proc.stderr.strip(), spec["password"])] if proc.stderr.strip() else [],
         }
 
     def _export_structured_snapshots(self, stage: Path) -> dict[str, int]:
@@ -354,25 +478,182 @@ class DisasterRecoveryManager:
             counts["vectors"] = len(vecs)
         return counts
 
-    def _export_repositories(self, stage: Path, include_uncommitted: bool) -> list[str]:
+    @staticmethod
+    def _git_run(args: list[str], cwd: Path, *, timeout: int = 60) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["git", *args],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            shell=False,
+        )
+
+    def _export_repositories(self, stage: Path, include_uncommitted: bool) -> dict:
         backed: list[str] = []
+        meta_list: list[dict] = []
+        missing: list[str] = []
         repos_dir = stage / "repositories"
         with self.db.sync_session() as s:
             projs = s.scalars(select(ProjectRow)).all()
         for p in projs:
             root = Path(p.root_path)
             if not root.exists() or not (root / ".git").exists():
+                missing.append(p.name)
                 continue
             repos_dir.mkdir(parents=True, exist_ok=True)
-            bundle_out = repos_dir / f"{p.name}.bundle"
-            res = subprocess.run(["git", "bundle", "create", str(bundle_out), "--all"], cwd=str(root), capture_output=True, text=True, timeout=60, shell=False)
-            if res.returncode == 0:
-                backed.append(p.name)
+            safe_name = "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in p.name).strip(".") or p.id
+            head_res = self._git_run(["rev-parse", "HEAD"], root, timeout=15)
+            head_sha = head_res.stdout.strip() if head_res.returncode == 0 else ""
+            br_res = self._git_run(["rev-parse", "--abbrev-ref", "HEAD"], root, timeout=15)
+            branch = br_res.stdout.strip() if br_res.returncode == 0 else "main"
+
+            bundle_name = f"{safe_name}.bundle"
+            bundle_out = repos_dir / bundle_name
+            res = self._git_run(["bundle", "create", str(bundle_out), "--all"], root, timeout=60)
+            if res.returncode != 0:
+                raise RuntimeError(f"git bundle create failed for {p.name}: {res.stderr.strip()}")
+            backed.append(p.name)
+
+            patch_name: str | None = None
+            untracked_zip_name: str | None = None
+            untracked_files: list[str] = []
             if include_uncommitted:
-                diff = subprocess.run(["git", "diff", "HEAD"], cwd=str(root), capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30, shell=False)
+                # Capture all staged + unstaged tracked changes relative to HEAD
+                diff = self._git_run(["diff", "HEAD", "--binary"], root, timeout=30)
                 if diff.stdout.strip():
-                    (repos_dir / f"{p.name}.uncommitted.patch").write_text(diff.stdout, encoding="utf-8")
-        return backed
+                    patch_name = f"{safe_name}.uncommitted.patch"
+                    (repos_dir / patch_name).write_text(diff.stdout, encoding="utf-8")
+                untracked_res = self._git_run(["ls-files", "--others", "--exclude-standard"], root, timeout=30)
+                if untracked_res.returncode == 0:
+                    untracked_files = [ln.strip() for ln in untracked_res.stdout.splitlines() if ln.strip()]
+                if untracked_files:
+                    untracked_zip_name = f"{safe_name}.untracked.zip"
+                    with zipfile.ZipFile(repos_dir / untracked_zip_name, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                        for rel in untracked_files:
+                            fp = (root / rel).resolve()
+                            if fp.is_file() and str(fp).startswith(str(root.resolve())):
+                                zf.write(fp, rel.replace("\\", "/"))
+
+            meta_list.append(
+                {
+                    "name": p.name,
+                    "safe_name": safe_name,
+                    "head_sha": head_sha,
+                    "branch": branch,
+                    "bundle_file": f"repositories/{bundle_name}",
+                    "patch_file": f"repositories/{patch_name}" if patch_name else None,
+                    "untracked_zip": f"repositories/{untracked_zip_name}" if untracked_zip_name else None,
+                    "untracked_files": untracked_files,
+                    "include_uncommitted": bool(include_uncommitted),
+                }
+            )
+        if meta_list:
+            repos_dir.mkdir(parents=True, exist_ok=True)
+            (repos_dir / "repos_meta.json").write_text(json.dumps(meta_list, indent=2), encoding="utf-8")
+        return {"backed": backed, "meta": meta_list, "missing": missing}
+
+    def restore_repositories(
+        self,
+        extracted_root: Path,
+        target_repos_dir: Path,
+        *,
+        overwrite_existing: bool = False,
+        restore_uncommitted: bool = True,
+    ) -> dict:
+        """Restore exported Git bundles, optional tracked patches & untracked files, verifying HEAD and working tree."""
+        repos_stage = Path(extracted_root) / "repositories"
+        if not repos_stage.exists():
+            return {"ok": True, "restored": [], "count": 0}
+        meta_path = repos_stage / "repos_meta.json"
+        if meta_path.exists():
+            entries = json.loads(meta_path.read_text(encoding="utf-8"))
+        else:
+            entries = [
+                {
+                    "name": b.stem,
+                    "safe_name": b.stem,
+                    "head_sha": "",
+                    "branch": "",
+                    "bundle_file": f"repositories/{b.name}",
+                    "patch_file": f"repositories/{b.stem}.uncommitted.patch" if (repos_stage / f"{b.stem}.uncommitted.patch").exists() else None,
+                    "untracked_zip": None,
+                    "untracked_files": [],
+                }
+                for b in sorted(repos_stage.glob("*.bundle"))
+            ]
+
+        base_target = Path(target_repos_dir).resolve()
+        base_target.mkdir(parents=True, exist_ok=True)
+        restored: list[dict] = []
+
+        for ent in entries:
+            dest_repo = (base_target / ent["safe_name"]).resolve()
+            if dest_repo.parent != base_target:
+                raise ValueError(f"Unsafe repository target path: {dest_repo}")
+            if dest_repo.exists() and any(dest_repo.iterdir()):
+                if not overwrite_existing:
+                    raise FileExistsError(
+                        f"Refusing to overwrite existing target repository '{dest_repo}' without overwrite_existing=True."
+                    )
+                _rmtree_readonly_safe(dest_repo)
+            bundle_file = Path(extracted_root) / ent["bundle_file"]
+            cl = subprocess.run(
+                ["git", "clone", str(bundle_file), str(dest_repo)],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                shell=False,
+            )
+            if cl.returncode != 0:
+                raise RuntimeError(f"git clone from bundle failed for {ent['name']}: {cl.stderr.strip()}")
+
+            if ent.get("branch") and ent["branch"] != "HEAD":
+                self._git_run(["checkout", ent["branch"]], dest_repo, timeout=20)
+            restored_head = self._git_run(["rev-parse", "HEAD"], dest_repo, timeout=15).stdout.strip()
+            if ent.get("head_sha") and restored_head != ent["head_sha"]:
+                raise RuntimeError(
+                    f"Restored HEAD mismatch for {ent['name']}: expected {ent['head_sha']}, got {restored_head}"
+                )
+
+            patch_applied = False
+            untracked_restored = 0
+            if restore_uncommitted:
+                if ent.get("patch_file"):
+                    pf = Path(extracted_root) / ent["patch_file"]
+                    if pf.exists() and pf.read_text(encoding="utf-8").strip():
+                        ap = self._git_run(["apply", str(pf)], dest_repo, timeout=30)
+                        if ap.returncode != 0:
+                            raise RuntimeError(f"git apply failed for {ent['name']}: {ap.stderr.strip()}")
+                        patch_applied = True
+                if ent.get("untracked_zip"):
+                    uz = Path(extracted_root) / ent["untracked_zip"]
+                    if uz.exists():
+                        with zipfile.ZipFile(uz, "r") as zf:
+                            for info in zf.infolist():
+                                p_rel = Path(info.filename)
+                                if ".." in p_rel.parts or p_rel.is_absolute():
+                                    raise ValueError(f"Unsafe path in untracked archive: {info.filename}")
+                            zf.extractall(dest_repo)
+                        for rel in ent.get("untracked_files") or []:
+                            if not (dest_repo / rel).exists():
+                                raise RuntimeError(f"Expected untracked file '{rel}' missing after restore in {ent['name']}")
+                            untracked_restored += 1
+
+            st = self._git_run(["status", "--porcelain"], dest_repo, timeout=20)
+            restored.append(
+                {
+                    "name": ent["name"],
+                    "path": str(dest_repo),
+                    "head_sha": restored_head,
+                    "patch_applied": patch_applied,
+                    "untracked_restored": untracked_restored,
+                    "working_tree_status": [ln for ln in st.stdout.splitlines() if ln.strip()],
+                }
+            )
+        return {"ok": True, "restored": restored, "count": len(restored)}
 
     def apply_retention(self, tier: str, keep: int | None = None) -> int:
         tier_dir = self.backup_root / tier
@@ -463,8 +744,11 @@ class DisasterRecoveryManager:
                         (stage / "learning" / "training").mkdir(parents=True, exist_ok=True)
                         shutil.copy2(fp, stage / "learning" / "training" / fname)
 
+            repos_res: dict = {"backed": [], "meta": [], "missing": []}
             if include_repositories:
-                repos_backed = self._export_repositories(stage, include_uncommitted=include_uncommitted)
+                repos_res = self._export_repositories(stage, include_uncommitted=include_uncommitted)
+            repos_backed = repos_res["backed"]
+            repositories_included = bool(include_repositories and len(repos_backed) > 0)
 
             for item in sorted(stage.rglob("*")):
                 if item.is_file():
@@ -480,6 +764,10 @@ class DisasterRecoveryManager:
                 "snapshot_counts": snapshot_counts,
                 "pg_meta": pg_meta,
                 "repositories": repos_backed,
+                "repositories_included": repositories_included,
+                "repositories_requested": bool(include_repositories),
+                "repositories_missing": repos_res["missing"],
+                "include_uncommitted": bool(include_uncommitted),
                 "files": files_hashes,
             }
             canonical_bytes = json.dumps(manifest_core, indent=2, sort_keys=True).encode("utf-8")
@@ -531,6 +819,10 @@ class DisasterRecoveryManager:
             "file_count": len(files_hashes),
             "snapshot_counts": snapshot_counts,
             "repositories": repos_backed,
+            "repositories_included": repositories_included,
+            "repositories_requested": bool(include_repositories),
+            "repositories_missing": repos_res["missing"],
+            "include_uncommitted": bool(include_uncommitted),
             "encrypted": True,
             "verified_restore": False,
         }
@@ -549,6 +841,8 @@ class DisasterRecoveryManager:
                         "encrypted_archive_path": rec["encrypted_archive_path"],
                         "remote_uri": remote_uri,
                         "snapshot_counts": snapshot_counts,
+                        "repositories_included": repositories_included,
+                        "repositories": repos_backed,
                     },
                 )
             )
@@ -563,13 +857,21 @@ class DisasterRecoveryManager:
         scratch_pg_url: str | None = None,
     ) -> dict:
         """Isolated restore dry-run NEVER touching live production DB: verifies decryption, HMAC authenticity,
-        file checksums, DB integrity, memory retrieval, vector retrieval, checkpoint recovery, project registry & RTO."""
+        file checksums, DB integrity, memory retrieval, vector retrieval, checkpoint recovery, project repos & RTO."""
         t0 = time.perf_counter()
         bp = Path(bundle_path).resolve()
         if not bp.exists():
             raise FileNotFoundError(f"Backup bundle not found: {bp}")
+        if self.db.is_postgres and scratch_pg_url and _same_pg_target(self.db.sync_url, scratch_pg_url):
+            raise ValueError("Refusing backup verification: scratch_pg_url must NOT point to the live production database.")
 
         warnings: list[str] = []
+        db_verified = False
+        repos_included = False
+        repos_verified = False
+        verified_repos_count = 0
+        repositories_list: list[str] = []
+
         with tempfile.TemporaryDirectory() as tmp:
             scratch = Path(tmp)
             zip_to_extract = bp
@@ -644,33 +946,73 @@ class DisasterRecoveryManager:
                         projects_count = len(s.scalars(select(ProjectRow)).all())
                 finally:
                     iso_db.sync_engine.dispose()
+                db_verified = True
             elif pg_dump_file.exists():
                 pg_meta_file = scratch / "db" / "postgres_meta.json"
                 pg_meta = json.loads(pg_meta_file.read_text(encoding="utf-8")) if pg_meta_file.exists() else None
                 if scratch_pg_url:
                     pg_rep = self.restore_postgresql(pg_dump_file, scratch_pg_url, expected_meta=pg_meta)
                     if not pg_rep["ok"]:
-                        raise ValueError(f"PostgreSQL isolated restore mismatch: {pg_rep['mismatches']}")
+                        raise ValueError(
+                            f"PostgreSQL isolated restore verification failed: mismatches={pg_rep['mismatches']} "
+                            f"pgvector={pg_rep['pgvector_installed']} vector_probe={pg_rep['vector_probe_ok']}"
+                        )
                     db_tables = len(pg_rep["tables"])
-                    vector_probe_ok = True
+                    memory_count = pg_rep["memory_count"]
+                    vector_count = pg_rep["vector_count"]
+                    vector_probe_ok = pg_rep["vector_probe_ok"]
+                    checkpoints_count = pg_rep["checkpoints_count"]
+                    projects_count = pg_rep["projects_count"]
+                    db_verified = True
                 else:
-                    warnings.append("PostgreSQL dump checksum verified; live pg_restore skipped because scratch_pg_url was not supplied.")
+                    db_verified = False
+                    warnings.append("PostgreSQL dump checksum verified ONLY; live pg_restore verification did NOT run because scratch_pg_url was not supplied.")
             else:
+                db_verified = False
                 warnings.append("No database file present in bundle.")
+
+            repositories_list = list(manifest.get("repositories") or [])
+            repos_included = bool(manifest.get("repositories_included") and repositories_list)
+            if repos_included and (scratch / "repositories").exists():
+                repo_rep = self.restore_repositories(
+                    scratch,
+                    scratch / "_repo_verify",
+                    overwrite_existing=True,
+                    restore_uncommitted=bool(manifest.get("include_uncommitted", True)),
+                )
+                verified_repos_count = repo_rep["count"]
+                repos_verified = verified_repos_count == len(repositories_list)
+            elif not repos_included:
+                warnings.append("Bundle scope is database_and_app_state_only (repositories_included=False); workspace Git repositories not included.")
 
         created_at = float(manifest.get("created_at") or time.time())
         rto_s = round(time.perf_counter() - t0, 3)
         rpo_s = max(0.0, round(time.time() - created_at, 3))
 
-        with self.db.sync_session() as s:
-            rows = s.query(BackupManifestRow).filter(BackupManifestRow.bundle_path == str(bp)).all()
-            for r in rows:
-                r.verified_restore = True
-            if rows:
-                s.commit()
+        verified_ok = bool(db_verified and (repos_verified or not repos_included))
+        full_recovery_verified = bool(db_verified and repos_included and repos_verified)
+        database_only_verified = bool(db_verified and not repos_included)
+        recovery_scope = (
+            "full_recovery_complete" if full_recovery_verified
+            else "database_and_app_state_only" if db_verified
+            else "incomplete"
+        )
+
+        if verified_ok:
+            match_paths = [str(bp)]
+            if bp.name.endswith(".jvault"):
+                match_paths.append(str(bp)[: -len(".jvault")])
+            with self.db.sync_session() as s:
+                rows = s.query(BackupManifestRow).filter(BackupManifestRow.bundle_path.in_(match_paths)).all()
+                for r in rows:
+                    r.verified_restore = True
+                if rows:
+                    s.commit()
 
         return {
-            "ok": True,
+            "ok": verified_ok,
+            "verified_restore": verified_ok,
+            "db_verified": db_verified,
             "verified_files": verified_files,
             "secrets_count": len(secrets),
             "db_tables": db_tables,
@@ -679,6 +1021,13 @@ class DisasterRecoveryManager:
             "vector_probe_ok": vector_probe_ok,
             "checkpoints_count": checkpoints_count,
             "projects_count": projects_count,
+            "repositories": repositories_list,
+            "repositories_included": repos_included,
+            "repositories_verified": repos_verified,
+            "verified_repos_count": verified_repos_count,
+            "database_only_verified": database_only_verified,
+            "full_recovery_complete": full_recovery_verified,
+            "recovery_scope": recovery_scope,
             "rto_seconds": rto_s,
             "rpo_seconds": rpo_s,
             "warnings": warnings,
@@ -709,13 +1058,20 @@ class DisasterRecoveryManager:
         target_data_dir: Path,
         target_notes_dir: Path | None = None,
         target_pg_url: str | None = None,
+        target_repos_dir: Path | None = None,
+        overwrite_existing: bool = False,
+        restore_uncommitted: bool = True,
     ) -> dict:
-        """Execute a complete machine recovery onto an isolated/new target directory."""
+        """Execute machine & optional repository recovery onto a target directory after isolated verification."""
         verify_rep = self.verify_backup(bundle_path, passphrase=passphrase, scratch_pg_url=target_pg_url)
+        if not verify_rep["ok"]:
+            raise RuntimeError(f"Backup verification failed prior to restore: {verify_rep.get('warnings')}")
+
         dst_data = Path(target_data_dir).resolve()
         dst_data.mkdir(parents=True, exist_ok=True)
         bp = Path(bundle_path).resolve()
 
+        repo_restore_rep: dict = {"ok": True, "restored": [], "count": 0}
         with tempfile.TemporaryDirectory() as tmp:
             scratch = Path(tmp)
             zpath = bp
@@ -729,7 +1085,10 @@ class DisasterRecoveryManager:
                 zf.extractall(scratch)
 
             if (scratch / "jarvis.db").exists():
-                shutil.copy2(scratch / "jarvis.db", dst_data / "jarvis.db")
+                db_dst = dst_data / "jarvis.db"
+                if db_dst.exists() and not overwrite_existing:
+                    raise FileExistsError(f"Refusing to overwrite existing restored database '{db_dst}' without overwrite_existing=True.")
+                shutil.copy2(scratch / "jarvis.db", db_dst)
             if (scratch / "settings.json").exists():
                 shutil.copy2(scratch / "settings.json", dst_data / "settings.json")
             self.restore_secrets_from_bundle(bp, passphrase=passphrase, dest_secrets_path=dst_data / "secrets.json")
@@ -742,7 +1101,30 @@ class DisasterRecoveryManager:
                 Path(target_notes_dir).mkdir(parents=True, exist_ok=True)
                 shutil.copytree(scratch / "notes", Path(target_notes_dir), dirs_exist_ok=True)
 
-        return {"ok": True, "restored_data_dir": str(dst_data), "verification": verify_rep}
+            if (scratch / "repositories").exists() and target_repos_dir is not None:
+                repo_restore_rep = self.restore_repositories(
+                    scratch,
+                    Path(target_repos_dir),
+                    overwrite_existing=overwrite_existing,
+                    restore_uncommitted=restore_uncommitted,
+                )
+
+        repos_expected = len(verify_rep.get("repositories") or [])
+        full_recovery_complete = bool(
+            verify_rep.get("repositories_included")
+            and target_repos_dir is not None
+            and repo_restore_rep.get("count", 0) == repos_expected
+        )
+        recovery_scope = "full_recovery_complete" if full_recovery_complete else "database_and_app_state_only"
+        return {
+            "ok": True,
+            "restored_data_dir": str(dst_data),
+            "verification": verify_rep,
+            "repositories_restored": repo_restore_rep["restored"],
+            "repositories_included": verify_rep.get("repositories_included", False),
+            "full_recovery_complete": full_recovery_complete,
+            "recovery_scope": recovery_scope,
+        }
 
     def list_manifests(self) -> list[dict]:
         with self.db.sync_session() as s:

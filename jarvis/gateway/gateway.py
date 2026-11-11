@@ -37,6 +37,16 @@ class CircuitBreakerState:
     last_error: str = ""
 
 
+def estimate_prompt_tokens(messages: list[dict]) -> int:
+    """Conservative ~4 chars/token + per-message framing estimate for preflight context gating."""
+    total = 0
+    for m in messages or []:
+        content = m.get("content", "")
+        text = content if isinstance(content, str) else str(content)
+        total += 4 + max(1, (len(text) + 3) // 4)
+    return total
+
+
 class ModelGateway:
     """Provider-independent, capability-aware, circuit-broken, firewall-enforced model router."""
 
@@ -188,25 +198,45 @@ class ModelGateway:
                 br.state = "OPEN"
                 br.opened_at = time.time()
 
-    def select_eligible_candidates(self, req: GatewayRequest, candidates: list[str]) -> list[str]:
-        """Filter model candidates by required capabilities, context window, paid authorization, & healthy breaker."""
+    def inspect_candidate_eligibility(self, req: GatewayRequest, candidates: list[str]) -> tuple[list[str], list[dict]]:
+        """Filter model candidates by streaming, tools, vision, json_mode, prompt+completion context fit, paid auth, & breaker."""
         eligible: list[str] = []
+        rejections: list[dict] = []
+        est_prompt = estimate_prompt_tokens(req.messages)
+        total_needed = est_prompt + max(0, int(req.max_tokens))
+
         for key in candidates:
             prov, mid = parse_model_key(key, self.settings)
             cap = self.get_capability(key)
-            if req.require_tools and not cap.tool_calling:
-                continue
-            if req.require_vision and not cap.vision:
-                continue
-            if req.json_mode and not cap.json_mode:
-                continue
-            if req.max_tokens > cap.max_ctx:
-                continue
-            if is_paid_model(prov, mid, self.settings) and not self.settings.providers.allow_paid_models:
-                continue
-            if self.breaker_status(prov) == "OPEN":
-                continue
-            eligible.append(key)
+            reason = ""
+            detail = ""
+            if req.require_streaming and not cap.streaming:
+                reason, detail = "streaming_unsupported", f"{key} does not support streaming"
+            elif req.require_tools and not cap.tool_calling:
+                reason, detail = "tools_unsupported", f"{key} does not support tool calling"
+            elif req.require_vision and not cap.vision:
+                reason, detail = "vision_unsupported", f"{key} does not support vision"
+            elif req.json_mode and not cap.json_mode:
+                reason, detail = "json_mode_unsupported", f"{key} does not support json_mode"
+            elif total_needed > cap.max_ctx:
+                reason, detail = (
+                    "context_window_exceeded",
+                    f"estimated tokens ({est_prompt} prompt + {req.max_tokens} max_tokens = {total_needed}) > max_ctx={cap.max_ctx}",
+                )
+            elif is_paid_model(prov, mid, self.settings) and not self.settings.providers.allow_paid_models:
+                reason, detail = "paid_blocked", f"{key} is a paid model and allow_paid_models=False"
+            elif self.breaker_status(prov) == "OPEN":
+                reason, detail = "circuit_open", f"circuit breaker OPEN for {prov}"
+
+            if reason:
+                rejections.append({"model": key, "reason": reason, "detail": detail})
+            else:
+                eligible.append(key)
+        return eligible, rejections
+
+    def select_eligible_candidates(self, req: GatewayRequest, candidates: list[str]) -> list[str]:
+        """Filter model candidates by required capabilities, prompt+completion context window, paid auth, & breaker."""
+        eligible, _ = self.inspect_candidate_eligibility(req, candidates)
         return eligible
 
     def _check_rate_and_budget(self) -> None:
@@ -300,10 +330,27 @@ class ModelGateway:
     ) -> AsyncIterator[GatewayEvent]:
         """Execute streaming model call across eligible fallback chain with breaker, retry/backoff, & firewall."""
         raw_candidates = [req.model_key] + [m for m in (fallback_models or []) if m != req.model_key]
-        candidates = self.select_eligible_candidates(req, raw_candidates)
+        candidates, rejections = self.inspect_candidate_eligibility(req, raw_candidates)
         if not candidates:
-            # Run explicit primary check so caller gets precise policy/paid/breaker error message
-            candidates = [req.model_key]
+            cats = [r["reason"] for r in rejections]
+            if cats and all(c == "paid_blocked" for c in cats):
+                raise CloudGatewayError(
+                    f"Blocked paid model call for {req.model_key!r}: paid models require explicit owner authorization (allow_paid_models=False).",
+                    category="paid_blocked",
+                    retryable=False,
+                )
+            if cats and all(c == "circuit_open" for c in cats):
+                raise CloudGatewayError(
+                    f"Circuit breaker OPEN for all candidate providers ({'; '.join(r['detail'] for r in rejections)}).",
+                    category="circuit_open",
+                    retryable=True,
+                )
+            detail = "; ".join(f"{r['model']}: {r['detail']}" for r in rejections) or "no candidates provided"
+            raise CloudGatewayError(
+                f"No eligible model satisfies request requirements ({detail}).",
+                category="no_eligible_model",
+                retryable=False,
+            )
 
         last_err: Exception | None = None
         fallback_reason = ""

@@ -83,16 +83,28 @@ class TrainingManager:
         free_vram_if_unloaded = round(min(total_vram, hw["free_vram_gb"] + hw["ollama_loaded_vram_gb"]), 2)
 
         blockers: list[str] = []
+        package_blockers: list[str] = []
+        hardware_blockers: list[str] = []
         if not caps["ready_for_peft_lora"] and cfg.backend == "peft_lora":
-            blockers.append(f"Missing required packages: {', '.join(caps['missing_required'])}")
-        if cfg.quantization == "4bit" and not caps["installed"].get("bitsandbytes"):
-            blockers.append("4-bit QLoRA requires optional 'bitsandbytes' package with CUDA support.")
+            msg = f"Missing required packages: {', '.join(caps['missing_required'])}"
+            package_blockers.append(msg)
+            blockers.append(msg)
+        if cfg.quantization == "4bit" and (not caps["installed"].get("bitsandbytes") or not caps["cuda"].get("available")):
+            msg = "4-bit QLoRA requires optional 'bitsandbytes' package with CUDA support."
+            package_blockers.append(msg)
+            blockers.append(msg)
+        elif cfg.quantization == "8bit" and (not caps["installed"].get("bitsandbytes") or not caps["cuda"].get("available")):
+            msg = "8-bit LoRA requires optional 'bitsandbytes' package with CUDA support."
+            package_blockers.append(msg)
+            blockers.append(msg)
         if total_vram > 0 and est_vram_gb > free_vram_if_unloaded:
-            blockers.append(
-                f"Estimated VRAM ({est_vram_gb} GB) exceeds available GPU capacity ({free_vram_if_unloaded} GB even after unloading Ollama)."
-            )
+            msg = f"Estimated VRAM ({est_vram_gb} GB) exceeds available GPU capacity ({free_vram_if_unloaded} GB even after unloading Ollama)."
+            hardware_blockers.append(msg)
+            blockers.append(msg)
         if est_ram_gb > max(free_ram, hw["total_ram_gb"] * 0.7):
-            blockers.append(f"Estimated RAM ({est_ram_gb} GB) is tight for free system RAM ({free_ram} GB).")
+            msg = f"Estimated RAM ({est_ram_gb} GB) is tight for free system RAM ({free_ram} GB)."
+            hardware_blockers.append(msg)
+            blockers.append(msg)
 
         need_unload = hw["ollama_loaded_vram_gb"] > 0.2 and total_vram > 0 and est_vram_gb > hw["free_vram_gb"]
         feasible = (len(blockers) == 0)
@@ -103,6 +115,8 @@ class TrainingManager:
             "estimated_ram_gb": est_ram_gb,
             "hardware": hw,
             "blockers": blockers,
+            "package_blockers": package_blockers,
+            "hardware_blockers": hardware_blockers,
             "recommendation": (
                 "Approved resource profile within local budget (unload Ollama before launch)." if (feasible and need_unload)
                 else "Resource budget feasible." if feasible
@@ -161,7 +175,55 @@ class TrainingManager:
         self.audit.record("training_approved", actor=approver, details={"job_id": job_id})
         return st
 
-    def start_job(self, job_id: str, *, force_spawn_even_if_blocked: bool = True) -> dict:
+    @staticmethod
+    def _is_pid_alive(pid: int | None) -> bool:
+        if not pid or pid <= 0:
+            return False
+        try:
+            if os.name == "nt":
+                out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"], capture_output=True, text=True, timeout=5, shell=False)
+                return str(pid) in (out.stdout or "")
+            os.kill(pid, 0)
+            return True
+        except Exception:
+            return False
+
+    def _active_job_pid(self, job_id: str) -> int | None:
+        proc = self._procs.get(job_id)
+        if proc is not None and proc.poll() is None:
+            return proc.pid
+        pid_file = self._job_dir(job_id) / "worker.pid"
+        if pid_file.exists():
+            try:
+                pid = int(pid_file.read_text(encoding="utf-8").strip())
+                if self._is_pid_alive(pid):
+                    return pid
+                pid_file.unlink(missing_ok=True)
+            except Exception:
+                pass
+        return None
+
+    def _find_other_active_job(self, exclude_job_id: str) -> tuple[str, int] | None:
+        if not self.jobs_dir.exists():
+            return None
+        for d in self.jobs_dir.iterdir():
+            if not d.is_dir() or d.name == exclude_job_id:
+                continue
+            pid = self._active_job_pid(d.name)
+            if pid is not None:
+                return d.name, pid
+        return None
+
+    def start_job(
+        self,
+        job_id: str,
+        *,
+        force_spawn_even_if_blocked: bool = False,
+        override: bool = False,
+        override_reason: str = "",
+        actor: str = "owner",
+        ollama_ps: list[dict] | None = None,
+    ) -> dict:
         with self._lock:
             jdir = self._job_dir(job_id)
             sp = jdir / "status.json"
@@ -170,9 +232,36 @@ class TrainingManager:
             st = json.loads(sp.read_text(encoding="utf-8"))
             if self.spec.require_training_approval and not st.get("approved"):
                 raise PermissionError("Training job requires explicit operator approval before starting.")
-            est = st.get("estimate") or {}
-            if not est.get("feasible_local") and not force_spawn_even_if_blocked:
-                raise RuntimeError("; ".join(est.get("blockers") or ["Insufficient hardware/packages for training"]))
+
+            if existing_pid := self._active_job_pid(job_id):
+                raise RuntimeError(f"Training job '{job_id}' is already running (pid={existing_pid}).")
+            if other := self._find_other_active_job(job_id):
+                raise RuntimeError(f"Another training job '{other[0]}' is already running (pid={other[1]}; max_concurrent_jobs=1).")
+
+            cfg_dict = dict(st.get("config") or {})
+            cfg_model = TrainingJobConfig.model_validate(cfg_dict)
+            est = self.estimate_resources(cfg_model, ollama_ps=ollama_ps)
+            st["estimate"] = est
+
+            pkg_blockers = list(est.get("package_blockers") or [])
+            hw_blockers = list(est.get("hardware_blockers") or [])
+            if pkg_blockers and not force_spawn_even_if_blocked:
+                raise RuntimeError("; ".join(pkg_blockers))
+
+            if hw_blockers and not force_spawn_even_if_blocked:
+                if not override:
+                    raise RuntimeError("; ".join(hw_blockers))
+                if not str(override_reason).strip() or not str(actor).strip():
+                    raise PermissionError("Hardware override requires explicit non-empty override_reason and actor.")
+                self.audit.record(
+                    "training_hardware_override",
+                    actor=actor,
+                    details={"job_id": job_id, "reason": override_reason[:300], "hardware_blockers": hw_blockers},
+                )
+                cfg_dict["hardware_override"] = True
+                cfg_dict["hardware_override_by"] = actor
+                cfg_dict["hardware_override_reason"] = override_reason[:300]
+                self._write_json(jdir / "config.json", cfg_dict)
 
             self._write_json(jdir / "control.json", {"command": "running"})
             self._write_json(jdir / "progress.json", {"job_id": job_id, "state": "starting", "updated_at": round(time.time(), 3)})
@@ -188,7 +277,8 @@ class TrainingManager:
                 stderr=subprocess.DEVNULL,
             )
             self._procs[job_id] = proc
-            self.audit.record("training_started", details={"job_id": job_id, "pid": proc.pid})
+            (jdir / "worker.pid").write_text(str(proc.pid), encoding="utf-8")
+            self.audit.record("training_started", actor=actor, details={"job_id": job_id, "pid": proc.pid, "hardware_override": bool(hw_blockers and override)})
             return self.get_job(job_id)
 
     def pause_job(self, job_id: str) -> dict:
@@ -225,12 +315,32 @@ class TrainingManager:
         st["updated_at"] = round(time.time(), 3)
         self._write_json(jdir / "status.json", st)
         proc = self._procs.get(job_id)
+        pid = self._active_job_pid(job_id)
         if proc and proc.poll() is None:
             try:
-                proc.wait(timeout=2.0)
+                proc.wait(timeout=1.5)
             except Exception:
-                proc.terminate()
-        self.audit.record("training_cancelled", details={"job_id": job_id})
+                try:
+                    if os.name == "nt":
+                        subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True, timeout=10, shell=False)
+                    else:
+                        proc.terminate()
+                        proc.wait(timeout=1.5)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+        elif pid:
+            try:
+                if os.name == "nt":
+                    subprocess.run(["taskkill", "/T", "/F", "/PID", str(pid)], capture_output=True, timeout=10, shell=False)
+                else:
+                    os.kill(pid, 15)
+            except Exception:
+                pass
+        (jdir / "worker.pid").unlink(missing_ok=True)
+        self.audit.record("training_cancelled", details={"job_id": job_id, "terminated_pid": pid})
         return self.get_job(job_id)
 
     def get_job(self, job_id: str) -> dict:

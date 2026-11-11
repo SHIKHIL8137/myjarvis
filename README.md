@@ -63,8 +63,9 @@ Jarvis runs local-first on Windows (Ollama local LLM inference, `faster-whisper`
 
 ## 4. Workforce Safety & Execution Restrictions
 
-- **Mandatory Gates**: Coding runs execute inside isolated `git worktree` checkouts (`.jarvis_worktrees/<slug>`). Failed QA retries transition to `FAILED` and cannot enter merge approval; `BLOCKED` security scans (covering tracked diffs, staged, unstaged, untracked files, binary files, mode changes, and symlinks) block merge; any edit after review invalidates the `manifest_sha256` and requires fresh approval.
-- **Sandbox Policy**: `ExecutionPolicy` restricts working directory bounds, allowed/denied executables (`powershell`, `bash`, `curl`, etc. denied), and environment variables. On native Windows without `sandbox_backend="docker"`, OS-level network/filesystem namespace isolation is **not** provided (directory scoping + env allowlisting only). Enable `workforce.sandbox_backend="docker"` with Docker Desktop running for container isolation (`--network=none`).
+- **Mandatory Gates**: Coding runs execute inside isolated `git worktree` checkouts (`.jarvis_worktrees/<slug>`) with immutable `base_sha` tracking. Security scanning covers committed `base_sha..HEAD` diffs, staged/unstaged changes, untracked files, renames (`old_path`/`new_path`), deletions, mode/symlink changes, and binary hashes via streaming reads up to `2 MB` (oversized text files are explicitly blocked). Approvals pin `base_sha`, `head_sha`, `manifest_sha256`, `diff_hash`, and `approval_fingerprint`.
+- **Real Cancellation**: Cancelling an active run terminates active subprocess trees and Docker containers, expires pending approvals, preserves worktrees (`cancelled_preserved`) unless cleanup is authorized, and blocks approval/merge resumption.
+- **Sandbox Policy**: `ExecutionPolicy` restricts working directory bounds, allowed/denied executables (`powershell`, `bash`, `curl`, etc. denied), and environment variables. `opencode_adapter` refuses silent unisolated host execution when `sandbox_backend="docker"` unless `allow_host_fallback=True`. On native Windows without Docker Desktop running, `restricted_subprocess` enforces directory scoping and env allowlisting without OS network/filesystem namespaces.
 
 ---
 
@@ -72,7 +73,7 @@ Jarvis runs local-first on Windows (Ollama local LLM inference, `faster-whisper`
 
 - **Knowledge Base (RAG)** and **Model Weight Training** are separate subsystems:
   - Remote documentation/Hugging Face knowledge sources require Online Assisted Mode, allowlisted hosts, verified permissive licenses (`allowed_licenses`), and prompt-injection screening (`detect_poisoning`), and are wrapped in `<retrieved_knowledge untrusted_data="true">` delimiters.
-  - Fine-tuning defaults to `automatic_training=false`, `require_training_approval=true`, `evaluation_required=true`, and `auto_promote=false`. Low-VRAM systems can export a verified off-device training spec via `TrainingManager.prepare_remote_delegation_bundle()`.
+  - Fine-tuning defaults to `automatic_training=false`, `require_training_approval=true`, `evaluation_required=true`, `auto_promote=false`, and `force_spawn_even_if_blocked=false`. Missing required packages/CUDA cannot be bypassed via API override; hardware limit overrides require explicit audited `override_reason` + `actor`; duplicate/concurrent jobs are blocked (`max_concurrent_jobs=1`), and the worker refuses silent FP32 fallback for 4-bit/8-bit QLoRA. Low-VRAM systems can export a remote training spec via `TrainingManager.prepare_remote_delegation_bundle()`.
 
 ---
 
@@ -81,7 +82,7 @@ Jarvis runs local-first on Windows (Ollama local LLM inference, `faster-whisper`
 | Variable | Purpose |
 |---|---|
 | `JARVIS_DATABASE_URL` | Optional SQLAlchemy DB URL (`postgresql+psycopg://...` or `sqlite:///...`) |
-| `JARVIS_PG_TEST_URL` | Optional live PostgreSQL + `pgvector` URL for `@pytest.mark.pg` integration tests |
+| `JARVIS_PG_TEST_URL` / `JARVIS_PG_SCRATCH_URL` | Optional live PostgreSQL + `pgvector` and scratch restore DB URLs for `@pytest.mark.pg` integration tests |
 | `OLLAMA_HOST` | Loopback Ollama bind address (`127.0.0.1:11434`) |
 | `OPENROUTER_API_KEY` / `GEMINI_API_KEY` / `HF_TOKEN` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | Optional provider API keys (also storable in DPAPI-encrypted `data/secrets.json`) |
 
@@ -89,7 +90,7 @@ Jarvis runs local-first on Windows (Ollama local LLM inference, `faster-whisper`
 
 ## 7. Backup & Complete New-Laptop Recovery
 
-1. **Create & Verify a Backup** (UI **RECOVERY** tab or `/api/v2/recovery/backup` + `/api/v2/recovery/verify`): captures SQLite/PostgreSQL dump (`pg_dump`), vector snapshots, 5-way memory, workflow checkpoints, project registry, encrypted `secrets.vault.enc`, `settings.json`, documents, knowledge DB, and optional Git bundles inside an AES-256-GCM `.jvault` archive with HMAC-SHA256 authenticity verification.
+1. **Create & Verify a Backup** (UI **RECOVERY** tab or `/api/v2/recovery/backup` + `/api/v2/recovery/verify`): captures SQLite/PostgreSQL dump (`pg_dump` via temporary `PGPASSFILE`), vector snapshots, 5-way memory, workflow checkpoints, project registry, encrypted `secrets.vault.enc`, `settings.json`, documents, knowledge DB, and optional Git bundles + tracked diffs + untracked files inside an AES-256-GCM `.jvault` archive with HMAC-SHA256 verification. Explicitly distinguishes `database_and_app_state_only` vs `full_recovery_complete` (`repositories_included`). PostgreSQL verification refuses targeting the live production DB and treats any non-zero `pg_restore --exit-on-error` exit or missing `pgvector`/row mismatch as failure.
 2. **Recover on a New Laptop**:
    ```powershell
    git clone <repo-url> myjarvis

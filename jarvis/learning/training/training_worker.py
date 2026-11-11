@@ -57,8 +57,26 @@ def run_job_directory(job_dir: Path) -> int:
     progress_path = job_dir / "progress.json"
     control_path = job_dir / "control.json"
     log_path = job_dir / "worker.log"
+    pid_path = job_dir / "worker.pid"
     out_dir = job_dir / "output"
     out_dir.mkdir(parents=True, exist_ok=True)
+    pid_path.write_text(str(os.getpid()), encoding="utf-8")
+
+    try:
+        return _execute_training_job(job_dir, cfg, prep_dir, progress_path, control_path, log_path, out_dir)
+    finally:
+        pid_path.unlink(missing_ok=True)
+
+
+def _execute_training_job(
+    job_dir: Path,
+    cfg: dict,
+    prep_dir: Path,
+    progress_path: Path,
+    control_path: Path,
+    log_path: Path,
+    out_dir: Path,
+) -> int:
 
     def log_line(msg: str):
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -85,7 +103,32 @@ def run_job_directory(job_dir: Path) -> int:
         save_prog("blocked", error=msg, capabilities=caps, epoch=0, step=0, total_steps=0)
         return 2
 
-    # Lazy import only after dependency check succeeds
+    quant = str(cfg.get("quantization") or "4bit").lower()
+    if quant == "4bit" and not caps["ready_for_qlora_4bit"]:
+        msg = "4-bit QLoRA blocked: CUDA GPU and 'bitsandbytes' are required; silent FP32 fallback is forbidden."
+        log_line(msg)
+        save_prog("blocked", error=msg, capabilities=caps, epoch=0, step=0, total_steps=0)
+        return 2
+    if quant == "8bit" and not (caps["installed"].get("bitsandbytes") and caps["cuda"].get("available")):
+        msg = "8-bit LoRA blocked: CUDA GPU and 'bitsandbytes' are required; silent FP32 fallback is forbidden."
+        log_line(msg)
+        save_prog("blocked", error=msg, capabilities=caps, epoch=0, step=0, total_steps=0)
+        return 2
+
+    if not cfg.get("hardware_override"):
+        try:
+            import psutil
+
+            free_ram_gb = psutil.virtual_memory().available / (1024 ** 3)
+            if free_ram_gb < 1.0:
+                msg = f"Training blocked inside worker: insufficient free RAM ({free_ram_gb:.2f} GB < 1.0 GB)."
+                log_line(msg)
+                save_prog("blocked", error=msg, capabilities=caps, epoch=0, step=0, total_steps=0)
+                return 2
+        except ImportError:
+            pass
+
+    # Lazy import only after dependency & quantization checks succeed
     import torch
     from peft import LoraConfig, TaskType, get_peft_model
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -97,14 +140,34 @@ def run_job_directory(job_dir: Path) -> int:
         return 1
 
     model_id = cfg["hf_model_id"]
-    log_line(f"Loading local tokenizer/base model (local_files_only=True): {model_id}")
+    log_line(f"Loading local tokenizer/base model (local_files_only=True, quant={quant}): {model_id}")
     save_prog("loading_model", epoch=0, step=0, total_steps=len(rows) * int(cfg["epochs"]))
     tok = AutoTokenizer.from_pretrained(model_id, local_files_only=True)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
 
-    dtype = torch.float16 if torch.cuda.is_available() else torch.float32
-    model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=dtype, local_files_only=True)
+    load_kwargs: dict = {"local_files_only": True}
+    use_device_map = False
+    if quant == "4bit":
+        from transformers import BitsAndBytesConfig
+
+        load_kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.float16,
+        )
+        load_kwargs["device_map"] = "auto"
+        use_device_map = True
+    elif quant == "8bit":
+        from transformers import BitsAndBytesConfig
+
+        load_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
+        load_kwargs["device_map"] = "auto"
+        use_device_map = True
+    else:
+        load_kwargs["torch_dtype"] = torch.float16 if torch.cuda.is_available() else torch.float32
+
+    model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
     lora_cfg = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
         r=int(cfg["lora_r"]),
@@ -114,7 +177,8 @@ def run_job_directory(job_dir: Path) -> int:
     )
     model = get_peft_model(model, lora_cfg)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model.to(device)
+    if not use_device_map:
+        model.to(device)
     model.train()
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(cfg["learning_rate"]))

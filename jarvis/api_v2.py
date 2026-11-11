@@ -1,5 +1,6 @@
 """Clean Modular v2 API Router exposing 5-Way Memory, Decision/Gateway, Projects/Graphify,
 LangGraph Workforce Runs, Approvals, Document Engine, Reminders, and 3-2-1 Disaster Recovery."""
+import asyncio
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -67,6 +68,12 @@ class ApprovalDecideIn(BaseModel):
     decided_by: str = "owner"
 
 
+class CancelRunIn(BaseModel):
+    reason: str = "Cancelled by owner"
+    actor: str = "owner"
+    authorize_cleanup: bool = False
+
+
 class DocGenerateIn(BaseModel):
     format: str = Field(..., pattern="^(pdf|docx|word|pptx|powerpoint|slides|xlsx|excel|spreadsheet)$")
     filename: str = Field(..., min_length=1, max_length=120)
@@ -88,6 +95,8 @@ class ReminderCreateIn(BaseModel):
 class BackupCreateIn(BaseModel):
     tier: str = Field("tier2_warm", pattern="^(tier1_hot|tier2_warm|tier3_cold)$")
     passphrase: str = Field(..., min_length=8, max_length=128)
+    include_repositories: bool = False
+    include_uncommitted: bool = False
 
 
 class BackupVerifyIn(BaseModel):
@@ -251,16 +260,25 @@ def create_v2_router(fallback=None) -> APIRouter:
 
     @router.post("/workforce/runs")
     async def trigger_workforce_run(body: WorkforceRunIn, a=Depends(get_a)):
-        return a.orchestrator.start_workforce_workflow(**body.model_dump())
+        return await asyncio.to_thread(a.orchestrator.start_workforce_workflow, **body.model_dump())
 
     @router.post("/workforce/runs/{run_id}/cancel")
-    async def cancel_workforce_run(run_id: str, a=Depends(get_a)):
-        a.orchestrator._update_run(run_id, "cancelled", "Cancelled by owner")
-        return {"ok": True, "run_id": run_id, "state": "cancelled"}
+    async def cancel_workforce_run(run_id: str, body: CancelRunIn | None = None, a=Depends(get_a)):
+        b = body or CancelRunIn()
+        try:
+            return await asyncio.to_thread(
+                a.orchestrator.cancel_workforce_run,
+                run_id,
+                reason=b.reason,
+                actor=b.actor,
+                authorize_cleanup=b.authorize_cleanup,
+            )
+        except KeyError:
+            raise HTTPException(404, f"Run {run_id} not found")
 
     @router.post("/assistant/runs")
     async def trigger_assistant_run(body: AssistantRunIn, a=Depends(get_a)):
-        return a.orchestrator.start_assistant_workflow(**body.model_dump())
+        return await asyncio.to_thread(a.orchestrator.start_assistant_workflow, **body.model_dump())
 
     @router.get("/approvals")
     async def list_approvals(a=Depends(get_a)):
@@ -268,7 +286,19 @@ def create_v2_router(fallback=None) -> APIRouter:
 
     @router.post("/approvals/{token}/decide")
     async def decide_approval(token: str, body: ApprovalDecideIn, a=Depends(get_a)):
-        return a.orchestrator.resume_workflow_after_approval(token=token, approved=body.approved, decided_by=body.decided_by)
+        try:
+            return await asyncio.to_thread(
+                a.orchestrator.resume_workflow_after_approval,
+                token=token,
+                approved=body.approved,
+                decided_by=body.decided_by,
+            )
+        except KeyError:
+            raise HTTPException(404, f"Approval {token} not found")
+        except TimeoutError as e:
+            raise HTTPException(410, str(e))
+        except ValueError as e:
+            raise HTTPException(409, str(e))
 
     # ---- Documents (PDF / DOCX / PPTX / XLSX) --------------------------------------------------------
     @router.get("/documents")
@@ -316,15 +346,22 @@ def create_v2_router(fallback=None) -> APIRouter:
 
     @router.post("/recovery/backup")
     async def run_backup(body: BackupCreateIn, a=Depends(get_a)):
-        return a.orchestrator.recovery.create_backup(
+        return await asyncio.to_thread(
+            a.orchestrator.recovery.create_backup,
             tier=body.tier,
             passphrase=body.passphrase,
             notes_dir=a.settings.notes_path,
+            include_repositories=body.include_repositories,
+            include_uncommitted=body.include_uncommitted,
         )
 
     @router.post("/recovery/verify")
     async def verify_backup(body: BackupVerifyIn, a=Depends(get_a)):
-        return a.orchestrator.recovery.verify_backup(Path(body.bundle_path), passphrase=body.passphrase)
+        return await asyncio.to_thread(
+            a.orchestrator.recovery.verify_backup,
+            Path(body.bundle_path),
+            passphrase=body.passphrase,
+        )
 
     @router.get("/recovery/instructions")
     async def recovery_instructions(a=Depends(get_a)):

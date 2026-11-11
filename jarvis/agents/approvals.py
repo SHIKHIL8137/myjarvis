@@ -120,6 +120,22 @@ class ApprovalService:
             s.commit()
             return self._to_dict(row)
 
+    def cancel_for_run(self, run_id: str, *, decided_by: str = "system_cancel") -> int:
+        now = round(time.time(), 3)
+        with self.db.sync_session() as s:
+            rows = (
+                s.query(ApprovalRequestRow)
+                .filter(ApprovalRequestRow.run_id == run_id, ApprovalRequestRow.status == "pending")
+                .all()
+            )
+            for row in rows:
+                row.status = "cancelled"
+                row.decided_by = decided_by
+                row.decided_at = now
+            if rows:
+                s.commit()
+            return len(rows)
+
     def get(self, token: str) -> dict:
         with self.db.sync_session() as s:
             row = s.get(ApprovalRequestRow, token)
