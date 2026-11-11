@@ -2,13 +2,17 @@
 LangGraph Workforce Runs, Approvals, Document Engine, Reminders, and 3-2-1 Disaster Recovery."""
 import asyncio
 from pathlib import Path
+import time
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from .api_deps import make_assistant_dep
+from .api_skills import create_skills_subrouter
 from .departments.assistant.documents import parse_document
+from .gateway.gateway import CloudGatewayError
+from .gateway.interface import GatewayRequest
 from .integrations import graphify_adapter
 from .memory.legacy_migrator import migrate_legacy_to_db
 
@@ -102,6 +106,34 @@ class BackupCreateIn(BaseModel):
 class BackupVerifyIn(BaseModel):
     bundle_path: str = Field(..., min_length=1, max_length=600)
     passphrase: str = Field(..., min_length=8, max_length=128)
+    scratch_pg_url: str | None = Field(None, max_length=600)
+
+
+class DbTargetRegisterIn(BaseModel):
+    role: str = Field(..., pattern="^(local_sqlite|dev_pg|test_pg|scratch_pg|prod_pg)$")
+    url: str = Field(..., min_length=5, max_length=600)
+    label: str = ""
+
+
+class ProdRestoreRequestIn(BaseModel):
+    bundle_path: str = Field(..., min_length=1, max_length=600)
+    target_pg_url: str = Field(..., min_length=8, max_length=600)
+    passphrase: str = Field(..., min_length=8, max_length=128)
+    reason: str = ""
+
+
+class ProdRestoreExecuteIn(BaseModel):
+    approval_token: str = Field(..., min_length=4, max_length=80)
+    bundle_path: str = Field(..., min_length=1, max_length=600)
+    target_pg_url: str = Field(..., min_length=8, max_length=600)
+    passphrase: str = Field(..., min_length=8, max_length=128)
+
+
+class SandboxChatIn(BaseModel):
+    model: str | None = None
+    messages: list[dict]
+    max_tokens: int = Field(512, ge=16, le=8192)
+    temperature: float = Field(0.6, ge=0.0, le=2.0)
 
 
 class MemoryUpdateIn(BaseModel):
@@ -135,6 +167,7 @@ def create_v2_router(fallback=None) -> APIRouter:
             "reminders": o.reminders.list_reminders(),
             "documents": o.documents.list_generated(),
             "backups": o.recovery.list_manifests(),
+            "skills": {"installed": len(o.skills.list_skills()), "enabled": len(o.skills.list_skills(enabled_only=True))},
         }
 
     # ---- Decision & Gateway --------------------------------------------------------------------------
@@ -357,11 +390,59 @@ def create_v2_router(fallback=None) -> APIRouter:
 
     @router.post("/recovery/verify")
     async def verify_backup(body: BackupVerifyIn, a=Depends(get_a)):
-        return await asyncio.to_thread(
-            a.orchestrator.recovery.verify_backup,
-            Path(body.bundle_path),
-            passphrase=body.passphrase,
-        )
+        try:
+            eff_scratch = body.scratch_pg_url or (a.settings.database.scratch_target_url or None)
+            return await asyncio.to_thread(
+                a.orchestrator.recovery.verify_backup,
+                Path(body.bundle_path),
+                passphrase=body.passphrase,
+                scratch_pg_url=eff_scratch,
+            )
+        except ValueError as e:
+            raise HTTPException(403, str(e)) from e
+
+    @router.get("/recovery/targets")
+    async def list_db_targets(a=Depends(get_a)):
+        return {"targets": a.orchestrator.recovery.list_database_targets()}
+
+    @router.post("/recovery/targets")
+    async def register_db_target(body: DbTargetRegisterIn, a=Depends(get_a)):
+        try:
+            return {"target": a.orchestrator.recovery.register_database_target(body.role, body.url, label=body.label)}
+        except ValueError as e:
+            raise HTTPException(422, str(e)) from e
+
+    @router.post("/recovery/restore/request-production")
+    async def request_prod_restore(body: ProdRestoreRequestIn, a=Depends(get_a)):
+        try:
+            req = await asyncio.to_thread(
+                a.orchestrator.recovery.request_production_restore,
+                Path(body.bundle_path),
+                target_pg_url=body.target_pg_url,
+                passphrase=body.passphrase,
+                requested_by="ui_user",
+                reason=body.reason,
+            )
+            return {"approval": req}
+        except (ValueError, FileNotFoundError) as e:
+            raise HTTPException(400, str(e)) from e
+
+    @router.post("/recovery/restore/execute")
+    async def execute_prod_restore(body: ProdRestoreExecuteIn, a=Depends(get_a)):
+        try:
+            return await asyncio.to_thread(
+                a.orchestrator.recovery.execute_production_restore,
+                approval_token=body.approval_token,
+                target_pg_url=body.target_pg_url,
+                bundle_path=Path(body.bundle_path),
+                passphrase=body.passphrase,
+            )
+        except PermissionError as e:
+            raise HTTPException(403, str(e)) from e
+        except ValueError as e:
+            raise HTTPException(403, str(e)) from e
+        except (KeyError, FileNotFoundError) as e:
+            raise HTTPException(404, str(e)) from e
 
     @router.get("/recovery/instructions")
     async def recovery_instructions(a=Depends(get_a)):
@@ -369,7 +450,78 @@ def create_v2_router(fallback=None) -> APIRouter:
             "steps": a.orchestrator.recovery.recovery_steps_doc(),
             "db": await a.orchestrator.db.health(),
             "backup_root": str(a.orchestrator.recovery.backup_root),
+            "targets": a.orchestrator.recovery.list_database_targets(),
         }
 
+    # ---- Scoped Container Model Gateway Proxy (OpenAI-compatible; short-lived bearer token only) --------
+    @router.get("/sandbox/v1/models")
+    async def sandbox_models(request: Request, a=Depends(get_a)):
+        try:
+            tok = a.orchestrator.sandbox_tokens.validate(request.headers.get("authorization", ""))
+        except PermissionError as e:
+            raise HTTPException(401, str(e)) from e
+        caps = a.orchestrator.gateway.list_capabilities() if a.orchestrator.gateway else []
+        models = list(tok.allowed_models) if tok.allowed_models else [f"{c['provider']}:{c['model_id']}" if not c["local"] else c["model_id"] for c in caps]
+        return {"object": "list", "data": [{"id": m, "object": "model"} for m in models]}
+
+    @router.post("/sandbox/v1/chat/completions")
+    async def sandbox_chat_completions(body: SandboxChatIn, request: Request, a=Depends(get_a)):
+        auth = request.headers.get("authorization", "")
+        try:
+            tok = a.orchestrator.sandbox_tokens.validate(auth, requested_model=body.model)
+        except PermissionError as e:
+            raise HTTPException(401, str(e)) from e
+        gw = a.orchestrator.gateway
+        if gw is None:
+            raise HTTPException(503, "ModelGateway unavailable")
+        model_key = body.model or (tok.allowed_models[0] if tok.allowed_models else a.settings.boot_brain)
+        if not tok.allow_ollama and (model_key in a.settings.brains or model_key.startswith("ollama:")):
+            raise HTTPException(403, "Local Ollama access is disabled for this sandbox network policy.")
+        t0 = time.perf_counter()
+        chunks: list[str] = []
+        usage: dict = {}
+        try:
+            req = GatewayRequest(
+                model_key=model_key,
+                messages=body.messages,
+                max_tokens=body.max_tokens,
+                temperature=body.temperature,
+                run_id=tok.run_id,
+                decision_layer=3,
+            )
+            async for ev in gw.stream_with_fallback(req):
+                if ev.type == "token":
+                    chunks.append(ev.text)
+                elif ev.type == "done":
+                    usage = ev.usage or {}
+            latency_ms = (time.perf_counter() - t0) * 1000.0
+            a.orchestrator.sandbox_tokens.record_request_metadata(
+                run_id=tok.run_id,
+                model=model_key,
+                status="ok",
+                latency_ms=latency_ms,
+                token_count=int(usage.get("completion_tokens") or 0),
+            )
+            return {
+                "id": f"chatcmpl-{tok.run_id}",
+                "object": "chat.completion",
+                "model": model_key,
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "".join(chunks)}, "finish_reason": "stop"}],
+                "usage": {
+                    "prompt_tokens": int(usage.get("prompt_tokens") or 0),
+                    "completion_tokens": int(usage.get("completion_tokens") or 0),
+                    "total_tokens": int(usage.get("prompt_tokens") or 0) + int(usage.get("completion_tokens") or 0),
+                },
+            }
+        except CloudGatewayError as e:
+            a.orchestrator.sandbox_tokens.record_request_metadata(
+                run_id=tok.run_id,
+                model=model_key,
+                status=e.category,
+                latency_ms=(time.perf_counter() - t0) * 1000.0,
+            )
+            raise HTTPException(403 if e.category in ("paid_blocked", "secret_blocked", "privacy_blocked") else 400, str(e)) from e
+
+    router.include_router(create_skills_subrouter(fallback))
     return router
 

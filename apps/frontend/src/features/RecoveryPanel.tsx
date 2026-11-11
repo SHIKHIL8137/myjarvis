@@ -15,23 +15,37 @@ interface ManifestItem {
   };
 }
 
+interface DbTargetItem {
+  target_id: string;
+  role: string;
+  driver: string;
+  host: string;
+  port: number;
+  database: string;
+  fingerprint: string;
+  is_current_live?: boolean;
+}
+
 export const RecoveryPanel: React.FC<{ onNotify: (msg: string) => void }> = ({ onNotify }) => {
   const [manifests, setManifests] = useState<ManifestItem[]>([]);
   const [steps, setSteps] = useState<string[]>([]);
+  const [targets, setTargets] = useState<DbTargetItem[]>([]);
   const [pass, setPass] = useState("");
   const [lastDrill, setLastDrill] = useState<Record<string, unknown> | null>(null);
   const [modeOnline, setModeOnline] = useState(false);
 
   const refresh = async () => {
     try {
-      const [m, net, inst] = await Promise.all([
+      const [m, net, inst, tgts] = await Promise.all([
         apiFetch<{ manifests: ManifestItem[] }>("/v2/recovery/manifests"),
         apiFetch<{ online_enabled: boolean }>("/internet"),
         apiFetch<{ steps: string[] }>("/v2/recovery/instructions"),
+        apiFetch<{ targets: DbTargetItem[] }>("/v2/recovery/targets"),
       ]);
       setManifests(m.manifests || []);
       setModeOnline(Boolean(net.online_enabled));
       setSteps(inst.steps || []);
+      setTargets(tgts.targets || []);
     } catch (e) {
       onNotify((e as Error).message);
     }
@@ -116,6 +130,19 @@ export const RecoveryPanel: React.FC<{ onNotify: (msg: string) => void }> = ({ o
           </div>
         ))}
         {lastDrill && <pre className="diff" style={{ marginTop: 8 }}>{JSON.stringify(lastDrill, null, 2)}</pre>}
+      </div>
+
+      <div className="card">
+        <h3>DATABASE TARGET REGISTRY (PRODUCTION PROTECTION)</h3>
+        {targets.map((t) => (
+          <div key={`${t.target_id}-${t.fingerprint}`} className="row" style={{ justifyContent: "space-between", padding: "3px 0" }}>
+            <span className="dim"><code>{t.fingerprint}</code></span>
+            <div className="row">
+              <span className={`pill ${t.role === "prod_pg" ? "danger" : t.role === "scratch_pg" ? "ok" : "warn"}`}>{t.role}</span>
+              {t.is_current_live && <span className="pill ok">LIVE ACTIVE</span>}
+            </div>
+          </div>
+        ))}
       </div>
 
       <div className="card">

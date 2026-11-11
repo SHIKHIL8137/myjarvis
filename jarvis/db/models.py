@@ -388,3 +388,74 @@ class VectorEntryRow(Base):
 Index("ix_vec_ns_proj", VectorEntryRow.namespace, VectorEntryRow.project_id)
 Index("ix_vec_expiry", VectorEntryRow.namespace, VectorEntryRow.expires_at)
 
+
+# ---- 4. Agent Skills & Capabilities Registry (P10.12) ------------------------------------------------
+class SkillRow(Base):
+    """Canonical central registry of validated, version-pinned, checksummed agent skills."""
+    __tablename__ = "skills"
+    skill_id: Mapped[str] = mapped_column(String(120), primary_key=True)
+    name: Mapped[str] = mapped_column(String(160))
+    description: Mapped[str] = mapped_column(Text, default="")
+    category: Mapped[str] = mapped_column(String(64), default="general", index=True)
+    version: Mapped[str] = mapped_column(String(64), default="1.0.0")
+    source_repo: Mapped[str] = mapped_column(String(300), default="")
+    source_commit: Mapped[str] = mapped_column(String(80), default="")
+    content_sha256: Mapped[str] = mapped_column(String(64), default="")
+    license: Mapped[str] = mapped_column(String(64), default="unknown")
+    supported_runtimes: Mapped[list] = mapped_column(JSON, default=list)
+    compatible_roles: Mapped[list] = mapped_column(JSON, default=list)
+    required_dependencies: Mapped[list] = mapped_column(JSON, default=list)
+    required_permissions: Mapped[list] = mapped_column(JSON, default=list)
+    network_requirements: Mapped[list] = mapped_column(JSON, default=list)
+    execution_mode: Mapped[str] = mapped_column(String(32), default="instruction_only")
+    approval_required: Mapped[bool] = mapped_column(Boolean, default=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    verification_status: Mapped[str] = mapped_column(String(32), default="pending", index=True)
+    install_path: Mapped[str] = mapped_column(String(600), default="")
+    installed_at: Mapped[float] = mapped_column(Float, default=_now)
+    updated_at: Mapped[float] = mapped_column(Float, default=_now)
+    last_used_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    manifest_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class SkillVersionRow(Base):
+    __tablename__ = "skill_versions"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    skill_id: Mapped[str] = mapped_column(ForeignKey("skills.skill_id", ondelete="CASCADE"), index=True)
+    version: Mapped[str] = mapped_column(String(64))
+    source_commit: Mapped[str] = mapped_column(String(80), default="")
+    content_sha256: Mapped[str] = mapped_column(String(64))
+    snapshot_dir: Mapped[str] = mapped_column(String(600), default="")
+    manifest_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    installed_by: Mapped[str] = mapped_column(String(64), default="owner")
+    action: Mapped[str] = mapped_column(String(32), default="install")
+    created_at: Mapped[float] = mapped_column(Float, default=_now)
+
+
+class SkillAssignmentRow(Base):
+    __tablename__ = "skill_assignments"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    skill_id: Mapped[str] = mapped_column(ForeignKey("skills.skill_id", ondelete="CASCADE"), index=True)
+    agent_role: Mapped[str] = mapped_column(String(64), index=True)
+    project_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    priority: Mapped[int] = mapped_column(Integer, default=10)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    assigned_by: Mapped[str] = mapped_column(String(64), default="owner")
+    created_at: Mapped[float] = mapped_column(Float, default=_now)
+
+
+class SkillMetricRow(Base):
+    __tablename__ = "skill_metrics"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    skill_id: Mapped[str] = mapped_column(ForeignKey("skills.skill_id", ondelete="CASCADE"), index=True)
+    agent_role: Mapped[str] = mapped_column(String(64), default="coder_agent", index=True)
+    run_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    task_kind: Mapped[str] = mapped_column(String(64), default="general")
+    success: Mapped[bool] = mapped_column(Boolean, default=True)
+    qa_passed: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    baseline_qa_passed: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    latency_ms: Mapped[float] = mapped_column(Float, default=0.0)
+    token_overhead: Mapped[int] = mapped_column(Integer, default=0)
+    user_corrected: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[float] = mapped_column(Float, default=_now, index=True)
+

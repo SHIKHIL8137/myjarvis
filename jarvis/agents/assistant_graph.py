@@ -16,6 +16,8 @@ class AssistantGraphState(TypedDict, total=False):
     task_kind: str  # "document_export" | "reminder" | "email_draft_and_send" | "research"
     payload: dict
     context_hits: list[dict]
+    selected_skills: list[dict]
+    skill_prompt_block: str
     artifact: dict
     approval_token: str
     approved: bool
@@ -31,13 +33,29 @@ def build_assistant_graph(
     email_service: EmailDraftService,
     approvals: ApprovalService,
     online_allowed_fn,
+    capability_router=None,
     checkpointer=None,
 ):
     def gather_context(state: AssistantGraphState) -> dict:
         goal = state.get("goal", "")
+        kind = state.get("task_kind", "research")
         personal = memory.search_personal_memory(goal, k=3)
         exp = memory.search_experience(goal, scope="assistant", k=2)
-        return {"context_hits": personal + exp, "status": "running"}
+        sel_skills: list[dict] = []
+        skill_block = ""
+        if capability_router is not None:
+            role = "document_producer" if kind == "document_export" else ("research_agent" if kind == "research" else "assistant_coordinator")
+            sel = capability_router.select_skills_for_task(
+                task_prompt=goal,
+                intent=kind,
+                department="assistant",
+                complexity="standard",
+                agent_role=role,
+                runtime="jarvis_native",
+            )
+            sel_skills = list(sel.get("selected") or [])
+            skill_block = str(sel.get("combined_prompt_block") or "")
+        return {"context_hits": personal + exp, "selected_skills": sel_skills, "skill_prompt_block": skill_block, "status": "running"}
 
     def route_task(state: AssistantGraphState) -> str:
         kind = state.get("task_kind", "research")

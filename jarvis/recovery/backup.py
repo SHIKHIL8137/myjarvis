@@ -19,9 +19,11 @@ from sqlalchemy.engine import make_url
 
 from .. import audit
 from ..config import Settings
+from ..agents.approvals import ApprovalService
 from ..db.engine import DatabaseManager
 from ..db.models import (
     AgentRunRow,
+    AuditEventRow,
     BackupManifestRow,
     ExperienceLessonRow,
     PersonalMemoryRow,
@@ -29,6 +31,7 @@ from ..db.models import (
     ReminderRow,
     VectorEntryRow,
 )
+from ..db.targets import DatabaseTargetRegistry, redact_db_url
 from ..memory.five_way import FiveWayMemoryService
 from ..security.secrets import export_encrypted_vault, import_encrypted_vault, load_secrets_map, save_secrets_map
 
@@ -215,14 +218,60 @@ class S3CompatibleDestination(BackupDestination):
 class DisasterRecoveryManager:
     """Manages complete DB/Vector/Memory/Workflow/Repo backups, encryption, retention, and isolated DR drills."""
 
-    def __init__(self, db: DatabaseManager, settings: Settings, *, data_dir: Path, secrets_path: Path):
+    def __init__(
+        self,
+        db: DatabaseManager,
+        settings: Settings,
+        *,
+        data_dir: Path,
+        secrets_path: Path,
+        target_registry: DatabaseTargetRegistry | None = None,
+        approvals: ApprovalService | None = None,
+    ):
         self.db = db
         self.settings = settings
         self.data_dir = Path(data_dir)
         self.secrets_path = Path(secrets_path)
+        self._explicit_registry = target_registry
+        self._manual_targets: list[tuple[str, str, str]] = []
+        self.approvals = approvals or ApprovalService(db)
         bdir = Path(settings.recovery.backup_dir)
         self.backup_root = bdir if bdir.is_absolute() else (self.data_dir / "backups")
         self.backup_root.mkdir(parents=True, exist_ok=True)
+
+    def get_target_registry(self) -> DatabaseTargetRegistry:
+        if self._explicit_registry is not None:
+            reg = self._explicit_registry
+            reg.set_active_db(self.db.sync_url, configured_role=str(getattr(self.settings.database, "role", "auto") or "auto"))
+        else:
+            reg = DatabaseTargetRegistry(self.settings, active_sync_url=self.db.sync_url, data_dir=self.data_dir)
+        for role, url, label in self._manual_targets:
+            reg.register(role, url, source="manual", label=label)
+        return reg
+
+    def register_database_target(self, role: str, url: str, *, label: str = "") -> dict:
+        t = self.get_target_registry().register(role, url, source="manual", label=label)
+        self._manual_targets.append((role, redact_db_url(url), label))
+        return t.to_dict()
+
+    def list_database_targets(self) -> list[dict]:
+        return self.get_target_registry().list_targets()
+
+    def _record_restore_audit(self, *, actor: str, decision: str, target_fp: str, details: dict) -> None:
+        try:
+            with self.db.sync_session() as s:
+                s.add(
+                    AuditEventRow(
+                        actor=(actor or "system")[:64],
+                        category="database_restore",
+                        decision=decision[:24],
+                        target=target_fp[:500],
+                        details=details,
+                    )
+                )
+                s.commit()
+        except Exception:
+            pass
 
     @staticmethod
     def recovery_steps_doc() -> list[str]:
@@ -286,11 +335,62 @@ class DisasterRecoveryManager:
         target_pg_url: str,
         *,
         expected_meta: dict | None = None,
-        allow_production_overwrite: bool = False,
+        approval_token: str | None = None,
+        owner_actor: str = "",
+        verification_scratch_only: bool = False,
     ) -> dict:
-        """Restore PostgreSQL custom dump via `pg_restore --exit-on-error` (via PGPASSFILE) and verify schema, rows, pgvector & memory."""
-        if self.db.is_postgres and not allow_production_overwrite and _same_pg_target(self.db.sync_url, target_pg_url):
-            raise ValueError("Refusing PostgreSQL restore against live production database without explicit allow_production_overwrite=True.")
+        """Restore PostgreSQL dump via `pg_restore --exit-on-error` (PGPASSFILE) enforcing target protection & owner approval."""
+        reg = self.get_target_registry()
+        cls = reg.classify_target(target_pg_url)
+        fp = cls["fingerprint"]
+        dump_sha = _sha256_file(dump_path) if Path(dump_path).exists() else ""
+
+        if cls["is_unknown"] or cls["is_ambiguous"]:
+            self._record_restore_audit(
+                actor=owner_actor or "system",
+                decision="blocked_unknown",
+                target_fp=fp,
+                details={"reason": "unknown_or_ambiguous_target", "roles": cls["roles"], "dump_sha256": dump_sha},
+            )
+            raise ValueError(
+                f"Refusing destructive pg_restore: target {fp} is {cls['primary_role']!r} "
+                "(unknown or ambiguous database targets are rejected by default)."
+            )
+
+        if cls["is_production"] or cls["is_current_live"]:
+            if verification_scratch_only:
+                self._record_restore_audit(
+                    actor=owner_actor or "system",
+                    decision="blocked_verify_prod",
+                    target_fp=fp,
+                    details={"reason": "cannot_verify_on_production_or_live", "roles": cls["roles"]},
+                )
+                raise ValueError(f"Refusing backup verification: target {fp} is production/live DB.")
+            if not approval_token:
+                self._record_restore_audit(
+                    actor=owner_actor or "system",
+                    decision="blocked_production",
+                    target_fp=fp,
+                    details={"reason": "missing_owner_approval_token", "roles": cls["roles"]},
+                )
+                raise ValueError(
+                    f"Refusing destructive pg_restore against production/live database {fp} without explicit owner approval token."
+                )
+            approved_req = self.approvals.consume_approved(approval_token, expected_action_type="restore_production_database")
+            args = approved_req.get("args") or {}
+            if args.get("target_fingerprint") != fp:
+                raise PermissionError(f"Approval token target mismatch ({args.get('target_fingerprint')} != {fp}).")
+            if args.get("dump_sha256") and dump_sha and args["dump_sha256"] != dump_sha:
+                raise PermissionError("Dump file SHA-256 changed after owner production restore approval.")
+            owner_actor = str(approved_req.get("decided_by") or owner_actor or "owner")
+        elif verification_scratch_only and not cls["is_scratch"]:
+            self._record_restore_audit(
+                actor=owner_actor or "system",
+                decision="blocked_non_scratch",
+                target_fp=fp,
+                details={"reason": "verification_requires_scratch_role", "roles": cls["roles"]},
+            )
+            raise ValueError(f"Refusing verification restore on role={cls['primary_role']!r}; use a dedicated 'scratch_pg' database.")
 
         pg_restore = _find_pg_tool("pg_restore")
         if not pg_restore:
@@ -364,8 +464,23 @@ class DisasterRecoveryManager:
 
         expected_pgvec = bool((expected_meta or {}).get("pgvector_installed", True))
         pgvec_valid = (pgvector_ok or not expected_pgvec)
+        ok_flag = len(mismatches) == 0 and pgvec_valid and vector_probe_ok
+        self._record_restore_audit(
+            actor=owner_actor or "system",
+            decision="restored_ok" if ok_flag else "restore_mismatch",
+            target_fp=fp,
+            details={
+                "role": cls["primary_role"],
+                "approval_token": approval_token,
+                "dump_sha256": dump_sha,
+                "pgvector_installed": pgvector_ok,
+                "mismatches": mismatches,
+            },
+        )
         return {
-            "ok": len(mismatches) == 0 and pgvec_valid and vector_probe_ok,
+            "ok": ok_flag,
+            "target_fingerprint": fp,
+            "target_role": cls["primary_role"],
             "tables": restored_counts,
             "mismatches": mismatches,
             "pgvector_installed": pgvector_ok,
@@ -376,6 +491,87 @@ class DisasterRecoveryManager:
             "projects_count": projects_count,
             "warnings": [_scrub_pg_secrets(proc.stderr.strip(), spec["password"])] if proc.stderr.strip() else [],
         }
+
+    def request_production_restore(
+        self,
+        bundle_path: Path,
+        *,
+        target_pg_url: str,
+        passphrase: str,
+        requested_by: str = "owner",
+        reason: str = "",
+    ) -> dict:
+        """Verify bundle on scratch/checksums first and create a pinned single-use production restore approval request."""
+        bp = Path(bundle_path).resolve()
+        if not bp.exists():
+            raise FileNotFoundError(f"Backup bundle not found: {bp}")
+        reg = self.get_target_registry()
+        cls = reg.classify_target(target_pg_url)
+        if cls["is_unknown"] or cls["is_ambiguous"]:
+            raise ValueError(f"Target {cls['fingerprint']} is {cls['primary_role']!r}; register target before requesting restore.")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            scratch = Path(tmp)
+            zpath = bp
+            if bp.name.endswith(".jvault"):
+                zpath = scratch / "inner.zip"
+                zpath.write_bytes(decrypt_archive_bytes(bp.read_bytes(), passphrase))
+            with zipfile.ZipFile(zpath, "r") as zf:
+                zf.extractall(scratch)
+            dump_fp = scratch / "db" / "postgres.dump"
+            if not dump_fp.exists():
+                raise ValueError("Bundle does not contain db/postgres.dump for PostgreSQL production restore.")
+            dump_sha = _sha256_file(dump_fp)
+
+        req = self.approvals.create_request(
+            action_type="restore_production_database",
+            target_resource=cls["fingerprint"],
+            preview_diff=f"DESTRUCTIVE pg_restore --clean into {cls['fingerprint']} (roles={cls['roles']})\nBundle: {bp.name}\nDump SHA-256: {dump_sha}\nReason: {reason or 'owner requested'}",
+            args={
+                "bundle_path": str(bp),
+                "target_fingerprint": cls["fingerprint"],
+                "roles": cls["roles"],
+                "dump_sha256": dump_sha,
+                "requested_by": requested_by,
+            },
+        )
+        self._record_restore_audit(
+            actor=requested_by,
+            decision="approval_requested",
+            target_fp=cls["fingerprint"],
+            details={"approval_token": req["token"], "bundle": str(bp), "dump_sha256": dump_sha},
+        )
+        return req
+
+    def execute_production_restore(
+        self,
+        *,
+        approval_token: str,
+        target_pg_url: str,
+        bundle_path: Path,
+        passphrase: str,
+    ) -> dict:
+        """Execute production PostgreSQL restore ONLY with an already-approved single-use ApprovalRequestRow token."""
+        bp = Path(bundle_path).resolve()
+        with tempfile.TemporaryDirectory() as tmp:
+            scratch = Path(tmp)
+            zpath = bp
+            if bp.name.endswith(".jvault"):
+                zpath = scratch / "inner.zip"
+                zpath.write_bytes(decrypt_archive_bytes(bp.read_bytes(), passphrase))
+            with zipfile.ZipFile(zpath, "r") as zf:
+                zf.extractall(scratch)
+            pg_dump_file = scratch / "db" / "postgres.dump"
+            if not pg_dump_file.exists():
+                raise ValueError("Backup bundle does not contain db/postgres.dump")
+            meta_file = scratch / "db" / "postgres_meta.json"
+            pg_meta = json.loads(meta_file.read_text(encoding="utf-8")) if meta_file.exists() else None
+            return self.restore_postgresql(
+                pg_dump_file,
+                target_pg_url,
+                expected_meta=pg_meta,
+                approval_token=approval_token,
+            )
 
     def _export_structured_snapshots(self, stage: Path) -> dict[str, int]:
         """Export DB tables & vectors cleanly to JSONL snapshots for cross-dialect recovery."""
@@ -862,8 +1058,13 @@ class DisasterRecoveryManager:
         bp = Path(bundle_path).resolve()
         if not bp.exists():
             raise FileNotFoundError(f"Backup bundle not found: {bp}")
-        if self.db.is_postgres and scratch_pg_url and _same_pg_target(self.db.sync_url, scratch_pg_url):
-            raise ValueError("Refusing backup verification: scratch_pg_url must NOT point to the live production database.")
+        if scratch_pg_url:
+            cls = self.get_target_registry().classify_target(scratch_pg_url)
+            if not cls["is_scratch"]:
+                raise ValueError(
+                    f"Refusing backup verification: scratch_pg_url target {cls['fingerprint']} has role={cls['primary_role']!r} "
+                    "(must be an isolated registered 'scratch_pg' database, never production, live, unknown, or ambiguous)."
+                )
 
         warnings: list[str] = []
         db_verified = False
@@ -951,7 +1152,12 @@ class DisasterRecoveryManager:
                 pg_meta_file = scratch / "db" / "postgres_meta.json"
                 pg_meta = json.loads(pg_meta_file.read_text(encoding="utf-8")) if pg_meta_file.exists() else None
                 if scratch_pg_url:
-                    pg_rep = self.restore_postgresql(pg_dump_file, scratch_pg_url, expected_meta=pg_meta)
+                    pg_rep = self.restore_postgresql(
+                        pg_dump_file,
+                        scratch_pg_url,
+                        expected_meta=pg_meta,
+                        verification_scratch_only=True,
+                    )
                     if not pg_rep["ok"]:
                         raise ValueError(
                             f"PostgreSQL isolated restore verification failed: mismatches={pg_rep['mismatches']} "

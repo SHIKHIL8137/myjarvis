@@ -203,9 +203,18 @@ class DevWorkforceService:
             denied_executables=set(workforce_spec.denied_executables),
             timeout_s=int(workforce_spec.qa_timeout_s),
             max_memory_mb=int(workforce_spec.max_memory_mb),
+            cpus=float(getattr(workforce_spec, "cpus", 2.0)),
+            pids_limit=int(getattr(workforce_spec, "pids_limit", 256)),
+            read_only_root_fs=bool(getattr(workforce_spec, "read_only_root_fs", True)),
             network_mode=str(workforce_spec.network_mode),
+            network_policy=str(getattr(workforce_spec, "network_policy", "offline")),
+            allowed_egress_domains=list(getattr(workforce_spec, "allowed_egress_domains", [])),
+            allow_ollama_in_sandbox=bool(getattr(workforce_spec, "allow_ollama_in_sandbox", False)),
+            allow_unrestricted_network=bool(getattr(workforce_spec, "docker_allow_unrestricted_network", False)),
+            unrestricted_authorized_by=str(getattr(workforce_spec, "docker_unrestricted_authorized_by", "")),
             sandbox_backend=str(workforce_spec.sandbox_backend),
             docker_image=str(workforce_spec.docker_image),
+            allow_host_fallback=bool(getattr(workforce_spec, "allow_host_fallback", False)),
         )
 
     def open_worktree(

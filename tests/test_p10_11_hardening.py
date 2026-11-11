@@ -194,7 +194,7 @@ def test_p10_11_2_docker_policy_no_silent_fallback_and_restricted_env(tmp_path, 
     assert "--security-opt=no-new-privileges:true" in docker_cmd
     assert "--memory" in docker_cmd and "512m" in docker_cmd
     assert "--cpus" in docker_cmd and "1.0" in docker_cmd
-    assert f"{wt.resolve()}:/workspace:rw" in docker_cmd
+    assert f"{git_worktree.to_docker_mount_path(wt)}:/workspace:rw" in docker_cmd
     assert "sk-or-must-not-leak" not in joined
 
     # When Docker daemon is unavailable & allow_host_fallback=False -> fail loudly (NEVER silent host run)
@@ -246,6 +246,7 @@ def test_p10_11_3_pg_restore_security_pgpass_exit_on_error_and_prod_guard(tmp_pa
     db = DatabaseManager("", data_dir=tmp_path / "pg_mock")
     db.init_schema_sync()
     dr = DisasterRecoveryManager(db, settings, data_dir=tmp_path / "pg_mock", secrets_path=tmp_path / "pg_secrets.json")
+    dr.register_database_target("scratch_pg", scratch_url, label="isolated scratch")
     # Simulate PG engine identity without opening real PG socket
     monkeypatch.setattr(dr.db, "is_postgres", True)
     monkeypatch.setattr(dr.db, "sync_url", prod_url)
@@ -253,9 +254,9 @@ def test_p10_11_3_pg_restore_security_pgpass_exit_on_error_and_prod_guard(tmp_pa
     # 1. Never allow verifying or restoring over production URL without explicit flag
     dump_file = tmp_path / "fake.dump"
     dump_file.write_bytes(b"PGDMP")
-    with pytest.raises(ValueError, match="production database"):
+    with pytest.raises(ValueError, match="production|scratch_pg"):
         dr.verify_backup(dump_file, passphrase="Passphrase123!", scratch_pg_url=prod_url)
-    with pytest.raises(ValueError, match="production database"):
+    with pytest.raises(ValueError, match="production|approval"):
         dr.restore_postgresql(dump_file, prod_url)
 
     # 2. Password NEVER appears on pg_dump / pg_restore CLI argv; PGPASSFILE is used & cleaned; non-zero fails!

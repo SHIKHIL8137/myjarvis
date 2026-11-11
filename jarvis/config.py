@@ -271,6 +271,11 @@ class ProvidersSpec(BaseModel):
 
 class DatabaseSpec(BaseModel):
     url: str = ""  # Empty -> local SQLite+WAL (data/jarvis.db); or postgresql+psycopg://...
+    role: str = Field("auto", pattern="^(auto|local_sqlite|dev_pg|test_pg|scratch_pg|prod_pg)$")
+    production_targets: list[str] = Field(default_factory=list)
+    scratch_target_url: str = ""
+    test_target_url: str = ""
+    registered_targets: list[dict] = Field(default_factory=list)
     echo: bool = False
     embedding_provider: str = Field("auto", pattern="^(auto|ollama|huggingface|local_hash)$")
     embedding_model: str = ""  # e.g. "nomic-embed-text" for Ollama or sentence-transformers model
@@ -305,9 +310,13 @@ class WorkforceSpec(BaseModel):
     max_repair_retries: int = Field(2, ge=0, le=5)
     registered_projects: list[dict] = Field(default_factory=list)
     sandbox_backend: str = Field("restricted_subprocess", pattern="^(restricted_subprocess|docker)$")
-    docker_image: str = "python:3.12-slim"
+    docker_image: str = "jarvis-opencode:1.19.5"
+    allow_host_fallback: bool = False
     qa_timeout_s: int = Field(120, ge=5, le=1800)
     max_memory_mb: int = Field(1024, ge=128, le=16384)
+    cpus: float = Field(2.0, ge=0.25, le=16.0)
+    pids_limit: int = Field(256, ge=32, le=4096)
+    read_only_root_fs: bool = True
     allowed_executables: list[str] = Field(
         default_factory=lambda: ["pytest", "python", "ruff", "mypy", "node", "npm", "npx", "tsc", "git"]
     )
@@ -317,6 +326,24 @@ class WorkforceSpec(BaseModel):
         ]
     )
     network_mode: str = Field("none", pattern="^(none|host)$")
+    network_policy: str = Field("offline", pattern="^(offline|model_gateway|restricted_egress|unrestricted)$")
+    allowed_egress_domains: list[str] = Field(default_factory=list)
+    allow_ollama_in_sandbox: bool = False
+    docker_allow_unrestricted_network: bool = False
+    docker_unrestricted_authorized_by: str = ""
+
+
+class SkillsSpec(BaseModel):
+    enabled: bool = True
+    skills_dir: str = "data/skills"
+    max_context_chars: int = Field(3200, ge=400, le=16000)
+    max_skills_per_run: int = Field(3, ge=1, le=8)
+    require_install_approval: bool = True
+    require_update_approval: bool = True
+    allow_untrusted_scripts: bool = False
+    allowed_licenses: list[str] = Field(
+        default_factory=lambda: ["mit", "apache-2.0", "bsd-3-clause", "bsd-2-clause", "isc", "cc-by-4.0", "cc0-1.0"]
+    )
 
 
 class RecoverySpec(BaseModel):
@@ -384,6 +411,7 @@ class Settings(BaseModel):
     gateway: GatewaySpec = GatewaySpec()
     workforce: WorkforceSpec = WorkforceSpec()
     recovery: RecoverySpec = RecoverySpec()
+    skills: SkillsSpec = SkillsSpec()
 
     @property
     def notes_path(self) -> Path:

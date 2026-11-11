@@ -9,6 +9,7 @@ import uuid
 
 from .git_worktree import (
     ExecutionPolicy,
+    GitWorktreeError,
     _posix_limits_fn,
     _terminate_proc_tree,
     build_docker_run_cmd,
@@ -16,6 +17,7 @@ from .git_worktree import (
     register_run_process,
     unregister_run_process,
 )
+from ..gateway.sandbox_proxy import RestrictedEgressProxy, ScopedGatewayTokenManager
 
 _SAFE_ENV_KEYS = {
     "PATH",
@@ -72,6 +74,8 @@ def run_opencode_task(
     policy: ExecutionPolicy | None = None,
     run_id: str | None = None,
     cancel_check=None,
+    token_manager: ScopedGatewayTokenManager | None = None,
+    gateway_port: int = 4700,
 ) -> dict:
     """Execute supervised OpenCode coding strictly inside `workdir` using Docker container or restricted host policy."""
     wd = Path(workdir).resolve()
@@ -81,6 +85,7 @@ def run_opencode_task(
     pol = policy or ExecutionPolicy(allowed_workdirs=[wd], timeout_s=timeout_s)
     pol.validate_access(wd, "write")
     eff_timeout = min(int(timeout_s), int(getattr(pol, "timeout_s", timeout_s)))
+    eff_run_id = run_id or f"oc-{uuid.uuid4().hex[:8]}"
 
     inner_args = [bin_name, "run", prompt, "--dir", "/workspace", "--format", "json"]
     if model:
@@ -96,54 +101,92 @@ def run_opencode_task(
         )
     caps = pol.capabilities(docker_ready=docker_ready)
 
+    issued_token = None
+    egress_proxy: RestrictedEgressProxy | None = None
     cid_file: Path | None = None
-    if caps["backend"] == "docker":
-        cid_file = wd.parent / f".oc-{uuid.uuid4().hex[:8]}.cid"
-        cmd = build_docker_run_cmd(wd, inner_args, pol, cid_file=cid_file)
-        env = {k: v for k, v in os.environ.items() if k.upper() in pol.env_allowlist}
-        cwd_arg = None
-        preexec = None
-    else:
-        exe = _find_opencode(bin_name)
-        cmd = [exe, "run", prompt, "--dir", str(wd), "--format", "json"]
-        if model:
-            cmd.extend(["-m", model])
-        if agent:
-            cmd.extend(["--agent", agent])
-        allow = set(getattr(pol, "env_allowlist", _SAFE_ENV_KEYS))
-        env = {k: v for k, v in os.environ.items() if k.upper() in allow}
-        env["PYTHONUTF8"] = "1"
-        cwd_arg = str(wd)
-        preexec = _posix_limits_fn(pol)
 
-    proc = subprocess.Popen(
-        cmd,
-        cwd=cwd_arg,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        preexec_fn=preexec,
-        shell=False,
-    )
-    register_run_process(run_id, proc, container_cid_file=cid_file)
-    deadline = time.monotonic() + eff_timeout
     try:
-        while proc.poll() is None:
-            if cancel_check and cancel_check():
-                _terminate_proc_tree(proc, cid_file)
-                raise OpenCodeError("OpenCode task cancelled cleanly by operator.")
-            if time.monotonic() > deadline:
-                _terminate_proc_tree(proc, cid_file)
-                raise OpenCodeError(f"OpenCode task timed out after {eff_timeout}s and was terminated.")
-            time.sleep(0.1)
-        stdout, stderr = proc.communicate(timeout=2)
+        if caps["backend"] == "docker":
+            eff_net = (pol.network_policy or "offline").strip().lower()
+            if eff_net == "model_gateway" and not pol.gateway_scoped_token and token_manager is not None:
+                issued_token = token_manager.issue(
+                    run_id=eff_run_id,
+                    allowed_models=[model] if model else [],
+                    allow_ollama=pol.allow_ollama_in_sandbox,
+                    ttl_s=float(eff_timeout) + 30.0,
+                )
+                pol.gateway_scoped_token = issued_token.token
+                if not pol.gateway_base_url:
+                    pol.gateway_base_url = f"http://host.docker.internal:{int(gateway_port)}/api/v2/sandbox/v1"
+            elif eff_net == "restricted_egress" and not pol.egress_proxy_url and (pol.allowed_egress_domains or pol.allow_ollama_in_sandbox):
+                egress_proxy = RestrictedEgressProxy(
+                    allowed_domains=pol.allowed_egress_domains,
+                    allow_ollama=pol.allow_ollama_in_sandbox,
+                    bind_host="127.0.0.1",
+                )
+                local_proxy = egress_proxy.start()
+                port_part = local_proxy.rsplit(":", 1)[-1]
+                pol.egress_proxy_url = f"http://host.docker.internal:{port_part}"
+
+            try:
+                pol.validate_network_policy()
+            except GitWorktreeError as e:
+                raise OpenCodeError(str(e)) from e
+
+            cid_file = wd.parent / f".oc-{uuid.uuid4().hex[:8]}.cid"
+            try:
+                cmd = build_docker_run_cmd(wd, inner_args, pol, cid_file=cid_file)
+            except GitWorktreeError as e:
+                raise OpenCodeError(str(e)) from e
+            env = {k: v for k, v in os.environ.items() if k.upper() in pol.env_allowlist}
+            cwd_arg = None
+            preexec = None
+        else:
+            exe = _find_opencode(bin_name)
+            cmd = [exe, "run", prompt, "--dir", str(wd), "--format", "json"]
+            if model:
+                cmd.extend(["-m", model])
+            if agent:
+                cmd.extend(["--agent", agent])
+            allow = set(getattr(pol, "env_allowlist", _SAFE_ENV_KEYS))
+            env = {k: v for k, v in os.environ.items() if k.upper() in allow}
+            env["PYTHONUTF8"] = "1"
+            cwd_arg = str(wd)
+            preexec = _posix_limits_fn(pol)
+
+        proc = subprocess.Popen(
+            cmd,
+            cwd=cwd_arg,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            preexec_fn=preexec,
+            shell=False,
+        )
+        register_run_process(eff_run_id, proc, container_cid_file=cid_file)
+        deadline = time.monotonic() + eff_timeout
+        try:
+            while proc.poll() is None:
+                if cancel_check and cancel_check():
+                    _terminate_proc_tree(proc, cid_file)
+                    raise OpenCodeError("OpenCode task cancelled cleanly by operator.")
+                if time.monotonic() > deadline:
+                    _terminate_proc_tree(proc, cid_file)
+                    raise OpenCodeError(f"OpenCode task timed out after {eff_timeout}s and was terminated.")
+                time.sleep(0.1)
+            stdout, stderr = proc.communicate(timeout=2)
+        finally:
+            unregister_run_process(eff_run_id, proc)
+            if cid_file and cid_file.exists():
+                cid_file.unlink(missing_ok=True)
     finally:
-        unregister_run_process(run_id, proc)
-        if cid_file and cid_file.exists():
-            cid_file.unlink(missing_ok=True)
+        if issued_token is not None and token_manager is not None:
+            token_manager.revoke_run(eff_run_id)
+        if egress_proxy is not None:
+            egress_proxy.stop()
 
     parsed = parse_opencode_json_lines(stdout or "")
     return {

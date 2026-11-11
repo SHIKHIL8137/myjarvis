@@ -37,6 +37,10 @@ ACTION_RISK_TIERS: dict[str, str] = {
     "promote_model": "EXECUTE",
     "rollback_model": "EXECUTE",
     "restore_backup": "EXECUTE",
+    "restore_production_database": "EXECUTE",
+    "install_skill": "EXECUTE",
+    "update_skill": "EXECUTE",
+    "uninstall_skill": "EXECUTE",
 }
 
 
@@ -141,6 +145,24 @@ class ApprovalService:
             row = s.get(ApprovalRequestRow, token)
             if not row:
                 raise KeyError(token)
+            return self._to_dict(row)
+
+    def consume_approved(self, token: str, *, expected_action_type: str | None = None) -> dict:
+        """Atomically verify and mark a previously approved token consumed so it cannot be replayed."""
+        with self.db.sync_session() as s:
+            row = s.get(ApprovalRequestRow, token)
+            if not row:
+                raise KeyError(token)
+            if expected_action_type and row.action_type != expected_action_type:
+                raise PermissionError(f"Approval token {token} is for {row.action_type!r}, expected {expected_action_type!r}.")
+            if row.status != "approved":
+                raise PermissionError(f"Approval token {token} status is {row.status!r}, expected 'approved'.")
+            if time.time() > float(row.expires_at):
+                row.status = "expired"
+                s.commit()
+                raise TimeoutError(f"Approval token {token} expired.")
+            row.status = "consumed"
+            s.commit()
             return self._to_dict(row)
 
     @staticmethod

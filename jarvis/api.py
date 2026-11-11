@@ -128,12 +128,18 @@ def create_app(settings: Settings | None = None, assistant: Assistant | None = N
     @app.middleware("http")
     async def guard(request: Request, call_next):
         host = request.headers.get("host", "")
-        if host not in allowed_hosts:
+        is_sandbox_gw = (
+            request.url.path.startswith("/api/v2/sandbox/v1/")
+            and not request.headers.get("origin")
+            and (request.headers.get("authorization") or "").lower().startswith("bearer ")
+        )
+        sandbox_hosts = allowed_hosts | {f"host.docker.internal:{settings.port}"}
+        if (host not in sandbox_hosts) if is_sandbox_gw else (host not in allowed_hosts):
             return JSONResponse({"error": "forbidden host"}, status_code=403)
         origin = request.headers.get("origin")
         if origin and origin.split("://", 1)[-1] not in allowed_hosts:
             return JSONResponse({"error": "forbidden origin"}, status_code=403)
-        if request.method in ("POST", "PUT", "DELETE", "PATCH") and request.headers.get("x-jarvis") != "1":
+        if not is_sandbox_gw and request.method in ("POST", "PUT", "DELETE", "PATCH") and request.headers.get("x-jarvis") != "1":
             return JSONResponse({"error": "missing X-Jarvis header"}, status_code=403)
         resp = await call_next(request)
         resp.headers["Content-Security-Policy"] = (

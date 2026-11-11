@@ -65,7 +65,11 @@ Jarvis runs local-first on Windows (Ollama local LLM inference, `faster-whisper`
 
 - **Mandatory Gates**: Coding runs execute inside isolated `git worktree` checkouts (`.jarvis_worktrees/<slug>`) with immutable `base_sha` tracking. Security scanning covers committed `base_sha..HEAD` diffs, staged/unstaged changes, untracked files, renames (`old_path`/`new_path`), deletions, mode/symlink changes, and binary hashes via streaming reads up to `2 MB` (oversized text files are explicitly blocked). Approvals pin `base_sha`, `head_sha`, `manifest_sha256`, `diff_hash`, and `approval_fingerprint`.
 - **Real Cancellation**: Cancelling an active run terminates active subprocess trees and Docker containers, expires pending approvals, preserves worktrees (`cancelled_preserved`) unless cleanup is authorized, and blocks approval/merge resumption.
-- **Sandbox Policy**: `ExecutionPolicy` restricts working directory bounds, allowed/denied executables (`powershell`, `bash`, `curl`, etc. denied), and environment variables. `opencode_adapter` refuses silent unisolated host execution when `sandbox_backend="docker"` unless `allow_host_fallback=True`. On native Windows without Docker Desktop running, `restricted_subprocess` enforces directory scoping and env allowlisting without OS network/filesystem namespaces.
+- **Sandbox Policy & Docker Image**: Build the pinned OpenCode container with `docker build -f deploy/opencode.Dockerfile -t jarvis-opencode:1.19.5 .` (`opencode-ai@1.19.5` verified via SHA-512 SRI digests, non-root `10001:10001`, `--read-only`, `--cap-drop=ALL`, `--pids-limit=256`). Network policy defaults to `offline` (`--network=none`), with configurable `model_gateway` (short-lived scoped `/api/v2/sandbox/v1/*` bearer tokens — zero host API keys injected), `restricted_egress` (domain-allowlist `RestrictedEgressProxy`), and owner-authorized `unrestricted`. See [`deploy/README.md`](deploy/README.md). On native Windows without Docker Desktop running, `ExecutionPolicy` refuses silent unisolated fallback when `sandbox_backend="docker"` unless `allow_host_fallback=true`.
+
+## 4B. Agent Skills & Capabilities Manager
+
+- **Central Registry (`SKILLS` tab & `/api/v2/skills/*`)**: Validates external skills before owner-approved installation (license allowlist, deterministic SHA-256 checksum, malicious script & policy-override scanner, runtime compatibility across `jarvis_native`, `opencode`, `claude_code`, `codex`), isolates files in `data/skills/installed/`, tracks version history with atomic rollback, enforces context-budgeted dynamic selection (`AgentCapabilityRouter`), and strictly preserves system-policy precedence over all skill instructions.
 
 ---
 
@@ -82,6 +86,7 @@ Jarvis runs local-first on Windows (Ollama local LLM inference, `faster-whisper`
 | Variable | Purpose |
 |---|---|
 | `JARVIS_DATABASE_URL` | Optional SQLAlchemy DB URL (`postgresql+psycopg://...` or `sqlite:///...`) |
+| `JARVIS_PROD_DATABASE_URL` / `JARVIS_DEV_DATABASE_URL` | Registered remote production / dev PostgreSQL targets protected by `DatabaseTargetRegistry` |
 | `JARVIS_PG_TEST_URL` / `JARVIS_PG_SCRATCH_URL` | Optional live PostgreSQL + `pgvector` and scratch restore DB URLs for `@pytest.mark.pg` integration tests |
 | `OLLAMA_HOST` | Loopback Ollama bind address (`127.0.0.1:11434`) |
 | `OPENROUTER_API_KEY` / `GEMINI_API_KEY` / `HF_TOKEN` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | Optional provider API keys (also storable in DPAPI-encrypted `data/secrets.json`) |

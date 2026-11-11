@@ -120,28 +120,66 @@ class ExecutionPolicy:
     cpu_seconds: int = 120
     cpus: float = 2.0
     env_allowlist: set[str] = field(default_factory=lambda: set(_SAFE_ENV_KEYS))
-    network_mode: str = "none"  # "none" | "host"
+    network_mode: str = "none"  # legacy alias ("none" | "host")
+    network_policy: str = "offline"  # "offline" | "model_gateway" | "restricted_egress" | "unrestricted"
+    allowed_egress_domains: list[str] = field(default_factory=list)
+    allow_ollama_in_sandbox: bool = False
+    allow_unrestricted_network: bool = False
+    unrestricted_authorized_by: str = ""
+    gateway_base_url: str = ""
+    gateway_scoped_token: str = ""
+    egress_proxy_url: str = ""
+    pids_limit: int = 256
     permissions: set[str] = field(default_factory=lambda: {"read", "write", "execute"})
     sandbox_backend: str = "restricted_subprocess"  # "restricted_subprocess" | "docker"
-    docker_image: str = "python:3.12-slim"
+    docker_image: str = "jarvis-opencode:1.19.5"
     allow_host_fallback: bool = False
     read_only_root_fs: bool = True
+
+    def validate_network_policy(self) -> str:
+        pol = (self.network_policy or "offline").strip().lower()
+        if self.network_mode == "host" and pol == "offline":
+            pol = "unrestricted"
+        if pol not in ("offline", "model_gateway", "restricted_egress", "unrestricted"):
+            raise GitWorktreeError(f"Invalid sandbox network_policy: {pol!r}")
+        if pol == "model_gateway":
+            if not self.gateway_base_url.strip() or not self.gateway_scoped_token.strip():
+                raise GitWorktreeError(
+                    "network_policy='model_gateway' requires scoped gateway_base_url and gateway_scoped_token; refusing silent fallback."
+                )
+        elif pol == "restricted_egress":
+            if not self.egress_proxy_url.strip() or (not self.allowed_egress_domains and not self.allow_ollama_in_sandbox):
+                raise GitWorktreeError(
+                    "network_policy='restricted_egress' requires active egress_proxy_url and explicit domain/Ollama allowlist; refusing silent fallback."
+                )
+        elif pol == "unrestricted":
+            if not self.allow_unrestricted_network or not (self.unrestricted_authorized_by or "").strip():
+                raise GitWorktreeError(
+                    "Unrestricted container networking (`network_policy='unrestricted'`) is disabled by default and requires explicit owner authorization."
+                )
+        return pol
 
     def capabilities(self, *, docker_ready: bool | None = None) -> dict:
         ready = is_docker_available() if docker_ready is None else docker_ready
         using_docker = self.sandbox_backend == "docker" and ready
+        eff_net = (self.network_policy or "offline").strip().lower()
         if using_docker:
             return {
                 "backend": "docker",
                 "requested_backend": self.sandbox_backend,
+                "docker_image": self.docker_image,
+                "network_policy": eff_net,
                 "directory_scoping": True,
                 "env_filtering": True,
                 "executable_allowlist": True,
                 "os_filesystem_isolation": True,
-                "os_network_isolation": self.network_mode == "none",
+                "os_network_isolation": eff_net in ("offline", "model_gateway", "restricted_egress"),
                 "read_only_root_fs": self.read_only_root_fs,
+                "non_root_uid": "10001:10001",
                 "cap_drop_all": True,
+                "pids_limit": self.pids_limit,
                 "no_host_secrets_mounted": True,
+                "no_docker_socket_mounted": True,
                 "memory_limit_mb": self.max_memory_mb,
                 "cpu_seconds_limit": self.cpu_seconds,
                 "cpus": self.cpus,
@@ -190,6 +228,18 @@ class ExecutionPolicy:
         return resolved
 
 
+def to_docker_mount_path(path: Path) -> str:
+    """Convert host worktree path cleanly for Docker Desktop on Windows or POSIX bind mounts."""
+    resolved = Path(path).resolve()
+    raw = str(resolved)
+    if os.name == "nt" or (len(raw) >= 2 and raw[1] == ":" and "\\" in raw):
+        norm = raw.replace("\\", "/").rstrip("/")
+        if len(norm) >= 2 and norm[1] == ":":
+            norm = norm[0].upper() + norm[1:]
+        return norm
+    return resolved.as_posix().rstrip("/") or "/"
+
+
 def build_docker_run_cmd(
     workdir: Path,
     argv: list[str],
@@ -198,35 +248,78 @@ def build_docker_run_cmd(
     cid_file: Path,
     extra_env: dict[str, str] | None = None,
 ) -> list[str]:
-    """Construct strict unprivileged container invocation mounting ONLY worktree RW and never host secrets."""
+    """Construct strict unprivileged non-root container invocation mounting ONLY target worktree RW."""
     docker_exe = shutil.which("docker") or "docker"
-    wd = Path(workdir).resolve()
-    net = "none" if policy.network_mode != "host" else "host"
+    wd_mount = to_docker_mount_path(workdir)
+    net_pol = policy.validate_network_policy()
+    if net_pol == "offline":
+        net_args = ["--network=none"]
+    elif net_pol == "model_gateway":
+        net_args = ["--network=bridge", "--add-host=host.docker.internal:host-gateway"]
+    elif net_pol == "restricted_egress":
+        net_args = ["--network=bridge", "--add-host=host.docker.internal:host-gateway"]
+    else:
+        net_args = ["--network=bridge"]
+
     cmd = [
         docker_exe,
         "run",
         "--rm",
         "--init",
+        "--user",
+        "10001:10001",
         "--cidfile",
         str(cid_file),
-        f"--network={net}",
+        *net_args,
         "--memory",
         f"{int(policy.max_memory_mb)}m",
         "--cpus",
         str(float(policy.cpus)),
+        "--pids-limit",
+        str(int(policy.pids_limit)),
         "--cap-drop=ALL",
         "--security-opt=no-new-privileges:true",
     ]
     if policy.read_only_root_fs:
-        cmd.extend(["--read-only", "--tmpfs", "/tmp:rw,noexec,nosuid,size=128m"])
-    filtered_env = {k: v for k, v in os.environ.items() if k.upper() in policy.env_allowlist and k.upper() not in {"PATH", "HOME", "USERPROFILE", "COMSPEC"}}
+        cmd.extend(
+            [
+                "--read-only",
+                "--tmpfs",
+                "/tmp:rw,noexec,nosuid,size=128m",
+                "--tmpfs",
+                "/home/jarvis/.local/state:rw,nosuid,size=32m",
+                "--tmpfs",
+                "/home/jarvis/.config:rw,nosuid,size=16m",
+            ]
+        )
+
+    filtered_env = {
+        k: v
+        for k, v in os.environ.items()
+        if k.upper() in policy.env_allowlist
+        and k.upper() not in {"PATH", "HOME", "USERPROFILE", "COMSPEC", "APPDATA", "LOCALAPPDATA"}
+    }
+    if net_pol == "model_gateway":
+        filtered_env["OPENAI_BASE_URL"] = policy.gateway_base_url
+        filtered_env["OPENAI_API_KEY"] = policy.gateway_scoped_token
+        filtered_env["JARVIS_GATEWAY_TOKEN"] = policy.gateway_scoped_token
+        filtered_env["JARVIS_NETWORK_POLICY"] = "model_gateway"
+    elif net_pol == "restricted_egress":
+        filtered_env["HTTP_PROXY"] = policy.egress_proxy_url
+        filtered_env["HTTPS_PROXY"] = policy.egress_proxy_url
+        filtered_env["JARVIS_ALLOWED_DOMAINS"] = ",".join(policy.allowed_egress_domains)
+        filtered_env["JARVIS_NETWORK_POLICY"] = "restricted_egress"
+    else:
+        filtered_env["JARVIS_NETWORK_POLICY"] = net_pol
+
     if extra_env:
         for k, v in extra_env.items():
             if k.upper() in policy.env_allowlist:
                 filtered_env[k] = v
+
     for k, v in sorted(filtered_env.items()):
         cmd.extend(["-e", f"{k}={v}"])
-    cmd.extend(["-v", f"{wd}:/workspace:rw", "-w", "/workspace", policy.docker_image, *argv])
+    cmd.extend(["-v", f"{wd_mount}:/workspace:rw", "-w", "/workspace", policy.docker_image, *argv])
     return cmd
 
 

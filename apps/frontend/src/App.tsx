@@ -6,9 +6,10 @@ import { GatewayPanel } from "./features/GatewayPanel";
 import { LearningPanel } from "./features/LearningPanel";
 import { MemoryPanel } from "./features/MemoryPanel";
 import { RecoveryPanel } from "./features/RecoveryPanel";
+import { SkillsPanel } from "./features/SkillsPanel";
 import { WorkforcePanel } from "./features/WorkforcePanel";
 
-type Tab = "chat" | "assistant" | "workforce" | "memory" | "gateway" | "learning" | "recovery";
+type Tab = "chat" | "assistant" | "workforce" | "skills" | "memory" | "gateway" | "learning" | "recovery";
 
 export const App: React.FC = () => {
   const [tab, setTab] = useState<Tab>("chat");
@@ -101,7 +102,7 @@ export const App: React.FC = () => {
         </div>
 
         <nav className="nav-tabs">
-          {(["chat", "assistant", "workforce", "memory", "gateway", "learning", "recovery"] as Tab[]).map((t) => (
+          {(["chat", "assistant", "workforce", "skills", "memory", "gateway", "learning", "recovery"] as Tab[]).map((t) => (
             <button key={t} className={`tab-btn ${tab === t ? "active" : ""}`} onClick={() => setTab(t)}>
               {t.toUpperCase()}
             </button>
@@ -170,6 +171,7 @@ export const App: React.FC = () => {
               }}
             />
           )}
+          {tab === "skills" && <SkillsPanel onNotify={notify} />}
           {tab === "memory" && <MemoryPanel onNotify={notify} />}
           {tab === "gateway" && <GatewayPanel onNotify={notify} />}
           {tab === "learning" && <LearningPanel onNotify={notify} />}

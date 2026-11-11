@@ -74,6 +74,8 @@ class WorkforceGraphState(TypedDict, total=False):
     graph_stats: dict
     impact_context: dict
     plan: str
+    selected_skills: list[dict]
+    skill_prompt_block: str
     worktree_path: str
     branch_name: str
     worktree_base_sha: str
@@ -104,6 +106,9 @@ def build_workforce_graph(
     workforce_spec=None,
     coder_runner: Callable[..., dict] | None = None,
     is_cancelled_fn: Callable[[str], tuple[bool, str]] | None = None,
+    capability_router=None,
+    token_manager=None,
+    gateway_port: int = 4700,
     graphify_bin: str = "graphify",
     opencode_bin: str = "opencode",
     checkpointer=None,
@@ -169,13 +174,31 @@ def build_workforce_graph(
                 aff_out = graphify_adapter.affected_nodes(root, sym, bin_name=graphify_bin).get("output", "")
         proj_mem = memory.search_project_knowledge(project_id=state["project_id"], query=state["task_prompt"], k=3)
         exp_mem = memory.search_experience(state["task_prompt"], scope="dev", project_id=state["project_id"], k=3)
+        sel_skills: list[dict] = []
+        skill_block = ""
+        if capability_router is not None:
+            rt = "opencode" if coder_fn is opencode_adapter.run_opencode_task else "jarvis_native"
+            sel = capability_router.select_skills_for_task(
+                task_prompt=state["task_prompt"],
+                intent="workforce_coding",
+                department="dev",
+                complexity="heavy_coding",
+                agent_role="coder_agent",
+                project_id=state["project_id"],
+                runtime=rt,
+            )
+            sel_skills = list(sel.get("selected") or [])
+            skill_block = str(sel.get("combined_prompt_block") or "")
         return {
+            "selected_skills": sel_skills,
+            "skill_prompt_block": skill_block,
             "impact_context": {
                 "graph_query": q_out[:2000],
                 "affected": aff_out[:2000],
                 "project_hits": proj_mem,
                 "experience_hits": exp_mem,
-            }
+                "selected_skills": sel_skills,
+            },
         }
 
     def architect_plan(state: WorkforceGraphState) -> dict:
@@ -222,7 +245,12 @@ def build_workforce_graph(
         retry_note = ""
         if prev_qa and not prev_qa.get("passed", True):
             retry_note = f"\n\nPrevious QA check failed (rc={prev_qa.get('returncode')}):\n{prev_qa.get('stdout', '')[:1200]}\n{prev_qa.get('stderr', '')[:800]}"
-        prompt = f"{state['task_prompt']}{retry_note}"
+        skill_note = ""
+        if state.get("skill_prompt_block"):
+            skill_note = f"\n\n### Validated Active Skills (System Policy Always Precedes)\n{state['skill_prompt_block']}"
+        if capability_router is not None and coder_fn is opencode_adapter.run_opencode_task and (state.get("selected_skills") or []):
+            capability_router.materialize_for_worktree({"selected": state["selected_skills"]}, worktree_path=wt_path, runtime="opencode", allow_scripts=False)
+        prompt = f"{state['task_prompt']}{skill_note}{retry_note}"
         policy = workforce.build_execution_policy(wt_path, workforce_spec=workforce_spec)
 
         kwargs: dict = {"workdir": state["worktree_path"], "model": state.get("model"), "bin_name": opencode_bin}
@@ -232,6 +260,10 @@ def build_workforce_graph(
             kwargs["run_id"] = state.get("run_id")
         if "cancel_check" in coder_params:
             kwargs["cancel_check"] = lambda: _cancelled(state)[0]
+        if "token_manager" in coder_params and token_manager is not None:
+            kwargs["token_manager"] = token_manager
+        if "gateway_port" in coder_params:
+            kwargs["gateway_port"] = gateway_port
 
         try:
             res = coder_fn(prompt, **kwargs)

@@ -16,9 +16,12 @@ from ..departments.assistant.productivity import EmailDraftService, LocalCalenda
 from ..departments.assistant.reminders import ReminderService
 from ..departments.dev.workforce import DevWorkforceService, ProjectRegistryService
 from ..gateway.gateway import ModelGateway
+from ..gateway.sandbox_proxy import ScopedGatewayTokenManager
 from ..integrations import git_worktree
 from ..memory.five_way import FiveWayMemoryService
 from ..recovery.backup import DisasterRecoveryManager
+from ..skills.registry import SkillRegistryService
+from ..skills.router import AgentCapabilityRouter
 from .approvals import ApprovalService
 from .assistant_graph import build_assistant_graph
 from .checkpointer import DBBackedCheckpointSaver
@@ -52,9 +55,27 @@ class AgentOrchestrator:
         self.reminders = ReminderService(self.db, bus=self.bus)
         self.email = EmailDraftService(self.data_dir / "outbox")
         self.calendar = LocalCalendarService(self.data_dir / "calendar")
-        self.recovery = DisasterRecoveryManager(self.db, settings, data_dir=self.data_dir, secrets_path=SECRETS_PATH)
+        self.recovery = DisasterRecoveryManager(self.db, settings, data_dir=self.data_dir, secrets_path=SECRETS_PATH, approvals=self.approvals)
+        skills_dir = Path(settings.skills.skills_dir)
+        if not skills_dir.is_absolute():
+            skills_dir = self.data_dir / "skills"
+        self.skills = SkillRegistryService(
+            self.db,
+            skills_root=skills_dir,
+            approvals=self.approvals,
+            allowed_licenses={x.lower() for x in settings.skills.allowed_licenses},
+            require_install_approval=settings.skills.require_install_approval,
+            require_update_approval=settings.skills.require_update_approval,
+            allow_untrusted_scripts=settings.skills.allow_untrusted_scripts,
+        )
+        self.capability_router = AgentCapabilityRouter(
+            self.skills,
+            default_max_context_chars=settings.skills.max_context_chars,
+            default_max_skills=settings.skills.max_skills_per_run,
+        )
         self.decision = DecisionEngine(settings)
         self.gateway = ModelGateway(brain, db=self.db, settings=settings) if brain is not None else None
+        self.sandbox_tokens = ScopedGatewayTokenManager()
 
         self.checkpointer = DBBackedCheckpointSaver(self.db)
         self._coder_runner = coder_runner
@@ -69,6 +90,7 @@ class AgentOrchestrator:
             email_service=self.email,
             approvals=self.approvals,
             online_allowed_fn=lambda: bool(self.settings.internet.enabled and not self.settings.offline_enforced),
+            capability_router=self.capability_router,
             checkpointer=self.checkpointer,
         )
         self._workforce_graph = build_workforce_graph(
@@ -79,6 +101,9 @@ class AgentOrchestrator:
             workforce_spec=settings.workforce,
             coder_runner=coder_runner,
             is_cancelled_fn=self.is_run_cancelled,
+            capability_router=self.capability_router,
+            token_manager=self.sandbox_tokens,
+            gateway_port=settings.port,
             graphify_bin=settings.workforce.graphify_bin,
             opencode_bin=settings.workforce.opencode_bin,
             checkpointer=self.checkpointer,
@@ -192,8 +217,19 @@ class AgentOrchestrator:
             1,
             "workforce_pipeline",
             state,
-            {"branch": res.get("branch_name"), "approval_token": res.get("approval_token"), "qa_result": res.get("qa_result"), "cancelled": cancelled},
+            {"branch": res.get("branch_name"), "approval_token": res.get("approval_token"), "qa_result": res.get("qa_result"), "cancelled": cancelled, "selected_skills": res.get("selected_skills")},
         )
+        qa_pass = (res.get("qa_result") or {}).get("passed")
+        for sk in res.get("selected_skills") or []:
+            self.skills.record_invocation_metric(
+                sk["skill_id"],
+                agent_role="coder_agent",
+                run_id=run_id,
+                task_kind="workforce",
+                success=(state not in ("failed", "blocked", "blocked_security")),
+                qa_passed=qa_pass,
+                token_overhead=max(1, len(res.get("skill_prompt_block") or "") // 4),
+            )
         self.bus.publish({"type": "agent_run_update", "run_id": run_id, "workflow": "workforce", "state": state})
         return {"run_id": run_id, "thread_id": thread_id, "state": state, "interrupted": interrupted, "cancelled": cancelled, "result": self._safe_res(res)}
 
