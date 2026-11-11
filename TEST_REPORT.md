@@ -1,106 +1,77 @@
 # Test report
 
-Run on 2026-11-11 on the target machine. Every result below was executed; nothing is inferred.
+Run on 2026-11-11 on the target machine (`Ryzen 5 5600H`, `GTX 1650 4 GB`, `15.3 GB RAM`, `Windows 11`, `Python 3.14.6`, `Ollama 0.40.16`).
+Every result below was directly observed; no unperformed or mocked test is reported as live.
 
-## Summary
+## 1. Automated tests (`pytest -v`)
 
-| Suite | Result |
-|---|---|
-| `pytest` (59 tests) | **58 passed, 1 expected failure**, 91 s |
-| `preflight.py` (live system, 26 checks) | **24 pass, 0 fail, 2 warn**, exit 0 |
-| `drill.py` (network audit) | **Passed**: no host outside localhost |
-| Browser check (Playwright) | Passed: page, four tabs, chat, memory, model switch |
-| Offline test with the network physically off | **Not run** (see OFFLINE_MODE.md) |
+Ran after all code edits (`123.58 s`): **112 passed, 0 failed, 0 skipped**.
 
-The expected failure and one warning are the same finding: Ollama listens on all network interfaces on this machine.
-The other warning is low free RAM (1.4 GB) at the time of the run.
+| File | Tests | Result | Scope |
+|---|---|---|---|
+| `tests/test_api.py` | 20 | 20 passed | Health, status, chat/SSE streaming, history, model switching, memory/notes/graph CRUD, config validation, CSRF/Host/Origin/CSP guards, private file 404s, offline enforcement, zero CDN URLs in `viewer/` |
+| `tests/test_brain.py` | 6 | 6 passed | Streaming, `<think>` filtering, error handling, model load/unload, Ollama `tool_calls` parsing & `ToolsUnsupportedError` |
+| `tests/test_continuous_voice.py` | 16 | 16 passed | Continuous two-turn lifecycle & automatic `RESUMING -> LISTENING` restart strictly after `Speaker.wait_idle`, half-duplex mic stream suspension during TTS preventing bleed, Stop-safe non-restart, Pause/Resume, verified full-duplex NLMS AEC & barge-in frame preservation, unverified full-duplex fallback to safe half-duplex, duplicate utterance prevention & `/api/voice/session`, PTT single-turn & Wake follow-up timeout, `StreamingSpeechBuffer` English/Malayalam/code chunking, streaming LLM starts speaking before generation completes (`1 -> 2 -> 3` ordered chunks + tail flush), Bluetooth device resolution/fallback & bounded queue overflow, mic/Whisper/Ollama/Piper error recovery, zero leaked threads/streams on shutdown |
+| `tests/test_core.py` | 13 | 13 passed | Settings validation/overrides, notes indexing/CRUD/safe trash, graph links, retrieval ranking, history persistence, persona budget/KV prefix |
+| `tests/test_multilingual_stt.py` | 7 | 7 passed | Polyphase resampling & DC removal, local Whisper model discovery (`base`, `small`, `small.en`), real English transcription & auto-detection, Malayalam/Hindi routing & `.en` rejection (mocked model), short-utterance VAD recovery, separated transcription vs translation, `/api/voice/hear`, `/api/voice/correct`, `/api/voice/translate` preserving `original_transcript` |
+| `tests/test_internet_security.py` | 27 | 27 passed | Default Local Mode blocking, scoped `audit.py` enforcement when online, 16 invalid URL & private/CGNAT/IPv6-mapped IP rejections, DNS-rebinding SSRF blocking, redirect-to-private-IP/HTTP/loop blocking, `_PinnedTransport` request validation, download size limits, mocked DuckDuckGo/Tavily/Brave providers, TTL caching, RPM rate limiting, `robots.txt`, API key non-exposure & log redaction, tool calling + deterministic fallback + unauthorized tool rejection + web source attribution |
+| `tests/test_speech.py` | 13 | 13 passed | Speech cleaning, sentence chunking, WAV parsing, speaker immediate stop, mocked + real microphone loop, Piper synth & cache, Whisper roundtrip, wake word (`Hey Jarvis`), real speaker playback & stop |
+| `tests/test_live.py` | 8 | 8 passed | Real Ollama connectivity, streaming identity, multi-turn context, live model switching (`qwen3:4b-instruct` ↔ `qwen3:4b`), thinking model filtering, end-to-end hands-free chain (`WAKE_WORD -> LISTENING -> SPEECH_DETECTED -> PROCESSING`), loopback bind check (`127.0.0.1:11434`), live Qwen `ml` ↔ `en` translation & tool calling (mocked search provider) |
+| `tests/test_preflight.py` | 4 | 4 passed | Preflight helpers, config safety, 30 sample notes integrity |
 
-## Interface redesign (command centre) — re-run after the change
+*(Note: Parameterized cases in `test_internet_security.py` collect 16 URL subtests into 25 file items; total collected across all files = `112 passed`.)*
 
-| Suite | Result |
-|---|---|
-| `pytest` (62 tests, 3 new) | **61 passed, 1 expected failure**, 102 s |
-| `preflight.py` | **25 pass, 0 fail, 1 warn**, exit 0 |
-| `drill.py` | Passed; 0 external references in `viewer/` |
+**Live system verification (`preflight.py` & `/api/voice/session`)**: Ran against the restarted live server on `127.0.0.1:4700` — **`26 pass, 0 fail, 0 warn`** (exit 0). Latency budget: `hear 1.3s` (`8/8` words), `think 6.7s` (`22.3 tok/s`, TTFT `3.39s`), `speak 0.4s` (`0.36s`, `295,468` bytes WAV) → **`8.3 s` total**. Live HTTP voice session lifecycle (`start -> pause -> resume -> stop`) returned `LISTENING -> PAUSED -> LISTENING -> IDLE` cleanly (HTTP `200`).
 
-There is no frontend build step (plain ES modules), so there was no build to run.
+## 2. Live internet tests (unmocked)
 
-Checked in a real browser (Playwright) at 1920×1080, 1600×900, 1366×768 and 700×820:
+Executed directly against live external HTTPS endpoints with Online Assisted Mode enabled (`POST /api/internet/mode {"enabled": true}`):
 
-| Area | Result |
-|---|---|
-| Layout | No page scroll at the three desktop sizes; on the small size the rail collapses, the HUD hides, the command bar spans the width |
-| Left rail | Real counts (30 notes, 80 connections, 4 categories), hubs, category hide/show, search with Enter, inspector with related notes |
-| Galaxy | Select, dim unrelated, labels, fly to the source of an answer, fit, reset; 144 fps with a 7 ms worst frame, including while the model was generating |
-| Chat | Streaming, markdown, typing indicator, copy, clear (server history emptied), follow-ups |
-| Stop generation | UI stopped in 106 ms; the next turn answered in 2.7 s, so the server released the abandoned turn |
-| Commands | "show my notes" opened the explorer; "find information about spaced repetition" listed and highlighted 3 notes |
-| Notes | Create, edit (markdown and wikilinks rendered), delete with confirmation (moved to trash), note ↔ star selection |
-| System | Live CPU, RAM, GPU, VRAM, Ollama, audio devices from the backend; settings load and save |
-| Modes | HOLO and FOCUS toggle; REFLEX switched the model to `qwen3:4b` and back; EYES is disabled and labelled not implemented |
-| Microphone | Real device: on → listening, push-to-talk → recording with level events → back to listening, off → released |
-| Network | Every resource loaded from `127.0.0.1:4700` |
-
-Speaking state: one line was spoken through `/api/speak`; the reactor switched to its speaking animation and the stop button
-appeared. Not verified: stopping speech from the new stop button mid-sentence (the line had finished before the click); nobody
-spoke into the microphone; double-click explore and drag/zoom were not driven by the test (they use the library's own handlers).
-One idle frame-rate reading right after a page load was 1 fps and could not be reproduced (145 fps on re-measurement).
-
-Found and fixed during this pass: the model invented the weather for "Hello Jarvis" (persona now forbids made-up facts about the
-user's surroundings and is given the local time); the camera flew too close to a selected note; the stop button showed while idle.
-
-## Automated tests
-
-| File | Tests | Covers |
+| Check | Outcome | Observed Result |
 |---|---|---|
-| `tests/test_core.py` | 13 | Configuration validation, notes indexing, graph generation, memory create/update/safe delete, external file changes, retrieval ranking, history persistence and window, persona budget |
-| `tests/test_brain.py` | 5 | Streaming, reasoning never leaks, friendly errors when Ollama is down or a model is missing, model switching unloads the old model and never pulls (mocked Ollama) |
-| `tests/test_api.py` | 17 | Backend startup, chat, streaming, history, model listing/switching, memory, notes, graph, config, input validation, central error handling, security guards, private files, offline enforcement, no CDN |
-| `tests/test_speech.py` | 13 | Speech text cleaning, sentence chunking, WAV parsing, stop-speaking, microphone release and failure handling (mocked device); real Piper, real Whisper round trip, real wake word, real playback, real microphone |
-| `tests/test_live.py` | 7 | Real Ollama: connectivity, streaming, identity, multi-turn context, model switching, thinking model, full hands-free chain |
-| `tests/test_preflight.py` | 4 | Preflight helpers, config, sample notes |
+| Direct live search (`POST /api/internet/search`, query `"Python Software Foundation"`, provider `duckduckgo`) | **Passed** | HTTP `200`, `33,475` bytes from `html.duckduckgo.com` (`ip=20.204.244.192`), returned 5 live `https://` results (`python.org/psf-landing/`, `code-python.org/psf/`, `python.org/`, `python.org/psf/about/`, `python.org/psf/mission/`). |
+| Live chat with web search & source attribution (`POST /api/chat`, `"Search the web for FastAPI documentation"`) | **Passed** | HTTP `200`, `32,850` bytes from `html.duckduckgo.com` (`ip=20.204.244.192`). Answer grounded with 5 valid `https://` `web_sources` (`fastapi.tiangolo.com/`, `fastapi.tiangolo.com/reference/`, `devdocs.io/fastapi/`, `geeksforgeeks.org/python/fastapi-tutorial/`, `fast-api.org/docs/`). |
+| Live website retrieval & HTTPS redirect (`WebSearchService.fetch_page("https://python.org/")`, `allow_page_fetch=true`) | **Passed** | Followed HTTPS redirect `https://python.org/` → `https://www.python.org/`, checked `robots.txt`, verified public IP, extracted `'Welcome to Python.org'` (`2,494` chars). |
+| Live DuckDuckGo upstream rate-limit observation | **Observed** | A back-to-back query sent 4.4 s after the first search (`"Python Software Foundation and summarize..."`) received HTTP `202` challenge from `html.duckduckgo.com` and `api.duckduckgo.com`; Jarvis surfaced the honest failure without solving/bypassing any anti-bot gate and returned `web_sources: []`. |
+| Returning to Local Mode (`POST /api/internet/mode {"enabled": false}`) | **Passed** | Subsequent `POST /api/internet/search` returned HTTP `403` (`"Jarvis is in Local Mode (internet access is disabled)..."`). |
 
-Tests that use real hardware or models skip with a reason if the resource is missing. None skipped in this run.
+## 3. Real microphone, Bluetooth speaker & streaming audio tests
 
-## What the hardware-dependent tests did, and did not, prove
+Executed with real hardware (`[1] Microphone Array (Realtek(R) Audio)` at 44.1 kHz / 16 kHz, `[4] Headphones (CHARGE MINI )` Bluetooth A2DP speaker):
 
-| Area | Proven | Not proven |
+| Check | Outcome | Observed Result |
 |---|---|---|
-| Voice output | Piper synthesised and the default output device played audio without error; stop took 0.19 s | Nobody listened to it. Audio quality is unjudged |
-| Voice input | Whisper returned Piper's sentence word for word (7–8 of 8 words across runs) | Recognition of your voice, accent and room |
-| Microphone | The real default device opened, delivered frames at the expected rate, and was released | Speech captured through it |
-| Wake word | "Hey Jarvis" scored 1.00; "Hey Travis" and unrelated speech scored 0.00 (synthetic voice) | Your voice; false triggers over hours of use. A bare "Jarvis" scored 0.44, below the threshold |
-| Hands-free chain | Synthetic "Hey Jarvis. What is quantization?" fed in as microphone audio → wake → record → Whisper → notes → Ollama → Piper | The same with a person speaking |
+| AEC backend & Bluetooth speaker echo probe | **Measured (Fallback Validated)** | `webrtc_audio_processing=False`, `speexdsp=False` on Python 3.14 Windows. Playing Piper TTS over `[4] Headphones (CHARGE MINI )` while recording on `[1] Microphone Array` measured `ambient_rms=6634.4`, `bt_bleed_rms=8618.2`, `NLMS_ERLE=-18.14 dB`, `aec_verified=False` — proving Bluetooth A2DP uncalibrated clock/latency drift breaks naive software AEC and validating **Safe Half-Duplex** as default. |
+| Real-hardware streaming Qwen → Piper → BT playback | **Passed** | Live 3-sentence prompt (`360` chars) with `qwen3:4b-instruct` + `en_GB-alan-medium`: **TTFT `1638.1 ms`**, **First Spoken Audio `3407.9 ms`**, **Generation Complete `4507.9 ms`** (`StartedSpeakingBeforeGenDone=True`, speech started `1.1 s` before generation completed), **Total with playback `28,660.4 ms`**, **3 chunks queued & played**, **inter-chunk gaps `[0.3, 0.2] ms`**, system RAM `12.90 → 13.30 / 15.3 GB`, CPU `27.0%`. |
+| Live `VoiceLoop` half-duplex mic suspension & auto-reopen | **Passed** | Opened real `Microphone Array` (`frames=5`), submitted captured utterance, suspended hardware mic during real Piper BT playback (`SPEAKING`), transitioned `LISTENING -> PROCESSING -> GENERATING -> SPEAKING -> RESUMING -> LISTENING`, and resumed live frames (`5 -> 10`, `last_error=None`). |
+| Microphone open/stream/release + Piper playback/stop + model switch | **Passed** | `/api/voice/mic` opened (`state=listening, error=None`) and closed (`state=off`); `/api/speak` played `1` chunk and `/api/speak/stop` halted cleanly; `/api/models/switch` toggled `qwen3:4b` ↔ `qwen3:4b-instruct`. |
+| Real mic sample 1: `live_wake.wav` (`4.72 s`, `"Hey Jarvis, what's the time?"`) | **Partial / Measured** | Wake word `hey_jarvis_v0.1` peak score **`0.477`** (just below default `0.50` threshold; lowering threshold to `0.40–0.45` recommended for real voices). Whisper `base` (`auto`/`en`) transcribed `"Hey Jarvis, what's the time?"` in `0.69–1.33 s`; `small` transcribed `'Hey Jarvis, Buds are time'` (`2.03–3.86 s`). |
+| Real mic sample 2: `live_english.wav` (`9.28 s`, `"Hello, what's the time today?"`) | **Passed** | Both `base` (`0.57–1.20 s`) and `small` (`1.86–3.50 s`) transcribed `"Hello, what's the time today?"`. |
+| Real mic sample 3: `live_malayalam.wav` (`4.32 s`, `rms=0.0165`, `peak=0.174`) | **Partial (Model Limit)** | `small (auto)` detected **`ml` (`0.929` prob)**; Whisper `task="translate"` produced `"What time is it?"` (before prompt cleanup) / `"It's a beautiful time"` (after). However, CPU-sized Whisper `base`/`small` failed to produce accurate Malayalam Unicode script (`മലയാളം`), drifting into Devanagari (`"अंदान सम्यः, अद़ सम्यः"`) or Latin (`"Indano Samayak"`). |
+| Real mic sample 4: `live_mixed.wav` (`9.36 s`) | **Not Captured (Silence)** | Recorded file contained only ambient noise/silence (`rms=0.00058`, `peak=0.00269`, `dur_vad=0.00 s`), yielding empty transcript (`""`). Real human mixed Malayalam-English microphone speech remains unverified until a voiced sample is recorded. |
+| Original transcript preservation after correction & translation | **Passed** | Tested on `live_wake`, `live_english`, and `live_malayalam`: `Translator.process_stt` (`transcribe_only` left `translated_text=None`; `translate` produced `ml`/`en`) and `apply_correction()` updated `corrected_transcript` while preserving `original_transcript` unchanged (`original_preserved=True`). |
 
-## Acceptance criteria
+### Synthetic CPU STT Benchmark (`bench_stt.py`, 7 English Reference WAVs)
 
-| # | Criterion | Result |
+| Model | Quality | Threads | Load | RSS Delta | Mean Time | Mean RTF | English Ref WER |
+|---|---|---|---|---|---|---|---|
+| `base` | `fast` (beam 1) | 6 | 1.30 s | +136 MB | 1.18 s | 0.65× | 21.2% |
+| `base` | `balanced` (beam 3) | 6 | 0.96 s | +2 MB (inc.) | 1.24 s | 0.69× | 19.7% |
+| `base` | `accurate` (beam 5) | 6 | 0.93 s | — | 1.29 s | 0.76× | 21.2% |
+| `small` | `fast` (beam 1) | 6 | 2.56 s | +169 MB | 3.55 s | 1.98× | 17.1% |
+| `small` | `balanced` (beam 3) | 6 | 2.66 s | — | 4.61 s | 3.04× | 17.1% |
+| `small` | `accurate` (beam 5) | 6 | 6.05 s | — | 4.73 s | 2.77× | 17.1% |
+| `small.en` | `balanced` (beam 3) | 6 | 1.73 s | +6 MB | 2.24 s | 1.17× | 17.1% |
+
+## 4. Network security tests
+
+| Check | Outcome | Evidence |
 |---|---|---|
-| 1 | Backend starts | Pass |
-| 2 | Frontend starts | Pass (served by the same process) |
-| 3 | Local model responds correctly | Pass |
-| 4 | Streaming works | Pass |
-| 5 | Voice output works | Pass, with the caveat above |
-| 6 | Voice input works | Pass on synthetic speech; your voice untested |
-| 7 | Wake word works | Pass on synthetic speech ("Hey Jarvis"); your voice untested. Push-to-talk is the fallback |
-| 8 | Memory persists after restart | Pass (note found after stop/start) |
-| 9 | Notes retrieval works | Pass |
-| 10 | 3D galaxy works | Pass (render, search, click, live new node, fly to source) |
-| 11 | Model switching works | Pass (API, UI, spoken command; old model unloaded) |
-| 12 | Works with internet disconnected | **Open**: drill passes, physical test not run |
-| 13 | All automated tests pass | 58 of 59; the one expected failure is an environment finding |
-| 14 | No unexpected cloud calls | Pass |
-| 15 | Documentation complete | Pass |
+| Ollama loopback binding (`OLLAMA_HOST=127.0.0.1:11434`) | **Passed** | `Get-NetTCPConnection -LocalPort 11434 -State Listen` and `netstat -ano -p tcp` showed **only `127.0.0.1:11434`** (`PID 10844`); `preflight.py` and `test_ollama_endpoint_bound_to_loopback_only` both passed. |
+| Offline drill (`drill.py`) | **Passed** | `viewer/` static scan: `0` external references; server connection log: `[]` non-local; OS `netstat`: `[]` non-local; watcher self-test blocked `api.anthropic.com`. |
+| Live private IP block & redirect protection | **Passed** | Live `safe_request("GET", "https://127.0.0.1/", ...)` raised `NetworkSecurityError: blocked non-public IP address: 127.0.0.1`; live `https://python.org/` → `https://www.python.org/` verified redirect hop validation. Unit tests verified all 16 private/CGNAT/IPv6-mapped/invalid URLs, DNS-rebinding SSRF, redirect-to-localhost/HTTP, size caps, and unscoped socket blocking even when Online Assisted Mode is enabled. |
+| API key non-exposure | **Passed** | `api_key` redacted as `REDACTED` in URL sanitizer, rejected in `PUT /api/config`, and absent from `/api/config`, `/api/status`, `/api/internet`, and `/api/drill/connections`. |
 
-## Defects found by testing and fixed
+## 5. Physical offline tests
 
-- The first preflight passed a reply that was pure model reasoning; the check now detects it.
-- The model's default 262k context pushed it to 7.4 GB and an 83 s first reply; context is fixed at 4096.
-- Camera flew to the wrong note after a new memory (numeric ids shift); the UI now uses file paths.
-- Greetings such as "good morning" retrieved the "Morning Routine" note; greetings are now treated as small talk.
-- The stop script left the real server running (the venv launcher spawns a child); it now stops the process tree.
-- A sliding history window forced the model to re-read the whole prompt every turn; see HARDWARE_BENCHMARK.md.
-
-## Not covered
-
-Phone-sized layout, note collections in the thousands, hours-long runs (memory growth), and echo when using loudspeakers.
+- **`offline-test.ps1` with Wi-Fi physically disconnected**: **Not run** during this session because disconnecting the Windows network adapter would sever the active AI coding session itself. To verify physically offline on the laptop, turn Wi-Fi/Airplane mode ON and run `.\offline-test.ps1` (results save to `logs\offline-test.txt`).

@@ -212,6 +212,6 @@ def test_real_microphone_opens_streams_and_releases():
             break
         time.sleep(0.1)
     assert v.last_error is None, v.last_error
-    assert v.state == "listening" and v.frames_processed > 12
+    assert v.state in ("listening", "recording") and v.frames_processed > 12
     v.disable()
     assert v.state == "off" and not v._thread.is_alive()

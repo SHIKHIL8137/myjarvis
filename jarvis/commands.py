@@ -13,12 +13,21 @@ COUNT = re.compile(r"\bhow many notes\b", re.I)
 SHOW = re.compile(r"^\W*(?:jarvis\W+)?(?:please\s+)?(?:show|open|list)\s+(?:me\s+)?(?:my\s+|the\s+)?notes\W*$", re.I)
 FIND = re.compile(r"^\W*(?:jarvis\W+)?(?:please\s+)?(?:find\s+(?:information|info|notes|anything)\s+(?:about|on)|search\s+(?:my\s+)?(?:knowledge(?:\s+base)?|notes)"
                   r"(?:\s+(?:for|about))?)(?:\s+(?P<q>.+?))?\W*$", re.I)
+WEB_EXPLICIT = re.compile(r"^\W*(?:hey\s+)?(?:jarvis\W+)?(?:please\s+)?(?:search\s+(?:the\s+)?(?:web|internet|online)|look\s+up\s+online|google)\b", re.I)
 ALIASES = {"thinking": "local_thinking", "reasoning": "local_thinking", "smart": "local_thinking", "deep": "local_thinking",
            "fast": "local", "quick": "local", "default": "local", "normal": "local", "instruct": "local", "local": "local"}
 
 
 async def route(a, text: str) -> dict | None:
     """-> {"name", "reply", "nodes": [ids]} when handled, else None. `a` is the Assistant."""
+    if WEB_EXPLICIT.match(text) and not a.settings.internet.enabled:
+        return {
+            "name": "web_offline",
+            "reply": "I am currently in Local Mode with internet access disabled, sir. Enable Online Assisted Mode in System settings if you would like me to search the web.",
+            "nodes": [],
+            "ok": False,
+        }
+
     if STOP.match(text):
         a.speaker.stop()
         return {"name": "stop", "reply": "Of course, sir.", "nodes": [], "speak": False}

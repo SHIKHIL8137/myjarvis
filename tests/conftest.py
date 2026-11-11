@@ -15,7 +15,7 @@ from jarvis.config import load_settings  # noqa: E402
 
 def ollama_up() -> bool:
     try:
-        return httpx.get("http://localhost:11434/api/version", timeout=2).status_code == 200
+        return httpx.get("http://127.0.0.1:11434/api/version", timeout=2).status_code == 200
     except httpx.HTTPError:
         return False
 
@@ -26,7 +26,7 @@ def models_present(*names) -> bool:
 
 needs_ollama = pytest.mark.skipif(not ollama_up(), reason="Ollama is not running on localhost:11434")
 needs_piper = pytest.mark.skipif(not models_present("piper/en_GB-alan-medium.onnx"), reason="Piper voice not downloaded")
-needs_whisper = pytest.mark.skipif(not any((ROOT / "models" / "whisper").glob("*small.en*")), reason="Whisper small.en not downloaded")
+needs_whisper = pytest.mark.skipif(not any((ROOT / "models" / "whisper").glob("models--*")), reason="Whisper model not downloaded")
 needs_wake = pytest.mark.skipif(not models_present("wake/hey_jarvis_v0.1.onnx"), reason="wake-word model not downloaded")
 
 

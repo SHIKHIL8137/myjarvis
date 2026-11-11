@@ -1,6 +1,14 @@
 // Small, safe Markdown renderer for chat and notes. Everything is HTML-escaped FIRST; only our own tags are added after.
-// Links are never navigable (the app is offline): external URLs render as plain text, [[wikilinks]] become buttons.
+// [[wikilinks]] become buttons; [label](https://...) becomes safe external links when https:// only.
 const esc = (s) => s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+function safeLink(label, rawUrl) {
+  const u = (rawUrl || "").trim();
+  if (u.startsWith("https://") && !/[\s<>"'`]/.test(u)) {
+    return `<a href="${u}" target="_blank" rel="noopener noreferrer">${label}</a>`;
+  }
+  return label;
+}
 
 function inline(s) {
   return s
@@ -9,7 +17,7 @@ function inline(s) {
     .replace(/(^|[\s(])\*([^*\s][^*]*)\*/g, "$1<em>$2</em>")
     .replace(/(^|[\s(])_([^_\s][^_]*)_/g, "$1<em>$2</em>")
     .replace(/\[\[([^\]|#]+)(?:[|#][^\]]*)?\]\]/g, (_, t) => `<button class="wl" data-note="${t.trim()}">${t.trim()}</button>`)
-    .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1");
+    .replace(/\[([^\]]+)\]\(([^)]*)\)/g, (_, label, url) => safeLink(label, url));
 }
 
 export function renderMarkdown(src) {

@@ -9,14 +9,14 @@
   "context_chars": 450,
   "brains": {
     "local": {
-      "base_url": "http://localhost:11434/v1",
+      "base_url": "http://127.0.0.1:11434/v1",
       "model": "qwen3:4b-instruct",
       "api_key": "ollama",
       "num_ctx": 4096,
       "max_tokens": 512
     },
     "local_thinking": {
-      "base_url": "http://localhost:11434/v1",
+      "base_url": "http://127.0.0.1:11434/v1",
       "model": "qwen3:4b",
       "api_key": "ollama",
       "num_ctx": 4096,
@@ -24,10 +24,72 @@
       "max_tokens": 2048
     }
   },
-  "tts": {"enabled": true, "voice": "en_GB-alan-medium", "speed": 1.0, "chunk_chars": 170},
-  "stt": {"model": "small.en", "compute_type": "int8", "cpu_threads": 6},
-  "wake": {"enabled": true, "model": "hey_jarvis_v0.1", "threshold": 0.5},
-  "audio": {"silence_ms": 800, "no_speech_timeout_s": 6.0, "max_utterance_s": 20.0},
+  "tts": {
+    "enabled": true,
+    "voice": "en_GB-alan-medium",
+    "speed": 1.0,
+    "chunk_chars": 170
+  },
+  "stt": {
+    "model": "base",
+    "compute_type": "int8",
+    "cpu_threads": 6,
+    "language": "auto",
+    "quality": "balanced",
+    "vad_filter": true,
+    "vad_threshold": 0.45,
+    "min_silence_duration_ms": 450,
+    "min_speech_duration_ms": 120,
+    "speech_pad_ms": 300,
+    "vocab_hints": "Jarvis, Ollama, FastAPI, VRAM, quantization",
+    "preserve_punctuation": true
+  },
+  "translation": {
+    "mode": "transcribe_only",
+    "target_language": "none",
+    "auto_correct": false,
+    "prefer_whisper_for_english": true
+  },
+  "wake": {
+    "enabled": true,
+    "model": "hey_jarvis_v0.1",
+    "threshold": 0.5
+  },
+  "audio": {
+    "sample_rate": 16000,
+    "voice_mode": "continuous",
+    "duplex_mode": "half_duplex",
+    "echo_cancellation": "auto",
+    "speech_confirm_ms": 180,
+    "silence_ms": 850,
+    "no_speech_timeout_s": 6.0,
+    "max_utterance_s": 25.0,
+    "min_utterance_ms": 200,
+    "pre_roll_ms": 240,
+    "use_silero_vad": true,
+    "vad_speech_threshold": 0.35,
+    "noise_gate_rms": 220.0,
+    "barge_in_enabled": true,
+    "barge_in_sensitivity": "medium",
+    "suppress_mic_during_tts": true,
+    "mic_resume_delay_ms": 300,
+    "post_tts_cooldown_ms": 250,
+    "wake_followup_s": 6.0
+  },
+  "internet": {
+    "enabled": false,
+    "provider": "duckduckgo",
+    "allow_page_fetch": false,
+    "searxng_url": "",
+    "max_results": 5,
+    "timeout_s": 8.0,
+    "rate_limit_rpm": 20,
+    "cache_ttl_s": 300,
+    "max_fetch_bytes": 512000,
+    "max_redirects": 3,
+    "respect_robots": true,
+    "tool_calling": true
+  },
   "min_free_ram_gb": 2.0,
   "min_vram_gb": 3.0
 }

@@ -84,3 +84,33 @@ def test_switch_unloads_previous_and_never_pulls(settings):
     assert not any(c[1] == "/api/pull" for c in calls)
     cat = run(b.catalogue())
     assert [m["key"] for m in cat][:2] == ["local", "local_thinking"] and sum(m["current"] for m in cat) == 1
+
+
+def test_stream_events_parses_tool_calls_and_handles_unsupported(settings):
+    from jarvis.brain import ToolsUnsupportedError
+
+    def tool_handler(req):
+        body = json.loads(req.content)
+        assert body["tools"][0]["function"]["name"] == "web_search"
+        return httpx.Response(200, content=ndjson(
+            {"message": {"content": "", "tool_calls": [{"id": "tc1", "function": {"name": "web_search", "arguments": {"query": "python 3.14"}}}]}},
+            {"done": True, "eval_count": 4, "eval_duration": 1_000_000_000, "done_reason": "stop"},
+        ))
+
+    async def collect():
+        b = make(settings, tool_handler)
+        evs = [ev async for ev in b.stream_events([{"role": "user", "content": "hi"}], tools=[{"type": "function", "function": {"name": "web_search"}}])]
+        await b.client.aclose()
+        return evs
+
+    evs = run(collect())
+    assert evs == [{"type": "tool_calls", "calls": [{"id": "tc1", "name": "web_search", "arguments": {"query": "python 3.14"}}]}]
+
+    b2 = make(settings, lambda r: httpx.Response(400, json={"error": "model does not support tools"}))
+    with pytest.raises(ToolsUnsupportedError):
+        run(collect_bad(b2))
+
+
+async def collect_bad(b):
+    async for _ in b.stream_events([{"role": "user", "content": "hi"}], tools=[{"type": "function", "function": {"name": "web_search"}}]):
+        pass

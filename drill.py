@@ -55,11 +55,11 @@ def honest_list() -> list[str]:
                 if not re.match(r"https?://(localhost|127\.0\.0\.1|testserver)", u) and not ln.strip().startswith(("#", '"""')):
                     found.append(f"runtime URL in code: {f.name}:{i} {u}")
     return found + [
-        "NONE at runtime: chat, speech-to-text, text-to-speech, wake word, memory and the galaxy are all local.",
-        "Setup only: `pip install` (PyPI), Whisper small.en (Hugging Face), Piper voice (Hugging Face), openWakeWord models (GitHub),",
+        "LOCAL MODE (default, internet.enabled=false): chat, speech-to-text, translation, text-to-speech, wake word, memory and galaxy are 100% local.",
+        "ONLINE ASSISTED MODE (opt-in, internet.enabled=true): same local Qwen model + approved HTTPS search providers (jarvis/search.py) & SSRF-guarded page fetch.",
+        "Setup only: `pip install` (PyPI), Whisper models (Hugging Face), Piper voice (Hugging Face), openWakeWord models (GitHub),",
         "            `ollama pull` for models, and the 3d-force-graph file (npm) vendored once into viewer/vendor/.",
-        "Not implemented, so unavailable offline AND online: live web research. Jarvis says he is offline instead of pretending.",
-        "No cloud brain exists in this build; there is no cloud fallback to switch to by accident.",
+        "No cloud LLM exists in this build; all reasoning and translation still run locally in Ollama.",
     ]
 
 

@@ -4,7 +4,7 @@ import subprocess
 import time
 
 _cache = {"t": 0.0, "gpu": None}
-_cpu = {"idle": 0, "total": 0}
+_cpu = {"idle": 0, "total": 0, "last": None}
 
 
 def cpu() -> float | None:
@@ -17,7 +17,12 @@ def cpu() -> float | None:
     i, t = val(idle), val(kernel) + val(user)  # kernel time includes idle time
     di, dt, first = i - _cpu["idle"], t - _cpu["total"], _cpu["total"] == 0
     _cpu.update(idle=i, total=t)
-    return None if first or dt <= 0 else round(max(0.0, min(100.0, 100 * (1 - di / dt))), 1)
+    if first:
+        return None
+    if dt <= 0:
+        return _cpu["last"] if _cpu["last"] is not None else 0.0
+    _cpu["last"] = round(max(0.0, min(100.0, 100 * (1 - di / dt))), 1)
+    return _cpu["last"]
 
 
 def audio() -> dict:

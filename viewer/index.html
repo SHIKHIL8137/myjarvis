@@ -17,7 +17,7 @@
   <header class="brand">
     <div class="brand-name">JARVIS</div>
     <div class="dim" id="brand-sub">loading…</div>
-    <div class="status-row"><span class="dot" id="st-backend"></span>backend <span class="dot" id="st-ollama"></span>ollama <span class="dot" id="st-offline"></span><span id="st-offline-t">offline guard</span></div>
+    <div class="status-row"><span class="dot" id="st-backend"></span>backend <span class="dot" id="st-ollama"></span>ollama <span class="dot" id="st-offline"></span><span id="st-offline-t">local mode</span></div>
   </header>
   <input id="search" type="search" placeholder="Search the brain…" aria-label="Search notes" autocomplete="off">
   <div class="rail-scroll">
@@ -67,37 +67,68 @@
     <text x="100" y="104" text-anchor="middle" class="r-name">J.A.R.V.I.S.</text>
   </svg>
   <div class="chips">
-    <span class="chip" id="h-online"><i></i><b>OFFLINE</b></span>
+    <span class="chip" id="h-online"><i></i><b>OLLAMA</b></span>
+    <span class="chip ok" id="h-mode" title="Local offline mode vs Online Assisted Mode"><i></i><b>LOCAL</b></span>
     <span class="chip" id="h-model" title="Current Ollama model"><b>—</b></span>
   </div>
   <div class="hud-lines">
     <div><span>LOCAL VOICE</span><b id="h-voice">—</b></div>
+    <div><span>SPEECH STT</span><b id="h-stt">base · auto</b></div>
+    <div><span>VOICE MODE</span><b id="h-vmode">continuous</b></div>
     <div><span>MICROPHONE</span><b id="h-mic">off</b></div>
-    <div><span>STATE</span><b id="h-state">standby</b></div>
+    <div><span>STATE</span><b id="h-state">IDLE</b></div>
   </div>
   <div class="modes">
     <button id="m-eyes" disabled title="Vision (camera / screen) is not implemented in this build"><span>EYES</span><b>n/a</b></button>
     <button id="m-holo" aria-pressed="false" title="Hologram view: scanlines, brighter links, rotation"><span>HOLO</span><b>off</b></button>
     <button id="m-focus" aria-pressed="false" title="Focus: hide the side panels and leave the galaxy and command bar"><span>FOCUS</span><b>off</b></button>
     <button id="m-reflex" aria-pressed="true" title="Reflex on = fast model. Off = thinking model (slower, reasons first)"><span>REFLEX</span><b>fast</b></button>
+    <button id="m-web" aria-pressed="false" title="Online Assisted Mode: allow approved web search with local Qwen"><span>INTERNET</span><b>off</b></button>
   </div>
 </aside>
 
 <!-- BOTTOM: command bar -->
 <div id="reply" class="glass" hidden role="status"></div>
 <form id="cmd" class="glass" autocomplete="off">
+  <select id="c-vmode" class="vmode-sel" aria-label="Voice mode" title="Voice interaction mode">
+    <option value="continuous">Continuous</option>
+    <option value="wake_word">Wake Word</option>
+    <option value="ptt">Push-to-Talk</option>
+  </select>
   <input id="input" maxlength="4000" placeholder="Ask · “remember that…” · “show my notes” · “find information about…”" aria-label="Command">
   <button type="submit" id="c-send" class="round primary" title="Send" aria-label="Send">➤</button>
-  <button type="button" id="c-halt" class="round" title="Stop generating and speaking" aria-label="Stop" hidden>■</button>
-  <button type="button" id="c-mic" class="round" aria-pressed="false" title="Microphone and wake word on/off" aria-label="Microphone">🎙</button>
-  <button type="button" id="c-ptt" class="round" title="Talk now (skips the wake word)" aria-label="Push to talk">●</button>
+  <button type="button" id="c-halt" class="round" title="Interrupt / Stop speaking and generating" aria-label="Interrupt or Stop" hidden>■</button>
+  <button type="button" id="c-pause" class="round" aria-pressed="false" title="Pause or Resume hands-free listening" aria-label="Pause or resume" hidden>⏸</button>
+  <button type="button" id="c-mic" class="round" aria-pressed="false" title="Start / Stop voice conversation" aria-label="Microphone">🎙</button>
+  <button type="button" id="c-ptt" class="round" title="Push to talk once" aria-label="Push to talk">●</button>
   <button type="button" id="c-voice" class="round" aria-pressed="true" title="Speak replies aloud" aria-label="Voice playback">🔊</button>
-  <div id="c-status"><span id="c-wake">wake word off</span><span id="c-state">standby</span></div>
+  <div id="c-status"><span id="c-wake">IDLE · continuous</span><span id="c-state">IDLE</span></div>
 </form>
 
 <!-- DRAWERS -->
 <section id="chat" class="drawer glass" hidden aria-label="Conversation">
   <header><h3>Conversation</h3><span class="grow"></span><button id="ch-clear" class="ghost">Clear</button><button class="ghost close" aria-label="Close">×</button></header>
+  <div id="transcript-box" class="tr-box" hidden aria-label="Speech transcript and translation">
+    <div class="tr-head">
+      <span class="tr-badge" id="tr-lang">lang: —</span>
+      <span class="tr-badge" id="tr-conf">conf: —</span>
+      <span class="dim" id="tr-model"></span>
+    </div>
+    <div class="tr-row"><span class="dim">Original:</span> <span id="tr-orig"></span></div>
+    <div class="tr-edit">
+      <input id="tr-corr" type="text" placeholder="Corrected transcript…" aria-label="Corrected transcript">
+      <button id="tr-apply" type="button">Apply</button>
+      <select id="tr-quick-target" aria-label="Translation target">
+        <option value="none">No translation</option>
+        <option value="en">English (en)</option>
+        <option value="ml">Malayalam (ml)</option>
+        <option value="hi">Hindi (hi)</option>
+        <option value="ta">Tamil (ta)</option>
+      </select>
+      <button id="tr-translate-btn" type="button">Translate</button>
+    </div>
+    <div class="tr-row" id="tr-trans-row" hidden><span class="dim" id="tr-trans-lbl">Translation:</span> <span id="tr-trans"></span></div>
+  </div>
   <div id="log" role="log" aria-live="polite"></div>
 </section>
 
@@ -123,6 +154,28 @@
         <label>Accent <select id="s-accent"><option value="cyan">Cyan</option><option value="blue">Electric blue</option><option value="green">Green</option><option value="amber">Amber</option></select></label>
         <label class="check"><input type="checkbox" id="s-motion"> Reduce motion</label>
       </div>
+      <h2>Internet &amp; Web Search</h2>
+      <div class="box form">
+        <label class="check"><input type="checkbox" id="s-web-on"> Online Assisted Mode (web search)</label>
+        <label>Search provider <select id="s-provider">
+          <option value="duckduckgo">DuckDuckGo (no API key)</option>
+          <option value="tavily">Tavily API</option>
+          <option value="brave">Brave Search API</option>
+          <option value="serper">Serper (Google API)</option>
+          <option value="searxng">SearXNG (HTTPS URL)</option>
+        </select></label>
+        <label class="check"><input type="checkbox" id="s-web-fetch"> Allow webpage content retrieval</label>
+        <label class="check"><input type="checkbox" id="s-web-tools"> Model tool calling (with fallback)</label>
+        <label id="s-searxng-row" hidden>SearXNG URL <input id="s-searxng-url" type="url" placeholder="https://search.example.org"></label>
+        <label>Provider API key
+          <span class="inline-row">
+            <input id="s-api-key" type="password" placeholder="Stored locally, never returned" autocomplete="new-password">
+            <button id="s-key-save" type="button">Set</button>
+            <button id="s-key-clear" type="button" class="ghost">Clear</button>
+          </span>
+        </label>
+        <div class="dim key-note" id="s-key-status">API key status: —</div>
+      </div>
     </div>
     <div class="s-col">
       <h2>Brain</h2>
@@ -138,11 +191,66 @@
         <label>Speaker <select id="s-out"></select></label>
         <label>Microphone <select id="s-in"></select></label>
       </div>
-      <h2>Wake word</h2>
+      <h2>Voice &amp; Conversation</h2>
       <div class="box form">
-        <label class="check"><input type="checkbox" id="s-wake"> Listen for “Hey Jarvis”</label>
-        <label>Threshold <span><input id="s-thr" type="range" min="0.2" max="0.9" step="0.05"><output id="s-thr-o"></output></span></label>
-        <label>Silence before stopping (ms) <input id="s-sil" type="number" min="200" max="3000" step="100"></label>
+        <label>Default mode <select id="s-vmode">
+          <option value="continuous">Continuous conversation</option>
+          <option value="wake_word">Wake word (“Hey Jarvis”)</option>
+          <option value="ptt">Push-to-Talk</option>
+        </select></label>
+        <label>Audio duplex <select id="s-duplex">
+          <option value="half_duplex">Safe Half-Duplex (suspend mic during TTS)</option>
+          <option value="full_duplex">Full-Duplex (only when AEC verified)</option>
+        </select></label>
+        <label>Echo cancellation <select id="s-aec">
+          <option value="auto">Auto (verify before enabling)</option>
+          <option value="nlms">NLMS experimental reference</option>
+          <option value="off">Off</option>
+        </select></label>
+        <label>Mic resume delay (ms) <input id="s-resume-delay" type="number" min="0" max="2000" step="50"></label>
+        <label class="check"><input type="checkbox" id="s-wake"> Listen for “Hey Jarvis” in Wake mode</label>
+        <label>Wake threshold <span><input id="s-thr" type="range" min="0.2" max="0.9" step="0.05"><output id="s-thr-o"></output></span></label>
+        <label>Wake follow-up (s) <input id="s-wfollow" type="number" min="0" max="30" step="1"></label>
+        <label>Speech confirm (ms) <input id="s-sconfirm" type="number" min="80" max="600" step="20"></label>
+        <label>Silence before stopping (ms) <input id="s-sil" type="number" min="200" max="3000" step="50"></label>
+        <label class="check"><input type="checkbox" id="s-barge"> Full-duplex barge-in (headphones/verified AEC only)</label>
+        <label>Barge-in sensitivity <select id="s-barge-sens">
+          <option value="low">Low (requires strong speech)</option>
+          <option value="medium">Medium (balanced)</option>
+          <option value="high">High (fast interruption)</option>
+        </select></label>
+        <label class="check"><input type="checkbox" id="s-suppress-tts"> Force mic mute during TTS playback</label>
+      </div>
+      <h2>Speech &amp; Translation</h2>
+      <div class="box form">
+        <label>Whisper model <select id="s-stt-model"></select></label>
+        <label>Input language <select id="s-stt-lang"></select></label>
+        <label>Quality / speed <select id="s-stt-quality">
+          <option value="fast">Fast (beam 1)</option>
+          <option value="balanced">Balanced (beam 3)</option>
+          <option value="accurate">Accurate (beam 5)</option>
+        </select></label>
+        <label>Vocabulary hints <input id="s-stt-hints" type="text" placeholder="Jarvis, Ollama, FastAPI, names…"></label>
+        <label>Speech action <select id="s-tr-mode">
+          <option value="transcribe_only">Transcribe only (keep spoken language)</option>
+          <option value="translate">Transcribe + translate</option>
+        </select></label>
+        <label>Translate target <select id="s-tr-target">
+          <option value="none">None (no translation)</option>
+          <option value="en">English (en)</option>
+          <option value="ml">Malayalam (ml)</option>
+          <option value="hi">Hindi (hi)</option>
+          <option value="ta">Tamil (ta)</option>
+          <option value="te">Telugu (te)</option>
+          <option value="kn">Kannada (kn)</option>
+          <option value="es">Spanish (es)</option>
+          <option value="fr">French (fr)</option>
+          <option value="de">German (de)</option>
+          <option value="ar">Arabic (ar)</option>
+          <option value="ja">Japanese (ja)</option>
+          <option value="zh">Chinese (zh)</option>
+        </select></label>
+        <label class="check"><input type="checkbox" id="s-tr-autocorrect"> Auto-clean punctuation (keeps original)</label>
       </div>
     </div>
   </div>

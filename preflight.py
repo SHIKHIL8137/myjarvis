@@ -177,7 +177,7 @@ def main():
 def summary(b):
     p, f, w = (results.count(x) for x in ("PASS", "FAIL", "WARN"))
     if b and b[1] is not None:
-        print(f"\nLATENCY BUDGET: hear {b[2]:.1f}s (5s of speech, CPU Whisper small.en), think {b[0]:.1f}s (full /chat turn incl. retrieval), "
+        print(f"\nLATENCY BUDGET: hear {b[2]:.1f}s (5s of speech, CPU Whisper {CFG['stt']['model']}), think {b[0]:.1f}s (full /chat turn incl. retrieval), "
               f"speak {b[1]:.1f}s (Piper synth, one sentence) -> total {b[0] + b[1] + b[2]:.1f}s")
     else:
         print("\nLATENCY BUDGET: not measured")

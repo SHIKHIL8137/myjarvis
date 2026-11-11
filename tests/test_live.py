@@ -64,7 +64,7 @@ def test_live_model_switch_loads_and_unloads_in_ollama():
     l1, l2 = asyncio.run(go())
     assert "qwen3:4b-instruct" in l1 and l2 == ["qwen3:4b"]  # previous model was unloaded, VRAM freed
     with httpx.Client() as c:
-        c.post("http://localhost:11434/api/generate", json={"model": "qwen3:4b-instruct", "keep_alive": 0})
+        c.post("http://127.0.0.1:11434/api/generate", json={"model": "qwen3:4b-instruct", "keep_alive": 0})
 
 
 def test_live_thinking_model_never_exposes_reasoning():
@@ -81,7 +81,7 @@ def test_live_thinking_model_never_exposes_reasoning():
 
 
 @pytest.mark.skipif(not (ROOT / "models" / "wake" / "hey_jarvis_v0.1.onnx").exists() or not (ROOT / "models" / "piper" / "en_GB-alan-medium.onnx").exists()
-                    or not any((ROOT / "models" / "whisper").glob("*small.en*")), reason="speech models not downloaded")
+                    or not any((ROOT / "models" / "whisper").glob("models--*")), reason="speech models not downloaded")
 def test_hands_free_end_to_end_wake_hear_think_speak(tmp_path, monkeypatch):
     """Synthetic 'Hey Jarvis, what is quantization?' fed as microphone audio -> real wake word, Whisper, retrieval, Ollama, Piper."""
     import threading
@@ -93,6 +93,8 @@ def test_hands_free_end_to_end_wake_hear_think_speak(tmp_path, monkeypatch):
 
     monkeypatch.setattr(Assistant, "_warm_speech", lambda self: None)
     s = load_settings()
+    s.audio.voice_mode = "wake_word"
+    s.wake.enabled = True
     s.audio.silence_ms = 500
     tts = PiperTTS(s.tts)
 
@@ -137,7 +139,10 @@ def test_hands_free_end_to_end_wake_hear_think_speak(tmp_path, monkeypatch):
     events, secs = asyncio.run(go())
     types_ = [e["type"] for e in events]
     states = [e["state"] for e in events if e["type"] == "voice_state"]
-    assert states[:3] == ["listening", "recording", "transcribing"], states
+    audio_states = [e["audio_state"] for e in events if e["type"] == "voice_state"]
+    dedup_states = [s_ for i, s_ in enumerate(states) if i == 0 or s_ != states[i - 1]]
+    assert dedup_states[:3] == ["listening", "recording", "transcribing"], states
+    assert audio_states[:4] == ["WAKE_WORD", "LISTENING", "SPEECH_DETECTED", "PROCESSING"], audio_states
     user = next(e for e in events if e["type"] == "user")
     assert "quantization" in user["text"].lower(), user
     done = events[-1]
@@ -155,3 +160,36 @@ def test_ollama_endpoint_bound_to_loopback_only():
         # Environment finding, not a Jarvis bug (Jarvis itself only talks to localhost). Reported, never hidden.
         pytest.xfail(f"Ollama listens on {out} (OLLAMA_HOST={__import__('os').environ.get('OLLAMA_HOST')}): reachable from LAN/Tailscale "
                      "without authentication. Set OLLAMA_HOST=127.0.0.1:11434 and restart Ollama to fix.")
+
+
+def test_live_qwen_translation_and_tool_calling(tmp_path, monkeypatch):
+    """Live Ollama test: local Qwen translation + Online Assisted Mode tool calling (search provider mocked)."""
+    from jarvis import audit
+    from jarvis.search import WebSearchService
+    import httpx
+
+    monkeypatch.setattr(Assistant, "_warm_speech", lambda self: None)
+    s = load_settings()
+    s.notes_dir = str(tmp_path / "n")
+    s.internet.enabled = True
+    audit.set_online_enabled(True)
+
+    def mock_search(req):
+        html = '<a class="result__a" href="https://docs.python.org/3.14/">Python 3.14 Documentation</a><a class="result__snippet">Python 3.14 includes template strings and improved error messages.</a>'
+        return httpx.Response(200, text=html)
+
+    async def go():
+        a = Assistant(s, data_dir=tmp_path, search_service=WebSearchService(s.internet, transport_factory=lambda target: httpx.MockTransport(mock_search)))
+        await a.start()
+        tr_en = await a.translator.translate_text("ഇന്ന് നല്ല ദിവസമാണ്.", "ml", "en")
+        tr_ml = await a.translator.translate_text("Good morning, how are you?", "en", "ml")
+        chat_res = await a.chat("What is the latest news on Python 3.14?")
+        await a.stop()
+        audit.set_online_enabled(False)
+        return tr_en, tr_ml, chat_res
+
+    tr_en, tr_ml, chat_res = asyncio.run(go())
+    assert tr_en and ("good" in tr_en.lower() or "day" in tr_en.lower()), tr_en
+    assert tr_ml and any("\u0d00" <= ch <= "\u0d7f" for ch in tr_ml), tr_ml  # contains Malayalam Unicode script
+    assert chat_res["web_sources"] and chat_res["web_sources"][0]["url"] == "https://docs.python.org/3.14/", chat_res
+    assert "3.14" in chat_res["answer"] or "python" in chat_res["answer"].lower(), chat_res

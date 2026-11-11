@@ -1,81 +1,83 @@
 # Architecture
 
-One Python process (FastAPI + uvicorn, bound to 127.0.0.1:4700) serves the UI and runs everything except the language model,
-which stays in Ollama on localhost:11434.
+One Python process (FastAPI + uvicorn, bound to `127.0.0.1:4700`) serves the UI and runs everything except the language model,
+which stays in Ollama on `127.0.0.1:11434`.
 
 ```
 browser (viewer/)  --HTTP/SSE-->  jarvis/api.py  -->  Assistant (assistant.py)
-                                                        |-- commands.py   routes checked before the model (remember, switch, stop)
-                                                        |-- notes.py      markdown store + graph      retrieval.py  keyword search
-                                                        |-- persona.py    the one system prompt       history.py    data/history.jsonl
-                                                        |-- brain.py      Ollama client + model manager  --> localhost:11434
-                                                        |-- tts.py        Piper + Speaker (sounddevice out)
-                                                        |-- stt.py        faster-whisper (CPU)
-                                                        |-- wakeword.py   openWakeWord       voice.py  mic loop (sounddevice in)
-                                                        |-- audit.py      connection log + offline enforcement
-                                                        `-- sysinfo.py    RAM / GPU
+                                                        |-- commands.py    deterministic routes (remember, switch, stop, offline web guard)
+                                                        |-- notes.py       markdown store + graph        retrieval.py  keyword search
+                                                        |-- persona.py     stable system prompts (Local & Online Assisted)
+                                                        |-- history.py     data/history.jsonl
+                                                        |-- brain.py       Ollama client + tool calling   --> 127.0.0.1:11434
+                                                        |-- translator.py  transcript preservation + Whisper/Qwen translation
+                                                        |-- stt.py         faster-whisper (CPU, multilingual) + polyphase resampling
+                                                        |-- tts.py         StreamingSpeechBuffer + Piper + Speaker (BT fallback + echo tap)
+                                                        |-- aec.py         AEC backend check + EchoReferenceBuffer + NLMS delay/ERLE filter
+                                                        |-- wakeword.py    openWakeWord       voice.py  VoiceState state machine + Silero VAD
+                                                        |-- search.py      SearchProvider interface + robots.txt + cache + rate limit
+                                                        |-- netsec.py      hardened HTTPS client (IP pinning, SSRF/redirect/size guards)
+                                                        |-- audit.py       connection log, scoped outbound gate, external audit log
+                                                        `-- sysinfo.py     CPU / RAM / GPU / audio
 ```
 
 | Path | Role |
 |---|---|
-| `server.py` | Entry point; sets offline environment flags and starts uvicorn |
-| `config.json` | Committed defaults. `data/settings.json` holds machine-local overrides written by the Settings tab |
-| `jarvis/config.py` | Pydantic-validated settings, logging to `logs/jarvis.log` |
+| `server.py` | Entry point; sets HuggingFace offline/telemetry flags and starts uvicorn |
+| `config.json` | Committed defaults (`internet.enabled: false` by default). `data/settings.json` holds local overrides; `data/secrets.json` holds optional API keys (gitignored) |
+| `jarvis/config.py` | Pydantic-validated settings (`STTSpec`, `TranslationSpec`, `AudioSpec`, `InternetSpec`) and secret helpers |
 | `viewer/` | `index.html`, `style.css`, `js/*.js` (ES modules), `vendor/` (3d-force-graph, Orbitron font). No build step, no CDN |
-| `notes/` | Your markdown. Folder = category. `captures/` = things Jarvis was told to remember. `.trash/` = deleted notes |
-| `models/` | Whisper, Piper and wake-word files (not in git) |
-| `data/` | History, settings overrides, TTS cache (not in git) |
-| `preflight.py`, `drill.py`, `bench_llm.py` | Live verification, network drill, model benchmark |
+| `notes/` | Markdown notes. Folder = category. `captures/` = remembered items. `.trash/` = deleted notes |
+| `models/` | Whisper (`base`, `small`, `small.en`), Piper, and openWakeWord models (not in git) |
+| `data/` | History, settings overrides, secrets, TTS cache (not in git) |
+| `preflight.py`, `drill.py`, `bench_llm.py`, `bench_stt.py` | Live verification, network drill, LLM and STT CPU benchmarks |
 | `tests/` | pytest suite |
 
 ## Frontend modules (`viewer/js/`)
 
 | File | Role |
 |---|---|
-| `api.js` | The only place that calls the backend: `api()`, `chatStream()`, `listen()` (server-sent events), plus DOM helpers and a small event hub |
-| `galaxy.js` | The 3D graph: data from `/api/graph`, selection, two-step explore, search, category filter, forces, labels, camera |
-| `main.js` | Left rail, reactor HUD and modes, command bar, conversation, live events |
-| `panels.js` | Drawers: knowledge explorer (notes CRUD) and system (settings + monitor) |
-| `md.js` | Markdown renderer for chat and notes. Escapes HTML first; links are never navigable |
+| `api.js` | Single backend client (`api()`, `chatStream()`, `listen()`), DOM helpers, and event bus |
+| `galaxy.js` | 3D knowledge graph: selection, two-step explore, search, category filter, forces, labels, camera |
+| `main.js` | Left rail, reactor HUD & mode toggles (including `INTERNET`), command bar, conversation, source links, transcript correction/translation card |
+| `panels.js` | Drawers: knowledge explorer (notes CRUD) and System (settings for brain, voice, speech/translation, internet/provider, live monitor) |
+| `md.js` | Safe Markdown renderer (HTML-escaped first; `[[wikilinks]]` become buttons; only validated `https://` links render as external anchors) |
 
-Rendering is kept light for the GTX 1650: pixel ratio capped at 1.5, no particles, labels for at most 40 nodes, lower sphere
-detail above 400 notes, rendering paused when the tab is hidden, and the monitor polls only while its drawer is open.
+## Speech, Streaming TTS & Voice State Machine
 
-## A turn
+1. **Voice Interaction Modes & State Machine (`voice.py`)**: Supports **Continuous Conversation** (default, auto-resumes listening after each reply), **Wake-Word Mode** ("Hey Jarvis" + configurable `wake_followup_s` window), and **Push-to-Talk**. Explicit synchronized [`VoiceState`](file:///d:/projects/myjarvis/jarvis/voice.py) transitions (`IDLE`, `WAKE_WORD`, `LISTENING`, `SPEECH_DETECTED`, `PROCESSING`, `GENERATING`, `SPEAKING`, `INTERRUPTED`, `RESUMING`, `PAUSED`, `ERROR`) prevent duplicate utterances (`utt_id`), concurrent TTS sessions, and accidental restarts after Stop.
+2. **Echo Prevention & Duplex Modes (`aec.py`, `voice.py`)**:
+   - **Safe Half-Duplex Mode (default, `duplex_mode: "half_duplex"`)**: Releases the hardware `InputStream` immediately upon end-of-speech, waits through `PROCESSING -> GENERATING -> SPEAKING` until `Speaker.wait_idle()` completes, pauses for `mic_resume_delay_ms` (`300 ms`), and re-opens the microphone in `RESUMING -> LISTENING`. Prevents Bluetooth/speaker audio from re-entering Whisper.
+   - **Full-Duplex Mode (`duplex_mode: "full_duplex"`)**: Uses [`NLMSEchoCanceller`](file:///d:/projects/myjarvis/jarvis/aec.py) with far-end [`EchoReferenceBuffer`](file:///d:/projects/myjarvis/jarvis/aec.py) for barge-in **only when `aec.verified == True`**; automatically falls back to Safe Half-Duplex if WebRTC/SpeexDSP/NLMS AEC is unverified.
+3. **Audio capture (`voice.py`) & STT (`stt.py`)**: Opens the configured input device (16 kHz with native-rate polyphase resampling via `scipy.signal.resample_poly`, plus PortAudio table refresh on BT reconnect). Uses streaming Silero VAD + adaptive RMS gating, `speech_confirm_ms` (`180 ms`), `pre_roll_ms` (`240 ms`), and multilingual `faster-whisper` (`base` default or `small`/`small.en`).
+4. **Incremental Streaming LLM → Piper TTS (`tts.py`, `assistant.py`)**: [`StreamingSpeechBuffer`](file:///d:/projects/myjarvis/jarvis/tts.py) incrementally parses streaming Ollama tokens into complete English/Malayalam/Indic sentences (preserving decimals/abbreviations, skipping code blocks), queueing them via bounded queues (`_text_q` maxsize 32, `_audio_q` maxsize 3) so Piper synthesizes and plays early sentences while Qwen continues generating, flushing any final clause at end of stream, and emitting `SPEAKING` only when `sd.play` begins.
+5. **Separated translation (`translator.py`)**: Preserves `original_transcript`, `corrected_transcript`, `detected_language`, `translated_text`, and `target_language` in `TranscriptStore`. Never translates silently when `translation.mode == "transcribe_only"`.
 
-1. Text arrives from the chat box (`POST /api/chat/stream`) or from the voice loop (wake word → record until silence → Whisper).
-2. `commands.route` checks for an action. If it matches, the action runs and the reply is its receipt.
-3. Otherwise the top 3 notes scoring above a threshold are added to the final user message; small talk gets none.
-4. `brain.stream` calls Ollama's native `/api/chat` with `num_ctx` 4096. Reasoning (`thinking` field or `<think>` tags) is dropped.
-5. Tokens stream to the UI. If speech is on, whole sentences are queued to the Speaker, which synthesises the next chunk while one plays.
-6. The exchange is appended to history; the UI flies the galaxy camera to the source note.
+## Conversation Turn & Modes
 
-All turns go through `Assistant.stream_turn`, and all new notes through `NoteStore.add`.
+- **Local Mode (default, `internet.enabled: false`)**: All outbound non-loopback connections are blocked by `jarvis/audit.py`. Turns run `commands.route` → local note retrieval → `brain.stream` (`PERSONA`).
+- **Online Assisted Mode (opt-in, `internet.enabled: true`)**: Keeps the local `qwen3:4b-instruct` model and local notes. `Assistant.stream_turn` offers strictly whitelisted backend tools (`web_search`, and `fetch_webpage` if `allow_page_fetch` is enabled) to Ollama `/api/chat`, falling back deterministically via `needs_web_intent()` if a model lacks or skips tool calling. Answers cite exact `https://` source URLs in `web_sources`.
 
 ## API (all under `/api`, loopback only)
 
 | Method and path | Purpose |
 |---|---|
-| GET `/health`, GET `/status` | Liveness; full status with CPU, RAM, GPU, VRAM, audio devices, voice state |
-| POST `/chat`, POST `/chat/stream` | One turn as JSON, or as server-sent events |
-| GET/DELETE `/history` | Conversation history |
-| GET `/models`, POST `/models/switch` | List and switch local models |
-| POST `/voice/hear` | WAV body → text |
-| POST `/tts`, POST `/speak`, POST `/speak/stop` | WAV out; speak on the laptop; stop speaking |
-| POST `/voice/mic`, POST `/voice/ptt`, GET `/audio/devices` | Microphone on/off, push to talk, device list |
-| POST `/memory`, GET `/memory/search` | Create a memory, search notes |
-| GET `/notes`, GET/PUT/DELETE `/notes/{id}` | List, read, edit, move to trash |
-| GET `/graph` | Nodes and links for the galaxy |
-| GET/PUT `/config` | Read settings (including installed voices); change tts, wake, audio, history_turns, boot_brain, num_ctx |
-| GET `/events` | Server-sent events: voice state, microphone level while recording, voice-initiated turns, graph changes |
-| GET `/drill/connections` | Connection log used by the drill |
+| `GET /health`, `GET /status` | Liveness and full status (Ollama, brain, voice, STT, translation, internet/search, system metrics) |
+| `POST /chat`, `POST /chat/stream` | Execute one turn as JSON or SSE (includes `web_sources` and tool status events when online) |
+| `GET/DELETE /history` | Conversation history |
+| `GET /models`, `POST /models/switch` | List and switch local Ollama models |
+| `POST /voice/hear`, `/voice/correct`, `/voice/translate`, `GET /voice/transcripts` | Transcribe WAV with metadata, update `corrected_transcript` while preserving `original_transcript`, translate, list recent records |
+| `POST /tts`, `POST /speak`, `POST /speak/stop` | Piper WAV synthesis and playback control |
+| `POST /voice/mic`, `POST /voice/session`, `POST /voice/interrupt`, `POST /voice/ptt`, `GET /audio/devices` | Voice session lifecycle (`start`, `pause`, `resume`, `stop`, `interrupt`, `mode`), interruption, PTT, and MME device list |
+| `GET /internet`, `POST /internet/mode`, `POST/DELETE /internet/key`, `POST /internet/search` | Mode indicator/toggle, write-only provider API key storage, direct search, external audit log |
+| `POST /memory`, `GET /memory/search`, `GET/PUT/DELETE /notes*`, `GET /graph` | Notes CRUD and 3D graph |
+| `GET/PUT /config` | Safe settings read/write (excludes secrets and brain definitions) |
+| `GET /events`, `GET /drill/connections` | Live SSE stream and connection audit log |
 
 ## Security
 
-- Binds to 127.0.0.1 only; settings reject any non-loopback host.
-- Requests with a non-loopback `Host` or foreign `Origin` get 403 (DNS rebinding, cross-site).
-- Every POST/PUT/DELETE needs the `X-Jarvis: 1` header, which a cross-site form or simple request cannot send.
-- Only `viewer/` is served; `config.json`, source, notes and data return 404.
-- Content-Security-Policy restricts the page to its own origin. `unsafe-eval` is allowed because the vendored 3D library needs it.
-- Brain definitions cannot be changed over the API. Deleting a note only moves it to `notes/.trash/`.
-- No authentication: this is a single-user loopback app. Anyone logged in to this Windows account can use it.
+- Binds to `127.0.0.1` only; foreign `Host`/`Origin` requests receive 403; mutating requests require `X-Jarvis: 1`.
+- Browser CSP (`connect-src 'self'`) prevents direct browser-to-internet requests; external requests originate solely from `jarvis/netsec.py` in Online Assisted Mode.
+- `jarvis/audit.py` remains enforced even in Online Assisted Mode: arbitrary sockets still raise `ConnectionError`; only scoped `netsec.safe_request` contexts are permitted.
+- `jarvis/netsec.py` enforces `https://` port 443 only, host allowlists for search providers, SSRF/private/CGNAT/link-local IP blocking, single-resolution IP pinning (anti-DNS-rebinding), manual redirect hop re-validation, `trust_env=False`, timeouts, and download byte limits.
+- API keys live only in environment variables or gitignored `data/secrets.json`, are redacted in logs, and are never returned over HTTP.

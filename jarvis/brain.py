@@ -1,7 +1,8 @@
 """Ollama client + model manager (native /api/chat: it is the only way to set num_ctx per request).
-Reasoning text never reaches callers: the `thinking` field is dropped and any <think>..</think> is filtered."""
+Reasoning text never reaches callers: the `thinking` field is dropped and any <think>..</think> is filtered.
+Supports Ollama tool calling for approved web search/fetch tools with clean fallback if a model lacks tool support."""
+import json
 import logging
-import re
 import time
 from typing import AsyncIterator
 
@@ -16,8 +17,13 @@ class BrainError(Exception):
     """Ollama unreachable, model missing, or bad reply. Message is safe to show the user."""
 
 
+class ToolsUnsupportedError(BrainError):
+    """Raised when the selected Ollama model rejects the `tools` parameter."""
+
+
 class ThinkFilter:
     """Streaming remover of <think>...</think> blocks (tags may be split across chunks)."""
+
     def __init__(self):
         self.buf, self.inside = "", False
 
@@ -126,41 +132,86 @@ class Brain:
         return time.time() - t
 
     # ---- chat ----------------------------------------------------------------------------------------
-    def _body(self, messages: list[dict], stream: bool) -> dict:
+    def _body(self, messages: list[dict], stream: bool, tools: list[dict] | None = None) -> dict:
         s = self.spec
-        return {"model": s.model, "messages": messages, "stream": stream, "think": s.thinking, "keep_alive": s.keep_alive,
-                "options": {"num_ctx": s.num_ctx, "num_predict": s.max_tokens, "temperature": 0.6}}
+        body = {
+            "model": s.model,
+            "messages": messages,
+            "stream": stream,
+            "think": s.thinking,
+            "keep_alive": s.keep_alive,
+            "options": {"num_ctx": s.num_ctx, "num_predict": s.max_tokens, "temperature": 0.6},
+        }
+        if tools:
+            body["tools"] = tools
+        return body
 
-    async def stream(self, messages: list[dict]) -> AsyncIterator[str]:
-        flt, t0, first, n = ThinkFilter(), time.time(), None, 0
+    async def stream_events(self, messages: list[dict], tools: list[dict] | None = None) -> AsyncIterator[dict]:
+        """Stream `/api/chat` yielding {"type": "token", "text"} and {"type": "tool_calls", "calls"}."""
+        flt, t0, first = ThinkFilter(), time.time(), None
+        collected_calls: list[dict] = []
         try:
-            async with self.client.stream("POST", self.host + "/api/chat", json=self._body(messages, True)) as r:
+            async with self.client.stream("POST", self.host + "/api/chat", json=self._body(messages, True, tools=tools)) as r:
                 if r.status_code == 404:
                     raise BrainError(f"Model {self.spec.model!r} not found in Ollama. Run `ollama pull {self.spec.model}`.")
+                if r.status_code == 400 and tools:
+                    body_txt = (await r.aread()).decode("utf-8", errors="replace")
+                    if "tool" in body_txt.lower():
+                        raise ToolsUnsupportedError(body_txt)
                 r.raise_for_status()
-                import json
                 async for line in r.aiter_lines():
                     if not line:
                         continue
                     c = json.loads(line)
                     if c.get("error"):
+                        if tools and "tool" in str(c["error"]).lower():
+                            raise ToolsUnsupportedError(c["error"])
                         raise BrainError(c["error"])
-                    piece = flt.feed(c.get("message", {}).get("content", ""))  # `thinking` field intentionally ignored
+                    msg = c.get("message") or {}
+                    if msg.get("tool_calls"):
+                        for tc in msg["tool_calls"]:
+                            fn = tc.get("function") or {}
+                            args = fn.get("arguments", {})
+                            if isinstance(args, str):
+                                try:
+                                    args = json.loads(args)
+                                except json.JSONDecodeError:
+                                    args = {"raw": args}
+                            collected_calls.append({
+                                "id": tc.get("id") or f"call_{len(collected_calls)}",
+                                "name": fn.get("name", ""),
+                                "arguments": args if isinstance(args, dict) else {},
+                            })
+                    piece = flt.feed(msg.get("content", ""))  # `thinking` field intentionally ignored
                     if piece:
                         first = first or time.time() - t0
-                        yield piece
+                        yield {"type": "token", "text": piece}
                     if c.get("done"):
                         n = c.get("eval_count", 0)
                         ed = c.get("eval_duration") or 1
-                        self.last_stats = {"ttft": first, "tokens": n, "tps": n / (ed / 1e9), "total": time.time() - t0,
-                                           "prompt_tokens": c.get("prompt_eval_count", 0), "prompt_s": (c.get("prompt_eval_duration") or 0) / 1e9,
-                                           "load_s": (c.get("load_duration") or 0) / 1e9,
-                                           "model": self.spec.model, "truncated": c.get("done_reason") == "length"}
+                        self.last_stats = {
+                            "ttft": first,
+                            "tokens": n,
+                            "tps": n / (ed / 1e9),
+                            "total": time.time() - t0,
+                            "prompt_tokens": c.get("prompt_eval_count", 0),
+                            "prompt_s": (c.get("prompt_eval_duration") or 0) / 1e9,
+                            "load_s": (c.get("load_duration") or 0) / 1e9,
+                            "model": self.spec.model,
+                            "truncated": c.get("done_reason") == "length",
+                        }
         except httpx.HTTPError as e:
             raise BrainError(f"Ollama request failed ({type(e).__name__}). Is Ollama running?") from e
         tail = flt.flush()
         if tail:
-            yield tail
+            yield {"type": "token", "text": tail}
+        if collected_calls:
+            yield {"type": "tool_calls", "calls": collected_calls}
+
+    async def stream(self, messages: list[dict]) -> AsyncIterator[str]:
+        async for ev in self.stream_events(messages):
+            if ev["type"] == "token":
+                yield ev["text"]
 
     async def complete(self, messages: list[dict]) -> str:
         return "".join([p async for p in self.stream(messages)]).strip()
