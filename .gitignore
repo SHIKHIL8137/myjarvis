@@ -1,0 +1,43 @@
+# environments
+.venv/
+venv/
+env/
+
+# caches
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.cache/
+
+# local data and logs
+*.db
+*.sqlite
+*.sqlite3
+*.log
+logs/
+data/
+tts_cache/
+captures/
+viewer/graph-data.js
+
+# secrets
+.env
+.env.*
+secrets.json
+config.local.json
+*.key
+*.pem
+
+# editor / OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+
+# local models, test artefacts, user memory trash
+models/
+.playwright-mcp/
+notes/.trash/
+bench_results.json
+*.pdf

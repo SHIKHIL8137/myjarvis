@@ -1,0 +1,86 @@
+"""Brain + model manager against a mocked Ollama (httpx.MockTransport): streaming, think filtering, errors, switching."""
+import asyncio
+import json
+
+import httpx
+import pytest
+
+from jarvis.brain import Brain, BrainError, ThinkFilter
+
+
+def run(c):
+    return asyncio.run(c)
+
+
+def ndjson(*chunks):
+    return "\n".join(json.dumps(c) for c in chunks).encode()
+
+
+def make(settings, handler):
+    return Brain(settings, client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+
+
+def test_think_filter_across_chunk_boundaries():
+    f = ThinkFilter()
+    out = "".join(f.feed(x) for x in ["Hel", "lo <thi", "nk>secret ", "reasoning</th", "ink> world", "!"]) + f.flush()
+    assert out == "Hello  world!" and "secret" not in out
+    g = ThinkFilter()
+    assert g.feed("a < b and <th") + g.flush() == "a < b and <th"  # lone '<' is not swallowed forever
+
+
+def test_stream_ignores_thinking_field_and_reports_stats(settings):
+    seen = {}
+
+    def h(req):
+        seen["body"] = json.loads(req.content)
+        return httpx.Response(200, content=ndjson(
+            {"message": {"thinking": "let me think about this"}}, {"message": {"content": "Hello"}},
+            {"message": {"content": " sir."}}, {"done": True, "eval_count": 10, "eval_duration": 2_000_000_000, "done_reason": "stop"}))
+    b = make(settings, h)
+    text = run(b.complete([{"role": "user", "content": "hi"}]))
+    assert text == "Hello sir." and "think" not in text
+    assert seen["body"]["options"]["num_ctx"] == 4096 and seen["body"]["think"] is False and seen["body"]["model"] == "qwen3:4b-instruct"
+    assert b.last_stats["tps"] == 5.0 and b.last_stats["truncated"] is False
+
+
+def test_thinking_model_requests_think_true_but_hides_it(settings):
+    seen = {}
+
+    def h(req):
+        seen["b"] = json.loads(req.content)
+        return httpx.Response(200, content=ndjson({"message": {"content": "<think>hmm</think>Answer."}}, {"done": True, "eval_count": 1, "eval_duration": 1}))
+    b = make(settings, h)
+    b.current = "local_thinking"
+    assert run(b.complete([{"role": "user", "content": "x"}])) == "Answer." and seen["b"]["think"] is True
+
+
+def test_errors_are_friendly(settings):
+    def refuse(req):
+        raise httpx.ConnectError("refused")
+    with pytest.raises(BrainError, match="Ollama"):
+        run(make(settings, refuse).complete([{"role": "user", "content": "x"}]))
+    with pytest.raises(BrainError, match="ollama pull"):
+        run(make(settings, lambda r: httpx.Response(404, json={"error": "model not found"})).complete([{"role": "user", "content": "x"}]))
+    with pytest.raises(BrainError, match="boom"):
+        run(make(settings, lambda r: httpx.Response(200, content=ndjson({"error": "boom"}))).complete([{"role": "user", "content": "x"}]))
+    assert run(make(settings, refuse).health())["up"] is False
+
+
+def test_switch_unloads_previous_and_never_pulls(settings):
+    calls = []
+
+    def h(req):
+        calls.append((req.method, req.url.path, req.content))
+        if req.url.path == "/api/tags":
+            return httpx.Response(200, json={"models": [{"name": "qwen3:4b-instruct"}, {"name": "qwen3:4b"}, {"name": "qwen2.5vl:3b"}]})
+        return httpx.Response(200, json={})
+    b = make(settings, h)
+    assert run(b.switch("local_thinking"))["model"] == "qwen3:4b" and b.current == "local_thinking"
+    unload = [c for c in calls if c[1] == "/api/generate"]
+    assert unload and json.loads(unload[0][2]) == {"model": "qwen3:4b-instruct", "keep_alive": 0}
+    assert run(b.switch("qwen2.5vl:3b"))["model"] == "qwen2.5vl:3b"  # any installed model
+    with pytest.raises(BrainError, match="not installed"):
+        run(b.switch("llama99:1b"))
+    assert not any(c[1] == "/api/pull" for c in calls)
+    cat = run(b.catalogue())
+    assert [m["key"] for m in cat][:2] == ["local", "local_thinking"] and sum(m["current"] for m in cat) == 1

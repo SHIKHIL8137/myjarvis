@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Jarvis</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='6' fill='none' stroke='%2327d3ff' stroke-width='2'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="galaxy" aria-label="3D knowledge galaxy"></div>
+<div id="labels" aria-hidden="true"></div>
+<div id="holo" aria-hidden="true"></div>
+
+<!-- LEFT: knowledge control -->
+<aside id="left" class="glass" aria-label="Knowledge control">
+  <header class="brand">
+    <div class="brand-name">JARVIS</div>
+    <div class="dim" id="brand-sub">loading…</div>
+    <div class="status-row"><span class="dot" id="st-backend"></span>backend <span class="dot" id="st-ollama"></span>ollama <span class="dot" id="st-offline"></span><span id="st-offline-t">offline guard</span></div>
+  </header>
+  <input id="search" type="search" placeholder="Search the brain…" aria-label="Search notes" autocomplete="off">
+  <div class="rail-scroll">
+    <h2>Inspector</h2>
+    <div class="box" id="inspector"></div>
+    <h2>Top hubs</h2>
+    <div class="box list" id="hubs"></div>
+    <h2>Categories</h2>
+    <div class="box list" id="cats"></div>
+    <h2>Statistics</h2>
+    <div class="box stats" id="stats"></div>
+    <h2>Forces</h2>
+    <div class="box">
+      <label class="slider">Repel <input id="f-repel" type="range" min="10" max="200" step="5" value="60"></label>
+      <label class="slider">Link length <input id="f-link" type="range" min="10" max="120" step="5" value="35"></label>
+    </div>
+    <h2>Display</h2>
+    <div class="box">
+      <label class="check"><input type="checkbox" id="d-labels" checked> Hub labels</label>
+      <label class="check"><input type="checkbox" id="d-rotate" checked> Slow rotation</label>
+      <label class="check"><input type="checkbox" id="d-links" checked> Connections</label>
+    </div>
+    <p class="dim hint">drag = rotate · scroll = zoom · right-drag = pan<br>click = focus · double-click = explore 2 steps</p>
+  </div>
+</aside>
+<button id="left-toggle" class="icon" aria-label="Collapse knowledge panel" aria-expanded="true">«</button>
+
+<!-- TOP: view controls -->
+<nav id="top" class="glass" aria-label="View">
+  <button id="v-fit" title="Fit everything in view">Fit</button>
+  <button id="v-reset" title="Reset the camera">Reset</button>
+  <span class="sep"></span>
+  <button id="v-notes" aria-controls="notes">Notes</button>
+  <button id="v-chat" aria-controls="chat">Chat</button>
+  <button id="v-settings" aria-controls="settings">System</button>
+</nav>
+
+<!-- RIGHT: Jarvis HUD -->
+<aside id="hud" class="off" aria-label="Jarvis status">
+  <svg id="reactor" viewBox="0 0 200 200" role="img" aria-label="Jarvis reactor">
+    <circle class="r-ticks" cx="100" cy="100" r="94"/>
+    <g class="r-spin-a"><path class="r-arc" d="M100 12 A88 88 0 0 1 188 100"/><path class="r-arc" d="M100 188 A88 88 0 0 1 12 100"/></g>
+    <g class="r-spin-b"><path class="r-arc2" d="M26 100 A74 74 0 0 0 100 174"/></g>
+    <g id="bars"></g>
+    <circle class="r-inner" cx="100" cy="100" r="46"/>
+    <circle class="r-core" cx="100" cy="100" r="38"/>
+    <text x="100" y="104" text-anchor="middle" class="r-name">J.A.R.V.I.S.</text>
+  </svg>
+  <div class="chips">
+    <span class="chip" id="h-online"><i></i><b>OFFLINE</b></span>
+    <span class="chip" id="h-model" title="Current Ollama model"><b>—</b></span>
+  </div>
+  <div class="hud-lines">
+    <div><span>LOCAL VOICE</span><b id="h-voice">—</b></div>
+    <div><span>MICROPHONE</span><b id="h-mic">off</b></div>
+    <div><span>STATE</span><b id="h-state">standby</b></div>
+  </div>
+  <div class="modes">
+    <button id="m-eyes" disabled title="Vision (camera / screen) is not implemented in this build"><span>EYES</span><b>n/a</b></button>
+    <button id="m-holo" aria-pressed="false" title="Hologram view: scanlines, brighter links, rotation"><span>HOLO</span><b>off</b></button>
+    <button id="m-focus" aria-pressed="false" title="Focus: hide the side panels and leave the galaxy and command bar"><span>FOCUS</span><b>off</b></button>
+    <button id="m-reflex" aria-pressed="true" title="Reflex on = fast model. Off = thinking model (slower, reasons first)"><span>REFLEX</span><b>fast</b></button>
+  </div>
+</aside>
+
+<!-- BOTTOM: command bar -->
+<div id="reply" class="glass" hidden role="status"></div>
+<form id="cmd" class="glass" autocomplete="off">
+  <input id="input" maxlength="4000" placeholder="Ask · “remember that…” · “show my notes” · “find information about…”" aria-label="Command">
+  <button type="submit" id="c-send" class="round primary" title="Send" aria-label="Send">➤</button>
+  <button type="button" id="c-halt" class="round" title="Stop generating and speaking" aria-label="Stop" hidden>■</button>
+  <button type="button" id="c-mic" class="round" aria-pressed="false" title="Microphone and wake word on/off" aria-label="Microphone">🎙</button>
+  <button type="button" id="c-ptt" class="round" title="Talk now (skips the wake word)" aria-label="Push to talk">●</button>
+  <button type="button" id="c-voice" class="round" aria-pressed="true" title="Speak replies aloud" aria-label="Voice playback">🔊</button>
+  <div id="c-status"><span id="c-wake">wake word off</span><span id="c-state">standby</span></div>
+</form>
+
+<!-- DRAWERS -->
+<section id="chat" class="drawer glass" hidden aria-label="Conversation">
+  <header><h3>Conversation</h3><span class="grow"></span><button id="ch-clear" class="ghost">Clear</button><button class="ghost close" aria-label="Close">×</button></header>
+  <div id="log" role="log" aria-live="polite"></div>
+</section>
+
+<section id="notes" class="drawer glass" hidden aria-label="Notes">
+  <header><h3>Knowledge explorer</h3><span class="grow"></span><button id="n-new" class="ghost">New note</button><button class="ghost close" aria-label="Close">×</button></header>
+  <div class="split">
+    <div class="n-side">
+      <input id="n-filter" type="search" placeholder="Filter notes…" aria-label="Filter notes">
+      <div id="n-chips" class="chipset"></div>
+      <div id="n-list"></div>
+    </div>
+    <div class="n-main" id="n-main"><p class="dim">Select a note to read it.</p></div>
+  </div>
+</section>
+
+<section id="settings" class="drawer glass" hidden aria-label="Settings and system">
+  <header><h3>System</h3><span class="grow"></span><span id="s-msg" class="dim"></span><button id="s-save">Save</button><button class="ghost close" aria-label="Close">×</button></header>
+  <div class="split">
+    <div class="s-col">
+      <h2>Monitor</h2><div id="monitor" class="monitor"></div>
+      <h2>Appearance</h2>
+      <div class="box form">
+        <label>Accent <select id="s-accent"><option value="cyan">Cyan</option><option value="blue">Electric blue</option><option value="green">Green</option><option value="amber">Amber</option></select></label>
+        <label class="check"><input type="checkbox" id="s-motion"> Reduce motion</label>
+      </div>
+    </div>
+    <div class="s-col">
+      <h2>Brain</h2>
+      <div class="box form">
+        <label>Model <select id="s-model"></select></label>
+        <label>Context window <select id="s-ctx"><option>2048</option><option>4096</option><option>8192</option></select></label>
+      </div>
+      <h2>Voice</h2>
+      <div class="box form">
+        <label class="check"><input type="checkbox" id="s-tts"> Voice output enabled</label>
+        <label>Voice <select id="s-voice"></select></label>
+        <label>Speed <span><input id="s-speed" type="range" min="0.6" max="1.6" step="0.05"><output id="s-speed-o"></output></span></label>
+        <label>Speaker <select id="s-out"></select></label>
+        <label>Microphone <select id="s-in"></select></label>
+      </div>
+      <h2>Wake word</h2>
+      <div class="box form">
+        <label class="check"><input type="checkbox" id="s-wake"> Listen for “Hey Jarvis”</label>
+        <label>Threshold <span><input id="s-thr" type="range" min="0.2" max="0.9" step="0.05"><output id="s-thr-o"></output></span></label>
+        <label>Silence before stopping (ms) <input id="s-sil" type="number" min="200" max="3000" step="100"></label>
+      </div>
+    </div>
+  </div>
+</section>
+
+<div id="toast" role="alert" hidden></div>
+<script src="vendor/3d-force-graph.min.js"></script>
+<script type="module" src="js/main.js"></script>
+</body>
+</html>
