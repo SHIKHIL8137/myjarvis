@@ -153,6 +153,8 @@ class ModelRegistry:
             rec = self._state["versions"].get(version_id)
             if not rec:
                 raise KeyError(f"Model version '{version_id}' not found.")
+            if actor == "auto" and not self.spec.auto_promote:
+                raise PermissionError("Automatic unattended model promotion is disabled by learning policy (auto_promote=false).")
             if self.spec.evaluation_required and not rec.get("evaluation_passed"):
                 raise PermissionError(
                     f"Cannot promote version '{version_id}': evaluation is required and has not passed."

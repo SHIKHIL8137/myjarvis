@@ -2,11 +2,13 @@ import React, { useCallback, useEffect, useState } from "react";
 import { apiFetch, streamChat } from "./api/client";
 import { GalaxyCanvas, type GraphLink, type GraphNode } from "./components/GalaxyCanvas";
 import { AssistantPanel } from "./features/AssistantPanel";
+import { GatewayPanel } from "./features/GatewayPanel";
+import { LearningPanel } from "./features/LearningPanel";
 import { MemoryPanel } from "./features/MemoryPanel";
 import { RecoveryPanel } from "./features/RecoveryPanel";
 import { WorkforcePanel } from "./features/WorkforcePanel";
 
-type Tab = "chat" | "assistant" | "workforce" | "memory" | "recovery";
+type Tab = "chat" | "assistant" | "workforce" | "memory" | "gateway" | "learning" | "recovery";
 
 export const App: React.FC = () => {
   const [tab, setTab] = useState<Tab>("chat");
@@ -99,7 +101,7 @@ export const App: React.FC = () => {
         </div>
 
         <nav className="nav-tabs">
-          {(["chat", "assistant", "workforce", "memory", "recovery"] as Tab[]).map((t) => (
+          {(["chat", "assistant", "workforce", "memory", "gateway", "learning", "recovery"] as Tab[]).map((t) => (
             <button key={t} className={`tab-btn ${tab === t ? "active" : ""}`} onClick={() => setTab(t)}>
               {t.toUpperCase()}
             </button>
@@ -169,6 +171,8 @@ export const App: React.FC = () => {
             />
           )}
           {tab === "memory" && <MemoryPanel onNotify={notify} />}
+          {tab === "gateway" && <GatewayPanel onNotify={notify} />}
+          {tab === "learning" && <LearningPanel onNotify={notify} />}
           {tab === "recovery" && <RecoveryPanel onNotify={notify} />}
         </section>
       </main>

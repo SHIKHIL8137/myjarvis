@@ -42,7 +42,7 @@ class AgentOrchestrator:
         self.db = db or DatabaseManager(settings.database.url, data_dir=self.data_dir, echo=settings.database.echo)
         self.db.init_schema_sync()
 
-        self.memory = FiveWayMemoryService(self.db)
+        self.memory = FiveWayMemoryService(self.db, settings=settings)
         self.approvals = ApprovalService(self.db)
         self.projects = ProjectRegistryService(self.db)
         self.workforce = DevWorkforceService(self.db, self.projects)
@@ -52,7 +52,7 @@ class AgentOrchestrator:
         self.calendar = LocalCalendarService(self.data_dir / "calendar")
         self.recovery = DisasterRecoveryManager(self.db, settings, data_dir=self.data_dir, secrets_path=SECRETS_PATH)
         self.decision = DecisionEngine(settings)
-        self.gateway = ModelGateway(brain, db=self.db) if brain is not None else None
+        self.gateway = ModelGateway(brain, db=self.db, settings=settings) if brain is not None else None
 
         self.checkpointer = DBBackedCheckpointSaver(self.db)
         self._coder_runner = coder_runner
@@ -70,6 +70,7 @@ class AgentOrchestrator:
             workforce=self.workforce,
             memory=self.memory,
             approvals=self.approvals,
+            workforce_spec=settings.workforce,
             coder_runner=coder_runner,
             graphify_bin=settings.workforce.graphify_bin,
             opencode_bin=settings.workforce.opencode_bin,
@@ -101,7 +102,7 @@ class AgentOrchestrator:
             if row:
                 row.state = state
                 row.output_summary = output_summary[:1000]
-                if state in ("completed", "failed", "rejected", "blocked_security"):
+                if state in ("completed", "failed", "rejected", "blocked_security", "blocked", "cancelled"):
                     row.ended_at = round(time.time(), 3)
                 s.commit()
 

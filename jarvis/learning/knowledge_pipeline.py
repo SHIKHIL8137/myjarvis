@@ -1,7 +1,7 @@
 """Automatic knowledge update pipeline (Phase 3): incremental multi-source ingestion,
 versioning, deduplication, corrupt/credential filtering, SQLite FTS5 indexing, optional local embeddings,
 and rollback WITHOUT modifying model weights."""
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 import hashlib
 import json
 import logging
@@ -17,6 +17,7 @@ from ..config import DATA, InternetSpec, ROOT, LearningSpec
 from ..memory_store import detect_secret
 from ..netsec import NetworkSecurityError, safe_request
 from ..search import SearchOfflineError, extract_readable_text
+from .training.dataset_validator import detect_poisoning, is_license_allowed, normalize_license
 
 log = logging.getLogger("jarvis.learning.knowledge")
 
@@ -86,13 +87,14 @@ class KnowledgeSourceSpec:
 class KnowledgePipeline:
     """Incremental versioned knowledge store & discovery/ingestion runner."""
 
-    def __init__(self, spec: LearningSpec | None = None, data_dir: Path | None = None, *, is_online_fn=lambda: False):
+    def __init__(self, spec: LearningSpec | None = None, data_dir: Path | None = None, *, is_online_fn=lambda: False, vector_store=None):
         self.spec = spec or LearningSpec()
         self.base_dir = Path(data_dir) if data_dir else (DATA / "learning" / "knowledge")
         self.base_dir.mkdir(parents=True, exist_ok=True)
         self.db_path = self.base_dir / "index.db"
         self.status_path = self.base_dir / "freshness.json"
         self.is_online_fn = is_online_fn
+        self.vector_store = vector_store
         self._lock = threading.RLock()
         self._sources: dict[str, KnowledgeSourceSpec] = {}
         self._freshness: dict = {
@@ -339,7 +341,7 @@ class KnowledgePipeline:
         trust: str = "verified_local",
         force: bool = False,
     ) -> dict:
-        """Validate, deduplicate, chunk, and incrementally index raw text with version rollback history."""
+        """Validate license/provenance/poisoning/secrets, deduplicate globally, chunk, and index into SQLite + VectorStore."""
         if not text or not text.strip():
             raise ValueError("Document content is empty")
         if len(text.encode("utf-8")) > self.spec.max_download_bytes:
@@ -348,12 +350,20 @@ class KnowledgePipeline:
             raise ValueError("Refused knowledge ingestion containing sensitive credential or private key")
         if text.count("\ufffd") > max(10, len(text) * 0.1):
             raise ValueError("Corrupt or unreadable replacement-character payload rejected")
+        norm_lic = normalize_license(license_name)
+        if kind in ("huggingface_dataset", "huggingface_model", "public_docs", "configured_api"):
+            if not is_license_allowed(norm_lic, self.spec):
+                raise ValueError(f"Unverified or disallowed license {license_name!r} for external source {source_id!r}")
+        if poison := detect_poisoning(text):
+            raise ValueError(f"Untrusted document blocked: prompt-injection or unsafe instruction pattern detected ({poison})")
 
         norm = text.strip()
         c_hash = hashlib.sha256(norm.encode("utf-8")).hexdigest()
         lang = detect_script_language(norm)
         now = round(time.time(), 3)
 
+        indexed_chunks: list[tuple[int, str]] = []
+        dedup_skipped = 0
         with self._lock, self._connect() as conn:
             cur = conn.execute("SELECT active_version, content_hash FROM sources WHERE source_id=?", (source_id,)).fetchone()
             if cur and cur["content_hash"] == c_hash and not force:
@@ -365,6 +375,11 @@ class KnowledgePipeline:
             chunks = chunk_text(norm)
             if not chunks:
                 raise ValueError("No valid text chunks extracted from document")
+
+            existing_hashes = {
+                r["content_hash"]
+                for r in conn.execute("SELECT content_hash FROM chunks WHERE active=1 AND source_id!=?", (source_id,)).fetchall()
+            }
 
             conn.execute("UPDATE chunks SET active=0 WHERE source_id=?", (source_id,))
             conn.execute(
@@ -378,20 +393,58 @@ class KnowledgePipeline:
                     active_version=excluded.active_version, content_hash=excluded.content_hash,
                     language=excluded.language, retrieved_at=excluded.retrieved_at, update_status='indexed'
                 """,
-                (source_id, name, kind, location, topic, license_name, trust, new_ver, c_hash, lang, now),
+                (source_id, name, kind, location, topic, norm_lic, trust, new_ver, c_hash, lang, now),
             )
             conn.execute(
                 "INSERT INTO versions (source_id, version_num, content_hash, doc_version, license, language, retrieved_at, byte_size) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (source_id, new_ver, c_hash, doc_version, license_name, lang, now, len(norm.encode("utf-8"))),
+                (source_id, new_ver, c_hash, doc_version, norm_lic, lang, now, len(norm.encode("utf-8"))),
             )
             for idx, c in enumerate(chunks):
                 ch_hash = hashlib.sha256(c.encode("utf-8")).hexdigest()
+                if ch_hash in existing_hashes:
+                    dedup_skipped += 1
+                    continue
+                existing_hashes.add(ch_hash)
                 conn.execute(
                     "INSERT INTO chunks (source_id, version_num, chunk_index, title, topic, language, content, content_hash, active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)",
                     (source_id, new_ver, idx, name, topic, lang, c, ch_hash),
                 )
+                indexed_chunks.append((idx, c))
             self._refresh_size_stats()
-            return {"source_id": source_id, "status": "indexed", "version": new_ver, "chunks": len(chunks), "language": lang, "hash": c_hash[:12]}
+
+        if self.vector_store is not None:
+            try:
+                self.vector_store.delete_doc("external_knowledge", source_id)
+                if indexed_chunks:
+                    self.vector_store.upsert_batch(
+                        [
+                            {
+                                "namespace": "external_knowledge",
+                                "doc_id": source_id,
+                                "chunk_index": idx,
+                                "title": name,
+                                "content": c,
+                                "memory_type": "kb_chunk",
+                                "source": kind,
+                                "privacy_level": "public" if kind in ("huggingface_dataset", "huggingface_model", "public_docs") else "internal",
+                                "meta": {"topic": topic, "license": norm_lic, "trust": trust, "version": new_ver, "language": lang},
+                            }
+                            for idx, c in indexed_chunks
+                        ]
+                    )
+            except Exception as e:
+                log.warning("Knowledge vector sync warning for %s: %s", source_id, e)
+
+        return {
+            "source_id": source_id,
+            "status": "indexed",
+            "version": new_ver,
+            "chunks": len(indexed_chunks),
+            "dedup_skipped": dedup_skipped,
+            "license": norm_lic,
+            "language": lang,
+            "hash": c_hash[:12],
+        }
 
     def rollback_source(self, source_id: str, target_version: int | None = None) -> dict:
         """Roll back an indexed knowledge source to its prior (or specified) snapshot cleanly."""
@@ -529,3 +582,28 @@ class KnowledgePipeline:
             }))
         scored.sort(key=lambda x: -x[0])
         return [s[1] for s in scored[: max(1, k)]]
+
+    def check_stale_sources(self, *, max_age_hours: float | None = None) -> list[dict]:
+        """Identify indexed knowledge sources older than configured update interval for safe re-evaluation."""
+        age_s = float(max_age_hours or self.spec.update_interval_hours) * 3600.0
+        cutoff = time.time() - age_s
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT source_id, name, kind, active_version, license, retrieved_at FROM sources WHERE retrieved_at IS NOT NULL AND retrieved_at < ?",
+                (cutoff,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    @staticmethod
+    def format_untrusted_knowledge(results: list[dict]) -> str:
+        """Render external knowledge chunks in strict inert XML-like delimiters so docs never act as system instructions."""
+        blocks: list[str] = []
+        for r in results:
+            sid = str(r.get("source_id") or "")
+            trust = str(r.get("trust") or "external")
+            loc = str(r.get("location") or "")
+            txt = str(r.get("content") or "")
+            if detect_poisoning(txt):
+                continue
+            blocks.append(f'<retrieved_knowledge source_id="{sid}" trust="{trust}" location="{loc}" untrusted_data="true">\n{txt}\n</retrieved_knowledge>')
+        return "\n".join(blocks)

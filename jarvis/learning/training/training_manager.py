@@ -266,3 +266,37 @@ class TrainingManager:
             except Exception:
                 pass
         return sorted(jobs, key=lambda j: j.get("created_at", 0), reverse=True)
+
+    def prepare_remote_delegation_bundle(self, job_id: str) -> dict:
+        """Export an auditable off-device training bundle when local VRAM (e.g. 4 GB GTX 1650) is insufficient."""
+        jdir = self._job_dir(job_id)
+        sp = jdir / "status.json"
+        if not sp.exists():
+            raise FileNotFoundError(f"Training job '{job_id}' not found.")
+        st = json.loads(sp.read_text(encoding="utf-8"))
+        if self.spec.require_training_approval and not st.get("approved"):
+            raise PermissionError("Training job requires explicit owner approval before remote delegation export.")
+        cfg = st["config"]
+        prep_dir = Path(cfg["prepared_dir"])
+        train_path = prep_dir / "train.jsonl"
+        manifest = {
+            "format": "jarvis-remote-training-spec-v1",
+            "job_id": job_id,
+            "base_model": cfg.get("base_model"),
+            "hf_model_id": cfg.get("hf_model_id"),
+            "method": cfg.get("method"),
+            "quantization": cfg.get("quantization"),
+            "dataset_build_id": cfg.get("dataset_build_id"),
+            "train_jsonl": str(train_path),
+            "train_sha256": __import__("hashlib").sha256(train_path.read_bytes()).hexdigest() if train_path.exists() else "",
+            "requires_post_training_evaluation": self.spec.evaluation_required,
+            "auto_promote": False,
+        }
+        out = jdir / "remote_delegation_bundle.json"
+        self._write_json(out, manifest)
+        st["state"] = "remote_ready"
+        st["remote_bundle_path"] = str(out)
+        st["updated_at"] = round(time.time(), 3)
+        self._write_json(sp, st)
+        self.audit.record("remote_training_bundle_prepared", details={"job_id": job_id, "bundle": str(out)})
+        return manifest

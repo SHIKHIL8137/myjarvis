@@ -213,6 +213,11 @@ class MemorySpec(BaseModel):
     confirm_inferred: bool = True
     max_temporary_items: int = Field(30, ge=5, le=200)
     backup_dir: str = "data/memory/backups"
+    ranking_similarity_weight: float = Field(0.55, ge=0.0, le=2.0)
+    ranking_recency_weight: float = Field(0.15, ge=0.0, le=2.0)
+    ranking_confidence_weight: float = Field(0.15, ge=0.0, le=2.0)
+    ranking_relevance_weight: float = Field(0.10, ge=0.0, le=2.0)
+    ranking_project_boost: float = Field(0.10, ge=0.0, le=2.0)
 
 
 class FilesystemSpec(BaseModel):
@@ -239,6 +244,9 @@ class ActionsSpec(BaseModel):
 
 class ProvidersSpec(BaseModel):
     allow_cloud: bool = False  # Never silently switch to cloud in Local Mode
+    allow_paid_models: bool = False  # Paid providers require explicit owner authorization
+    prefer_free_cloud: bool = True
+    paid_providers: list[str] = Field(default_factory=lambda: ["openai", "anthropic"])
     openai_base_url: str = "https://api.openai.com/v1"
     openai_model: str = "gpt-4o-mini"
     anthropic_base_url: str = "https://api.anthropic.com/v1"
@@ -264,6 +272,12 @@ class ProvidersSpec(BaseModel):
 class DatabaseSpec(BaseModel):
     url: str = ""  # Empty -> local SQLite+WAL (data/jarvis.db); or postgresql+psycopg://...
     echo: bool = False
+    embedding_provider: str = Field("auto", pattern="^(auto|ollama|huggingface|local_hash)$")
+    embedding_model: str = ""  # e.g. "nomic-embed-text" for Ollama or sentence-transformers model
+    embedding_dim: int = Field(256, ge=32, le=4096)
+    vector_index_type: str = Field("hnsw", pattern="^(hnsw|ivfflat)$")
+    vector_metric: str = Field("cosine", pattern="^(cosine|l2|ip)$")
+    embedding_version: str = "hash-v1:256"
 
 
 class GatewaySpec(BaseModel):
@@ -272,6 +286,14 @@ class GatewaySpec(BaseModel):
     classifier_confidence_threshold: float = Field(0.75, ge=0.3, le=0.99)
     enable_llm_classifier: bool = True
     scrub_outbound_secrets: bool = True
+    circuit_breaker_failures: int = Field(3, ge=1, le=20)
+    circuit_breaker_cooldown_s: float = Field(60.0, ge=5.0, le=3600.0)
+    retry_max_attempts: int = Field(3, ge=1, le=6)
+    retry_base_delay_s: float = Field(0.25, ge=0.05, le=5.0)
+    request_timeout_s: float = Field(30.0, ge=2.0, le=300.0)
+    max_local_concurrency: int = Field(1, ge=1, le=4)
+    max_cloud_concurrency: int = Field(3, ge=1, le=16)
+    max_queue_size: int = Field(16, ge=2, le=100)
 
 
 class WorkforceSpec(BaseModel):
@@ -282,6 +304,19 @@ class WorkforceSpec(BaseModel):
     max_agent_steps: int = Field(16, ge=2, le=60)
     max_repair_retries: int = Field(2, ge=0, le=5)
     registered_projects: list[dict] = Field(default_factory=list)
+    sandbox_backend: str = Field("restricted_subprocess", pattern="^(restricted_subprocess|docker)$")
+    docker_image: str = "python:3.12-slim"
+    qa_timeout_s: int = Field(120, ge=5, le=1800)
+    max_memory_mb: int = Field(1024, ge=128, le=16384)
+    allowed_executables: list[str] = Field(
+        default_factory=lambda: ["pytest", "python", "ruff", "mypy", "node", "npm", "npx", "tsc", "git"]
+    )
+    denied_executables: list[str] = Field(
+        default_factory=lambda: [
+            "powershell", "pwsh", "cmd", "bash", "sh", "zsh", "curl", "wget", "rm", "del", "format", "reg", "diskpart",
+        ]
+    )
+    network_mode: str = Field("none", pattern="^(none|host)$")
 
 
 class RecoverySpec(BaseModel):
@@ -289,6 +324,12 @@ class RecoverySpec(BaseModel):
     tier3_dir: str = ""
     retain_tier1: int = Field(10, ge=2, le=100)
     retain_tier2: int = Field(14, ge=2, le=100)
+    retain_tier3: int = Field(7, ge=1, le=100)
+    encrypt_bundles: bool = True
+    s3_endpoint: str = ""
+    s3_bucket: str = ""
+    s3_prefix: str = "jarvis-backups"
+    s3_region: str = "us-east-1"
 
 
 class LearningSpec(BaseModel):

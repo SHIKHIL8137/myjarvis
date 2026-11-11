@@ -1,44 +1,44 @@
 # Test report
 
-Updated on 2026-11-11 after completing the P0–P9 AI Operating System upgrade on the target machine (`Ryzen 5 5600H`, `GTX 1650 4 GB`, `15.3 GB RAM`, `Windows 11`, `Python 3.14.6`, `Ollama 0.40.16`, `Node v24.16.0`).
-Every result below was directly observed; no unperformed, skipped, or mocked test is reported as live.
+Updated on 2026-11-11 after completing **P10 — Reliability, Security, Memory, Workforce & Autonomous Learning Hardening** on the target machine (`Ryzen 5 5600H`, `GTX 1650 4 GB`, `15.3 GB RAM`, `Windows 11`, `Python 3.14.6`, `Ollama 0.40.16`, `Node v24.16.0`).
+Every result below was directly observed; no unperformed, skipped, or mocked test is reported as live. See [P10_TEST_REPORT.md](P10_TEST_REPORT.md) and [P10_IMPLEMENTATION_REPORT.md](P10_IMPLEMENTATION_REPORT.md) for the complete P10 matrix.
 
-## 1. Automated tests & static verification (post-P0–P9 edits)
+## 1. Automated tests & static verification (post-P10 edits)
 
-Ran `.venv\Scripts\pytest.exe -v` after all code and script edits (`234.56 s` / `0:03:54`): **143 passed, 0 failed, 0 skipped** (`99` dependency deprecation warnings from `langsmith` and `sounddevice`).
-*(Observation note: in an immediately preceding full-suite run, `tests/test_live.py::test_live_thinking_model_never_exposes_reasoning` once returned an empty non-thinking answer from `qwen3:4b` under tight host RAM before passing both individually in `47.71 s` and across the full post-edit `143/143` suite run without relaxed assertions.)*
+Ran `.venv\Scripts\pytest.exe -v` after all P10 code edits (`187.01 s` / `0:03:07`): **156 passed, 1 skipped, 0 failed** (`99` external dependency deprecation warnings from `langsmith` and `sounddevice`; the single skipped test is `@pytest.mark.pg` `test_live_postgres_pgvector_crud_hnsw_expiry_and_migration`, skipped because `JARVIS_PG_TEST_URL` is not configured).
 
 | File | Tests | Result | Scope |
 |---|---|---|---|
-| `tests/test_ai_os_agents_workforce_dr.py` | 6 | 6 passed | Document Engine (`PDF`/`DOCX`/`PPTX`/`XLSX` + spreadsheet formula neutralization), Reminders & Calendar/Email ports, LangGraph + real Git worktree + QA `pytest` + human approval interrupt & cross-restart DB resume, dev diff secret scanner blocking, 3-2-1 ZIP+SHA-256+AES-256-GCM DR verify & tamper detection, `/api/v2/*` & built React `dist/` zero-CDN check |
-| `tests/test_ai_os_memory_decision_gateway.py` | 5 | 5 passed | Unicode Malayalam tokenization & PII/secret firewall, Windows DPAPI + portable PBKDF2 AES-256-GCM vault roundtrip, 5-way memory scope isolation & legacy JSONL migrator, 3-layer DecisionEngine & ModelGateway Local Mode blocking, read-only learning overview, TTS cache LRU pruning, & dynamic FastAPI DI |
-| `tests/test_api.py` | 20 | 20 passed | Health, status, chat/SSE streaming, history, model switching, memory/notes/graph CRUD, config validation, CSRF/Host/Origin/CSP guards, private file 404s, offline enforcement, zero CDN URLs in `viewer/` |
-| `tests/test_brain.py` | 6 | 6 passed | Streaming, `<think>` filtering, error handling, model load/unload, Ollama `tool_calls` parsing & `ToolsUnsupportedError` |
-| `tests/test_continuous_voice.py` | 16 | 16 passed | Continuous two-turn lifecycle & automatic `RESUMING -> LISTENING` restart strictly after `Speaker.wait_idle`, half-duplex mic suspension, Stop/Pause/Resume, verified full-duplex NLMS AEC & barge-in frame preservation, unverified AEC fallback, PTT/Wake follow-up, `StreamingSpeechBuffer`, streaming LLM->TTS chunks (`1 -> 2 -> 3`), BT device handling & recovery |
-| `tests/test_core.py` | 13 | 13 passed | Settings validation/overrides, notes indexing/CRUD/safe trash, graph links, retrieval ranking, history persistence, persona budget/KV prefix |
-| `tests/test_intent_and_tasks.py` | 4 | 4 passed | Multi-step `TaskManager` lifecycle/cancel, ambiguous switch clarification, history/stop routing, one-shot `push_to_talk()` preserving continuous/wake settings |
-| `tests/test_internet_security.py` | 25 | 25 passed | Default Local Mode blocking, scoped `audit.py` enforcement, SSRF/IP/redirect/DNS-rebinding guards, providers/caching/rate limit/robots, API key safety, tool calling & fallback (includes 16 parametrized invalid/private URL cases) |
-| `tests/test_learning_and_training.py` | 6 | 6 passed | Incremental versioned KB & Local Mode remote blocking, secret/corrupt filter, feedback approval/lesson retrieval, safe zip/SHA-256/license/poisoning/leakage dataset pipeline, GTX 1650 VRAM estimation, blocked training worker diagnostics & lifecycle, 12-category evaluator regression gate, model registry & atomic rollback, `/api/learning/*` endpoints |
-| `tests/test_live.py` | 8 | 8 passed | Real Ollama connectivity, streaming identity, multi-turn context, live model switching, thinking filter, E2E wake->hear->think->speak chain, loopback bind (`127.0.0.1:11434`), live Qwen translation & tool calling |
-| `tests/test_memory_and_filesystem.py` | 5 | 5 passed | 6-category personal memory (duplicates, secret rejection, pending confirmation, update/delete/export/backup/restore), >400-turn disk `History.search_disk`, allowlisted file/folder/ext/content search, `.env`/traversal blocking, soft `.trash` delete, permission tiers (`READ..SYSTEM`) & confirmation tokens |
-| `tests/test_models_and_voices.py` | 5 | 5 passed | Piper voice discovery/hot-switch/rate, gated cloud Local Mode rejection, gated `safe_request` routing when enabled, model alias resolution, independent runtime model vs voice switching |
-| `tests/test_multilingual_stt.py` | 7 | 7 passed | Polyphase resampling & DC removal, local Whisper models, English/auto detection, Malayalam/Hindi routing & `.en` rejection (mocked model), short-utterance VAD, separated transcription vs translation, transcript preservation API |
-| `tests/test_preflight.py` | 4 | 4 passed | Preflight helpers, config safety, 30 sample notes integrity |
-| `tests/test_speech.py` | 13 | 13 passed | Speech cleaning, sentence chunking, WAV parsing, speaker immediate stop, mocked + real mic loop, Piper synth/pool & cache, Whisper roundtrip, wake word (`Hey Jarvis`), real playback & stop |
+| `tests/test_ai_os_agents_workforce_dr.py` | 6 | 6 passed | Document Engine (`PDF`/`DOCX`/`PPTX`/`XLSX`), Reminders/Calendar/Email, LangGraph + Git worktree + interrupt/restart resume, diff secret scan, DR backup/tamper, `/api/v2/*` & dist compliance |
+| `tests/test_ai_os_memory_decision_gateway.py` | 5 | 5 passed | Unicode Malayalam tokenization & PII/secret firewall, DPAPI + AES-256-GCM vault, 5-way memory & legacy migrator, 3-layer DecisionEngine & gateway guard, overview read-only / TTS prune / DI |
+| `tests/test_p10_workforce_safety.py` | 5 | 5 passed | State machine transition guard, failed QA/exhausted retries halt before approval/merge, untracked `.env`/binary/symlink manifest scan without leaking raw secret, post-review diff invalidation, worktree collision/ownership/uncommitted cleanup guard, `ExecutionPolicy` deny list |
+| `tests/test_p10_pgvector_memory.py` | 5 | 4 passed, 1 skipped | Embedding normalization & dimension mismatch guard, vector+SQL expiry & purge, full lifecycle CRUD/duplicates/supersession/audit/ranking, PgVector DB-side SQL operators & 1,000-vector SQLite benchmark + migration; live `@pytest.mark.pg` test skipped cleanly without `JARVIS_PG_TEST_URL` |
+| `tests/test_p10_dr_gateway_learning.py` | 4 | 4 passed | Encrypted `.jvault` backup/HMAC tamper detection/full isolated directory restore/retention, real chunked SSE streaming/paid-model lock/central firewall/breaker/cancellation/`ResourceGovernor`, KB license/poisoning/cross-dedup/auto-promote block/remote training spec, `/api/v2/*` CRUD & CSRF |
+| `tests/test_api.py` | 20 | 20 passed | Health, status, chat/SSE streaming, history, model switch, memory/notes/graph, config, CSRF/Host/Origin/CSP, offline enforcement, zero CDN URLs in `viewer/` |
+| `tests/test_brain.py` | 6 | 6 passed | Streaming, `<think>` filter, friendly errors, unload/no-pull, Ollama `tool_calls`, thinking-budget fallback |
+| `tests/test_continuous_voice.py` | 16 | 16 passed | Continuous voice two-turn loop, Stop/Pause/Resume, half-duplex suspension, NLMS AEC fallback, barge-in, streaming chunks, BT handling |
+| `tests/test_core.py` | 13 | 13 passed | Settings/overrides, notes CRUD/trash/graph, retrieval ranking, history, persona budget |
+| `tests/test_intent_and_tasks.py` | 4 | 4 passed | `TaskManager`, clarification prompts, history/stop routing, one-shot PTT |
+| `tests/test_internet_security.py` | 25 | 25 passed | Local Mode enforcement, SSRF/IP/redirect/DNS-rebinding guards, providers/rate limit/robots, key redaction, tool calling |
+| `tests/test_learning_and_training.py` | 6 | 6 passed | Knowledge versioning & offline block, dataset validation/cleaning, 12-cat evaluator, feedback store, training lifecycle/registry/rollback |
+| `tests/test_live.py` | 8 | 8 passed | Live Ollama connectivity, streaming identity, context, model switch, thinking safety, E2E wake->hear->think->speak, `127.0.0.1:11434` bind, live Qwen translation & tools |
+| `tests/test_memory_and_filesystem.py` | 5 | 5 passed | Personal memory CRUD/backup/restore, disk history search, allowlisted FS bounds & soft delete, permission tiers |
+| `tests/test_models_and_voices.py` | 5 | 5 passed | Piper discovery/hot-switch, gated cloud Local Mode rejection & `safe_request`, aliases, independent model vs voice switch |
+| `tests/test_multilingual_stt.py` | 7 | 7 passed | Polyphase resampling, Whisper local models, EN/ML/HI routing, short VAD, transcript vs translation preservation |
+| `tests/test_preflight.py` | 4 | 4 passed | Preflight helpers, config safety, 30 sample notes |
+| `tests/test_speech.py` | 13 | 13 passed | Speech cleaning, chunking, WAV parsing, speaker stop, mic loop, Piper cache, Whisper roundtrip, wake word, real playback/mic |
 
 ### Static checks, builds, migrations & dependency audit (post-edit)
 
 | Check | Result | Scope & Evidence |
 |---|---|---|
-| `ruff check` (scoped to `server.py`, `preflight.py`, `drill.py`, P1–P7 packages, modified `jarvis/` modules, and P0–P9 tests) | **Passed** | `All checks passed!` (untouched legacy modules outside this scope retain pre-existing style items). |
-| `mypy --follow-imports=silent` (55 new & modified P0–P9 source files) | **Passed** | `Success: no issues found in 55 source files` (checking transitive legacy files such as `sysinfo.py`/`stt.py`/`actions.py`/`search.py`/`aec.py`/`tts.py`/`assistant.py` without `--follow-imports=silent` surfaces pre-existing untyped/legacy type issues). |
-| `pip check` & `pip-audit --local` | **Passed** | `No broken requirements found.` and `No known vulnerabilities found`. |
-| Alembic migration roundtrip (isolated temp SQLite DB) | **Passed** | `alembic upgrade head -> downgrade base -> upgrade head` exited `0,0,0`. |
-| React + TypeScript frontend (`apps/frontend`: `npm run build`) | **Passed** | `tsc --noEmit && vite build` transformed `33` modules cleanly in `735 ms` (`dist/assets/index-DUIc-MgF.css` `3.87 kB`, `dist/assets/index-CLQVuPlQ.js` `162.15 kB`). |
+| `ruff check` (P10 created/modified modules, scripts & tests) | **Passed** | `All checks passed!` |
+| `mypy --follow-imports=silent` (58 P0–P10 source files) | **Passed** | `Success: no issues found in 58 source files` |
+| `pip check` & `pip-audit --local` | **Passed** | `No broken requirements found.` and `No known vulnerabilities found` |
+| Alembic migration roundtrip (temp SQLite DB) | **Passed** | `alembic upgrade head -> downgrade base -> upgrade head` exited `0,0,0` (`0001_initial_schema` -> `0002_p10_hardening`) |
+| React + TypeScript frontend (`apps/frontend`: `npm run build`) | **Passed** | `tsc --noEmit && vite build` transformed `35` modules in `783 ms` (`dist/assets/index-DaALhkLZ.js` `173.15 kB`) |
 
-**Live system verification (`preflight.py` & `drill.py`)**: Ran against the live upgraded server on `127.0.0.1:4700` — **`32 pass, 0 fail, 2 warn`** (exit `0`; warnings for host free RAM `1.2 GB` while Ollama held models and optional `torch`/`transformers`/`peft` training packages not installed locally). Latency budget: `hear 1.4s` (`7/8` words), `think 7.1s` (`20.0 tok/s`, TTFT `3.51s`), `speak 0.3s` (`0.33s`, `243,756` bytes WAV) → **`8.9 s` total**. Live HTTP checks verified exact SHA-256 disk-to-HTTP parity for both `apps/frontend/dist/index.html` at `/` and legacy `/legacy/` (`8` files), `/api/v2/system/overview` schema (`['backups', 'db', 'documents', 'gateway', 'memory', 'pending_approvals', 'projects', 'reminders', 'runs']`), personal memory store, safe filesystem search, HTTP 403 traversal guard, Piper voice discovery, learning overview, model registry (`baseline-v1`), `0` external URLs across `viewer/` & `apps/frontend/dist/`, and Local Mode blocking of `/api/learning/datasets/discover` (HTTP `503`) with `0` non-local hosts in server logs and OS `netstat`.
-
-## 2. Live internet tests (unmocked — pre-P0–P9 baseline check)
+**Live system verification (`preflight.py` & `drill.py`)**: Ran against live `server.py` on `127.0.0.1:4700` — **`33 pass, 0 fail, 1 warn`** (exit `0`; single warning for optional `torch`/`transformers`/`peft` packages not installed locally). Latency budget: `hear 1.3s` (`8/8` words), `think 9.5s` (`21.4 tok/s`, TTFT `6.14s`), `speak 0.4s` (`0.44s`, `265,772` bytes WAV) → **`11.2 s` total**. Offline drill: `0` external references across `viewer/` & `apps/frontend/dist/`, `0` non-local hosts in server logs and OS `netstat`, watcher blocked `api.anthropic.com`, and `/api/v2/system/overview` passed.
 
 Executed directly against live external HTTPS endpoints with Online Assisted Mode enabled (`POST /api/internet/mode {"enabled": true}`):
 

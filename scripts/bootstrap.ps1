@@ -1,19 +1,22 @@
 <#
 .SYNOPSIS
-    Replacement-machine bootstrap script for Jarvis AI OS (Windows).
+    Replacement-machine bootstrap & disaster recovery script for Jarvis AI OS (Windows).
 .DESCRIPTION
-    Checks Python, Node, Git, Ollama, Graphify, OpenCode, installs Python dependencies,
-    verifies optional encrypted DR bundle restoration, and runs preflight checks.
+    1. Checks prerequisites (Python, Node, Git, Ollama, Graphify, OpenCode, optional PostgreSQL tools).
+    2. Sets up Python `.venv` and offline React frontend dist bundle.
+    3. Verifies and restores encrypted DR bundle (`secrets`, `settings.json`, DB/SQLite or PG, memory, notes, documents).
+    4. Runs Alembic migrations, rebuilds Graphify project graphs when registered, and runs `preflight.py`.
 #>
 param(
     [string]$RestoreBundle = "",
-    [string]$Passphrase = ""
+    [string]$Passphrase = "",
+    [string]$PostgresUrl = ""
 )
 
 $ErrorActionPreference = "Stop"
-Write-Host "=== Jarvis Replacement-Machine Bootstrap ===" -ForegroundColor Cyan
+Write-Host "=== Jarvis Replacement-Machine Bootstrap & Recovery ===" -ForegroundColor Cyan
 
-foreach ($cmd in @("python", "git", "node", "npm", "ollama", "opencode", "graphify")) {
+foreach ($cmd in @("python", "git", "node", "npm", "ollama", "opencode", "graphify", "pg_dump", "pg_restore")) {
     if (Get-Command $cmd -ErrorAction SilentlyContinue) {
         Write-Host "[OK] Found $cmd" -ForegroundColor Green
     } else {
@@ -36,25 +39,35 @@ if (Test-Path "apps\frontend\package.json") {
     Pop-Location
 }
 
+if ($PostgresUrl) {
+    $env:JARVIS_DATABASE_URL = $PostgresUrl
+    .\.venv\Scripts\alembic.exe -c alembic.ini upgrade head
+}
+
 if ($RestoreBundle -and $Passphrase) {
-    Write-Host "Verifying and restoring encrypted DR secrets & manifest from $RestoreBundle..." -ForegroundColor Cyan
+    Write-Host "Running isolated DR verify + full restore from $RestoreBundle..." -ForegroundColor Cyan
     .\.venv\Scripts\python.exe -c "
 from pathlib import Path
-from jarvis.config import DATA, SECRETS_PATH, load_settings
+from jarvis.config import DATA, SECRETS_PATH, ROOT, load_settings
 from jarvis.db.engine import DatabaseManager
 from jarvis.recovery.backup import DisasterRecoveryManager
+
 s = load_settings()
-db = DatabaseManager(s.database.url, data_dir=DATA)
+db = DatabaseManager(r'$PostgresUrl' or s.database.url, data_dir=DATA)
 db.init_schema_sync()
 dr = DisasterRecoveryManager(db, s, data_dir=DATA, secrets_path=SECRETS_PATH)
-rep = dr.verify_backup(Path(r'$RestoreBundle'), passphrase=r'$Passphrase')
-print('Verify report:', rep)
-dr.restore_secrets_from_bundle(Path(r'$RestoreBundle'), passphrase=r'$Passphrase')
-print('Secrets restored safely.')
+res = dr.restore_to_directory(
+    Path(r'$RestoreBundle'),
+    passphrase=r'$Passphrase',
+    target_data_dir=DATA,
+    target_notes_dir=ROOT / 'notes',
+    target_pg_url=r'$PostgresUrl' or None,
+)
+print('Recovery Report:', res)
+db.sync_engine.dispose()
 "
 }
 
 Write-Host "Running Jarvis preflight verification..." -ForegroundColor Cyan
 .\.venv\Scripts\python.exe preflight.py
-Write-Host "=== Bootstrap Complete ===" -ForegroundColor Green
-
+Write-Host "=== Bootstrap & Recovery Complete ===" -ForegroundColor Green

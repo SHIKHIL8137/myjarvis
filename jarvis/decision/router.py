@@ -1,22 +1,40 @@
-"""Layer 3 Capability & Policy Router + Unified DecisionEngine facade."""
+"""Layer 3 Capability & Policy Router respecting free-cloud preference & paid-model restrictions."""
 from ..config import Settings, has_provider_api_key
 from .classifier import LLMJsonFn, classify_intent
-from .rules import evaluate_layer1
 from .schemas import DecisionEnvelope, RoutingPlan
+from .rules import evaluate_layer1
 
 
 class DecisionEngine:
-    """3-Layer Fast Decision Engine (L1 Deterministic -> L2 Classifier -> L3 Capability Route)."""
+    """3-Layer Fast Decision Engine (L1 Deterministic -> L2 Classifier -> L3 Capability/Cost Route)."""
 
     def __init__(self, settings: Settings):
         self.settings = settings
 
+    def _cloud_chain(self) -> list[str]:
+        p = self.settings.providers
+        if not (not self.settings.offline_enforced and self.settings.internet.enabled and p.allow_cloud):
+            return []
+        paid_set = {x.lower() for x in p.paid_providers}
+        chain: list[str] = []
+
+        # Free cloud providers FIRST (never silently route to paid models!)
+        if has_provider_api_key("openrouter") and (p.openrouter_model.endswith(":free") or p.allow_paid_models):
+            chain.append(f"openrouter:{p.openrouter_model}")
+        if has_provider_api_key("gemini") and ("gemini" not in paid_set or p.allow_paid_models):
+            chain.append(f"gemini:{p.gemini_model}")
+        if has_provider_api_key("huggingface") and ("huggingface" not in paid_set or p.allow_paid_models):
+            chain.append(f"huggingface:{p.huggingface_model}")
+
+        # Paid providers ONLY when explicitly authorized via providers.allow_paid_models=True
+        if p.allow_paid_models:
+            if has_provider_api_key("anthropic"):
+                chain.append(f"anthropic:{p.anthropic_model}")
+            if has_provider_api_key("openai"):
+                chain.append(f"openai:{p.openai_model}")
+        return chain
+
     def route_for_decision(self, env: DecisionEnvelope) -> RoutingPlan:
-        online_cloud = bool(
-            not self.settings.offline_enforced
-            and self.settings.internet.enabled
-            and self.settings.providers.allow_cloud
-        )
         local_default = self.settings.boot_brain
         local_think = "local_thinking" if "local_thinking" in self.settings.brains else local_default
 
@@ -36,21 +54,9 @@ class DecisionEngine:
                 agent_role="system",
             )
 
+        cloud = self._cloud_chain()
         if env.department == "dev":
-            chain: list[str] = []
-            if online_cloud:
-                p = self.settings.providers
-                if has_provider_api_key("openrouter"):
-                    chain.append(f"openrouter:{p.openrouter_model}")
-                if has_provider_api_key("anthropic"):
-                    chain.append(f"anthropic:{p.anthropic_model}")
-                if has_provider_api_key("openai"):
-                    chain.append(f"openai:{p.openai_model}")
-                if has_provider_api_key("gemini"):
-                    chain.append(f"gemini:{p.gemini_model}")
-                if has_provider_api_key("huggingface"):
-                    chain.append(f"huggingface:{p.huggingface_model}")
-            chain.extend([local_think, local_default])
+            chain = cloud + [local_think, local_default]
             return RoutingPlan(
                 decision=env,
                 workflow="workforce_graph",
@@ -61,9 +67,7 @@ class DecisionEngine:
             )
 
         if env.department == "assistant" or env.needs_live_web:
-            chain = [local_think if env.complexity == "complex_reasoning" else local_default]
-            if online_cloud and has_provider_api_key("gemini"):
-                chain.append(f"gemini:{self.settings.providers.gemini_model}")
+            chain = [local_think if env.complexity == "complex_reasoning" else local_default] + cloud
             return RoutingPlan(
                 decision=env,
                 workflow="assistant_graph",
@@ -91,4 +95,3 @@ class DecisionEngine:
             confidence_threshold=self.settings.gateway.classifier_confidence_threshold,
         )
         return self.route_for_decision(env)
-

@@ -279,3 +279,63 @@ async def safe_request(
     audit.record_external("redirect_block", sanitize_url(current_url), urlsplit(current_url).hostname or "", False, "too many redirects")
     raise NetworkSecurityError(f"exceeded maximum redirects ({spec.max_redirects})")
 
+
+async def safe_stream_lines(
+    method: str,
+    url: str,
+    spec: InternetSpec,
+    *,
+    allowed_hosts: Iterable[str] | None = None,
+    params: dict | None = None,
+    json_body: dict | None = None,
+    headers: dict[str, str] | None = None,
+    max_bytes: int | None = None,
+    transport_factory=None,
+):
+    """Stream SSE/line-delimited HTTPS responses line-by-line under the exact same offline & SSRF protections."""
+    if not spec.enabled or not audit.is_online_enabled():
+        audit.record_external("offline_block", sanitize_url(url), urlsplit(url).hostname or "", False, "internet disabled")
+        raise NetworkSecurityError("Jarvis is in Local Mode (internet access is disabled).")
+
+    limit_bytes = max_bytes or (spec.max_fetch_bytes * 4)
+    timeout = httpx.Timeout(spec.timeout_s, connect=min(4.0, spec.timeout_s))
+    req_headers = {"User-Agent": "JarvisLocalAssistant/1.0 (https://127.0.0.1)", **(headers or {})}
+
+    current_url = str(httpx.URL(url, params=params)) if params else url
+    if transport_factory is not None:
+        host, _ = _validate_url_syntax(current_url)
+        if allowed_hosts is not None:
+            allow = {h.rstrip(".").lower() for h in allowed_hosts if h}
+            if host not in allow:
+                raise NetworkSecurityError(f"host {host!r} is not in the approved allowlist")
+        target = ValidatedTarget(current_url, sanitize_url(current_url), host, 443, ("93.184.216.34",), "93.184.216.34")
+        transport = transport_factory(target)
+    else:
+        target = resolve_and_validate(current_url, allowed_hosts=allowed_hosts)
+        transport = _PinnedTransport(target)
+
+    total = 0
+    try:
+        async with httpx.AsyncClient(transport=transport, timeout=timeout, follow_redirects=False, trust_env=False) as client:
+            req_kwargs: dict[str, Any] = {"headers": req_headers}
+            if json_body is not None and method.upper() == "POST":
+                req_kwargs["json"] = json_body
+            async with client.stream(method, current_url, **req_kwargs) as resp:
+                if resp.status_code >= 400:
+                    err_body = (await resp.aread()).decode("utf-8", errors="replace")[:320]
+                    audit.record_external(method.upper(), target.sanitized_url, target.host, False, f"http_{resp.status_code}", resp.status_code)
+                    raise NetworkSecurityError(f"HTTP {resp.status_code}: {err_body}")
+                async for line in resp.aiter_lines():
+                    total += len(line.encode("utf-8", errors="replace")) + 1
+                    if total > limit_bytes:
+                        audit.record_external("size_block", target.sanitized_url, target.host, False, f"sse > {limit_bytes}", resp.status_code, total)
+                        raise NetworkSecurityError(f"stream exceeded max size ({limit_bytes} bytes)")
+                    yield line
+                audit.record_external(method.upper(), target.sanitized_url, target.host, True, f"stream ip={target.pinned_ip}", resp.status_code, total)
+    except NetworkSecurityError:
+        raise
+    except httpx.HTTPError as e:
+        audit.record_external("http_error", target.sanitized_url, target.host, False, f"{type(e).__name__}: {e}")
+        raise
+
+

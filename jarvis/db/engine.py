@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 from typing import AsyncIterator
 
-from sqlalchemy import create_engine, event, text
+from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -12,6 +12,33 @@ from ..config import DATA
 from .models import Base
 
 log = logging.getLogger("jarvis.db")
+
+_P10_COLUMN_DDLS: dict[str, list[tuple[str, str]]] = {
+    "personal_memories": [
+        ("namespace", "VARCHAR(48) NOT NULL DEFAULT 'personal_memory'"),
+        ("owner_scope", "VARCHAR(64) NOT NULL DEFAULT 'default'"),
+        ("project_id", "VARCHAR(36)"),
+        ("meta", "TEXT NOT NULL DEFAULT '{}'"),
+        ("privacy_level", "VARCHAR(24) NOT NULL DEFAULT 'private'"),
+        ("embedding_model", "VARCHAR(120) NOT NULL DEFAULT 'hash-v1:256'"),
+        ("archived", "BOOLEAN NOT NULL DEFAULT FALSE"),
+        ("deleted_at", "FLOAT"),
+        ("superseded_by", "VARCHAR(32)"),
+        ("supersedes_id", "VARCHAR(32)"),
+    ],
+    "projects": [
+        ("privacy_level", "VARCHAR(24) NOT NULL DEFAULT 'private'"),
+    ],
+    "vector_entries": [
+        ("memory_type", "VARCHAR(32) NOT NULL DEFAULT 'fact'"),
+        ("source", "VARCHAR(64) NOT NULL DEFAULT 'system'"),
+        ("confidence", "FLOAT NOT NULL DEFAULT 1.0"),
+        ("privacy_level", "VARCHAR(24) NOT NULL DEFAULT 'private'"),
+        ("embedding_model", "VARCHAR(120) NOT NULL DEFAULT 'hash-v1:256'"),
+        ("expires_at", "FLOAT"),
+        ("created_at", "FLOAT NOT NULL DEFAULT 0.0"),
+    ],
+}
 
 
 def resolve_database_urls(configured_url: str = "", data_dir: Path | None = None) -> tuple[str, str]:
@@ -44,6 +71,22 @@ def _attach_sqlite_pragmas(engine) -> None:
             cur.close()
 
 
+def _reconcile_columns_sync(conn) -> None:
+    """Safely add newly introduced P10 columns to existing databases created prior to Alembic upgrade."""
+    insp = inspect(conn)
+    existing_tables = set(insp.get_table_names())
+    is_pg = conn.dialect.name == "postgresql"
+    for tbl, cols in _P10_COLUMN_DDLS.items():
+        if tbl not in existing_tables:
+            continue
+        have = {c["name"] for c in insp.get_columns(tbl)}
+        for cname, ddl in cols:
+            if cname in have:
+                continue
+            pg_ddl = ddl.replace("TEXT NOT NULL DEFAULT '{}'", "JSONB NOT NULL DEFAULT '{}'::jsonb") if (is_pg and cname == "meta") else ddl
+            conn.execute(text(f"ALTER TABLE {tbl} ADD COLUMN {cname} {pg_ddl}"))
+
+
 class DatabaseManager:
     """Lifecycle owner for SQLAlchemy async + sync engines, migrations, and health status."""
 
@@ -51,6 +94,7 @@ class DatabaseManager:
         self.async_url, self.sync_url = resolve_database_urls(configured_url, data_dir=data_dir)
         self.is_postgres = self.sync_url.startswith("postgresql")
         self.pgvector_available = False
+        self.pgvector_version = ""
 
         self.sync_engine = create_engine(self.sync_url, echo=echo, future=True)
         if not self.is_postgres:
@@ -62,26 +106,30 @@ class DatabaseManager:
         self.async_session = async_sessionmaker(self.async_engine, class_=AsyncSession, expire_on_commit=False)
         self.sync_session = sessionmaker(self.sync_engine, class_=Session, expire_on_commit=False)
 
+    def _probe_pgvector_sync(self, conn) -> None:
+        if not self.is_postgres:
+            return
+        try:
+            conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+            ver = conn.execute(text("SELECT extversion FROM pg_extension WHERE extname = 'vector'")).scalar()
+            self.pgvector_available = True
+            self.pgvector_version = str(ver or "")
+        except Exception as e:
+            self.pgvector_available = False
+            log.warning("PostgreSQL vector extension skipped/unavailable: %s", e)
+
     def init_schema_sync(self) -> None:
-        """Create schema tables idempotently (works in tests/dev; Alembic runs for versioned upgrades)."""
-        if self.is_postgres:
-            try:
-                with self.sync_engine.begin() as conn:
-                    conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-                    self.pgvector_available = True
-            except Exception as e:
-                log.warning("PostgreSQL vector extension skipped/unavailable: %s", e)
-        Base.metadata.create_all(self.sync_engine)
+        """Create schema tables and reconcile newly added columns idempotently."""
+        with self.sync_engine.begin() as conn:
+            self._probe_pgvector_sync(conn)
+            Base.metadata.create_all(conn)
+            _reconcile_columns_sync(conn)
 
     async def init_schema(self) -> None:
         async with self.async_engine.begin() as conn:
-            if self.is_postgres:
-                try:
-                    await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-                    self.pgvector_available = True
-                except Exception as e:
-                    log.warning("PostgreSQL vector extension skipped/unavailable: %s", e)
+            await conn.run_sync(self._probe_pgvector_sync)
             await conn.run_sync(Base.metadata.create_all)
+            await conn.run_sync(_reconcile_columns_sync)
 
     async def session(self) -> AsyncIterator[AsyncSession]:
         async with self.async_session() as s:
@@ -95,6 +143,7 @@ class DatabaseManager:
                 "up": True,
                 "dialect": "postgresql" if self.is_postgres else "sqlite",
                 "pgvector": self.pgvector_available,
+                "pgvector_version": self.pgvector_version or None,
             }
         except Exception as e:
             return {"up": False, "dialect": "postgresql" if self.is_postgres else "sqlite", "error": str(e)}
@@ -102,4 +151,3 @@ class DatabaseManager:
     async def close(self) -> None:
         await self.async_engine.dispose()
         self.sync_engine.dispose()
-

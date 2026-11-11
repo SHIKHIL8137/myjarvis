@@ -327,7 +327,7 @@ class Brain:
         self.last_stats = {"ttft": time.time() - t0, "tokens": len(txt.split()), "tps": 0.0, "total": time.time() - t0, "model": self.spec.model, "truncated": False}
         yield {"type": "token", "text": txt}
 
-    async def stream_events(self, messages: list[dict], tools: list[dict] | None = None) -> AsyncIterator[dict]:
+    async def stream_events(self, messages: list[dict], tools: list[dict] | None = None, *, _allow_think_fallback: bool = True) -> AsyncIterator[dict]:
         """Stream `/api/chat` (or gated cloud provider) yielding {"type": "token", "text"} and {"type": "tool_calls", "calls"}."""
         if self.provider in ("openai", "anthropic", "openrouter", "gemini", "huggingface"):
             async for ev in self._cloud_complete(self.provider, messages):
@@ -335,8 +335,12 @@ class Brain:
             return
         flt, t0, first = ThinkFilter(), time.time(), None
         collected_calls: list[dict] = []
+        saw_visible = False
+        body = self._body(messages, True, tools=tools)
+        if not _allow_think_fallback:
+            body["think"] = False
         try:
-            async with self.client.stream("POST", self.host + "/api/chat", json=self._body(messages, True, tools=tools)) as r:
+            async with self.client.stream("POST", self.host + "/api/chat", json=body) as r:
                 if r.status_code == 404:
                     raise BrainError(f"Model {self.spec.model!r} not found in Ollama. Run `ollama pull {self.spec.model}`.")
                 if r.status_code == 400 and tools:
@@ -369,6 +373,7 @@ class Brain:
                             })
                     piece = flt.feed(msg.get("content", ""))  # `thinking` field intentionally ignored
                     if piece:
+                        saw_visible = True
                         first = first or time.time() - t0
                         yield {"type": "token", "text": piece}
                     if c.get("done"):
@@ -389,9 +394,14 @@ class Brain:
             raise BrainError(f"Ollama request failed ({type(e).__name__}). Is Ollama running?") from e
         tail = flt.flush()
         if tail:
+            saw_visible = True
             yield {"type": "token", "text": tail}
         if collected_calls:
             yield {"type": "tool_calls", "calls": collected_calls}
+        elif _allow_think_fallback and self.spec.thinking and not saw_visible and self.last_stats.get("truncated"):
+            # Thinking model spent entire token budget in internal `thinking`; retry once with `think=False` cleanly
+            async for ev in self.stream_events(messages, tools=tools, _allow_think_fallback=False):
+                yield ev
 
     async def stream(self, messages: list[dict]) -> AsyncIterator[str]:
         async for ev in self.stream_events(messages):

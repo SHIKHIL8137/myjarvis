@@ -1,26 +1,119 @@
 # Jarvis — Local-First Personal AI Assistant & Multi-Agent OS
 
-Jarvis runs local-first on Windows (Ollama local LLM inference, `faster-whisper` multilingual STT, Piper TTS, `"Hey Jarvis"` wake word via openWakeWord, NLMS echo cancellation + safe half-duplex mic loop), with optional explicit **Online Assisted Mode**, **Multi-Model Gateway**, **5-Way Memory + Learning Pipeline**, **Dev Workforce (Graphify + OpenCode + Git Worktrees)**, and **3-2-1 Disaster Recovery**.
+Jarvis runs local-first on Windows (Ollama local LLM inference, `faster-whisper` multilingual STT, Piper TTS, `"Hey Jarvis"` wake word via openWakeWord, NLMS echo cancellation + safe half-duplex mic loop), hardened in P10 with Worktree QA/Security gates, PostgreSQL + native `pgvector` vector search, streaming Model Gateway with circuit breakers & central PII firewall, controlled Knowledge/Model Learning, React Owner Control Center, and complete 3-2-1 Disaster Recovery.
 
-```powershell
-.\start-jarvis.ps1      # starts the backend on http://127.0.0.1:4700/
-.\stop-jarvis.ps1       # stops it cleanly (Ollama stays untouched)
-```
+---
 
-## Key Modes & Guarantees
+## 1. Starting Jarvis
 
-- **Local Mode (default)**: `sys.addaudithook` blocks all non-loopback sockets; Ollama binds to `127.0.0.1:11434`.
-- **Online Assisted Mode (explicit opt-in)**: IP-pinned HTTPS (`netsec.py`), redirect & SSRF blocking, outbound secret/PII firewall, and external audit logging.
-- **Two Departments**:
-  - **Personal Assistant**: Voice conversation, multilingual translation, 5-way memory separation, PDF/DOCX/PPTX/XLSX generation & parsing, reminders/email/calendar ports.
-  - **AI Development Workforce**: Multi-project registry, Graphify architecture graphs, OpenCode delegated execution inside isolated Git worktrees, QA test verification, and `EXECUTE` approval gates.
+### Prerequisites
 
-## Quick Verification
+- **Windows 10/11**, **Python 3.12+** (tested on Python `3.14.6`), **Node 20+** (`v24.16.0`), **Git**
+- **Ollama** bound to `127.0.0.1:11434` (`OLLAMA_HOST=127.0.0.1:11434`) with default local models pulled:
+  ```powershell
+  ollama pull qwen3:4b-instruct
+  ollama pull qwen3:4b
+  ```
+- Optional external CLIs for Dev Workforce / PG DB: `opencode`, `graphify`, `pg_dump`, `pg_restore`, `docker`
+
+### Start & Stop Commands
+
+1. **Start Local Ollama** (loopback only):
+   ```powershell
+   $env:OLLAMA_HOST = "127.0.0.1:11434"
+   ollama serve
+   ```
+2. **Start Backend + Prebuilt Frontend (`http://127.0.0.1:4700/`)**:
+   ```powershell
+   .\start-jarvis.ps1      # starts FastAPI + React Control Center on 127.0.0.1:4700
+   .\stop-jarvis.ps1       # stops Jarvis cleanly without stopping Ollama
+   ```
+3. **Rebuild Frontend (optional development)**:
+   ```powershell
+   Push-Location apps\frontend
+   npm ci
+   npm run build
+   Pop-Location
+   ```
+
+---
+
+## 2. Database Setup (SQLite Default or PostgreSQL + `pgvector`)
+
+- **Default Local Mode**: Uses SQLite WAL at `data/jarvis.db` automatically when `JARVIS_DATABASE_URL` and `database.url` are empty.
+- **PostgreSQL + `pgvector` Production Mode**:
+  1. Start PostgreSQL with `pgvector` installed (either local PostgreSQL 18 + `vector` extension or `docker compose -f deploy/docker-compose.db.yml up -d`).
+  2. Set the connection string in environment and run Alembic migrations:
+     ```powershell
+     $env:JARVIS_DATABASE_URL = "postgresql+psycopg://jarvis:<password>@127.0.0.1:5432/jarvis"
+     .\.venv\Scripts\alembic.exe -c alembic.ini upgrade head
+     ```
+  3. To transfer existing SQLite data non-destructively into PostgreSQL (`ID`, timestamps, namespaces, `project_id`, `expires_at`, and count verification), call `migrate_sqlite_to_postgres()` from `jarvis.memory.legacy_migrator`.
+
+---
+
+## 3. Model Gateway, Cloud Providers & Hardware Policy
+
+- **Paid-model lock**: `providers.allow_cloud=false` and `providers.allow_paid_models=false` by default. Free cloud options (e.g., `openrouter:*:free`, Gemini free tier, Hugging Face router) take priority when Online Assisted Mode is enabled; `openai` and `anthropic` require explicit `providers.allow_paid_models=true`.
+- **Secrets management**: Set API keys securely via the API/UI (`/api/internet/key`), stored DPAPI-encrypted at rest in gitignored `data/secrets.json`, or via env vars (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`, `GEMINI_API_KEY`, `HF_TOKEN`).
+- **Central PII/Secret Firewall**: Outbound external requests automatically redact API keys/credentials and block `confidential`/`restricted` project content unless explicitly authorized with an audited owner override.
+- **GTX 1650 (4 GB VRAM) Resource Limits**: `ResourceGovernor` serializes concurrent local heavy inference (`max_local_concurrency=1`) and bounds queue sizes (`max_queue_size=16`).
+
+---
+
+## 4. Workforce Safety & Execution Restrictions
+
+- **Mandatory Gates**: Coding runs execute inside isolated `git worktree` checkouts (`.jarvis_worktrees/<slug>`). Failed QA retries transition to `FAILED` and cannot enter merge approval; `BLOCKED` security scans (covering tracked diffs, staged, unstaged, untracked files, binary files, mode changes, and symlinks) block merge; any edit after review invalidates the `manifest_sha256` and requires fresh approval.
+- **Sandbox Policy**: `ExecutionPolicy` restricts working directory bounds, allowed/denied executables (`powershell`, `bash`, `curl`, etc. denied), and environment variables. On native Windows without `sandbox_backend="docker"`, OS-level network/filesystem namespace isolation is **not** provided (directory scoping + env allowlisting only). Enable `workforce.sandbox_backend="docker"` with Docker Desktop running for container isolation (`--network=none`).
+
+---
+
+## 5. Learning Pipeline & Model Registry
+
+- **Knowledge Base (RAG)** and **Model Weight Training** are separate subsystems:
+  - Remote documentation/Hugging Face knowledge sources require Online Assisted Mode, allowlisted hosts, verified permissive licenses (`allowed_licenses`), and prompt-injection screening (`detect_poisoning`), and are wrapped in `<retrieved_knowledge untrusted_data="true">` delimiters.
+  - Fine-tuning defaults to `automatic_training=false`, `require_training_approval=true`, `evaluation_required=true`, and `auto_promote=false`. Low-VRAM systems can export a verified off-device training spec via `TrainingManager.prepare_remote_delegation_bundle()`.
+
+---
+
+## 6. Environment Variable Reference
+
+| Variable | Purpose |
+|---|---|
+| `JARVIS_DATABASE_URL` | Optional SQLAlchemy DB URL (`postgresql+psycopg://...` or `sqlite:///...`) |
+| `JARVIS_PG_TEST_URL` | Optional live PostgreSQL + `pgvector` URL for `@pytest.mark.pg` integration tests |
+| `OLLAMA_HOST` | Loopback Ollama bind address (`127.0.0.1:11434`) |
+| `OPENROUTER_API_KEY` / `GEMINI_API_KEY` / `HF_TOKEN` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | Optional provider API keys (also storable in DPAPI-encrypted `data/secrets.json`) |
+
+---
+
+## 7. Backup & Complete New-Laptop Recovery
+
+1. **Create & Verify a Backup** (UI **RECOVERY** tab or `/api/v2/recovery/backup` + `/api/v2/recovery/verify`): captures SQLite/PostgreSQL dump (`pg_dump`), vector snapshots, 5-way memory, workflow checkpoints, project registry, encrypted `secrets.vault.enc`, `settings.json`, documents, knowledge DB, and optional Git bundles inside an AES-256-GCM `.jvault` archive with HMAC-SHA256 authenticity verification.
+2. **Recover on a New Laptop**:
+   ```powershell
+   git clone <repo-url> myjarvis
+   cd myjarvis
+   .\scripts\bootstrap.ps1 -RestoreBundle "D:\Backups\jarvis-tier2_warm-YYYYMMDD-HHMMSS.zip.jvault" -Passphrase "<passphrase>"
+   ```
+   Pass `-PostgresUrl "postgresql+psycopg://jarvis:<pw>@127.0.0.1:5432/jarvis"` if restoring into PostgreSQL. After bootstrap completes, inspect recoverable workflows/approvals in the **WORKFORCE** tab before resuming.
+
+---
+
+## 8. Verification & Troubleshooting
 
 ```powershell
 .\.venv\Scripts\python.exe -m pytest -v
 .\.venv\Scripts\python.exe preflight.py
+.\.venv\Scripts\python.exe drill.py
 .\offline-test.ps1
 ```
 
-See [docs/audit/01_EXECUTIVE_SUMMARY.md](docs/audit/01_EXECUTIVE_SUMMARY.md) for the full architecture & P0–P9 migration specification.
+### Common Issues
+
+- **PostgreSQL / `pgvector` unavailable**: Leave `JARVIS_DATABASE_URL` unset to run SQLite WAL locally, or ensure `CREATE EXTENSION IF NOT EXISTS vector;` succeeds in PostgreSQL.
+- **Ollama out of memory (GTX 1650 4 GB)**: Unload unused models (`ollama ps` / switch brain), keep `max_local_concurrency=1`, or offload heavy reasoning to an explicit free cloud model in Online Assisted Mode.
+- **Cloud provider rate limit (429/503)**: `ModelGateway` automatically applies exponential backoff + jitter, trips circuit breakers temporarily, and falls back to the configured local model.
+- **OpenCode or Graphify unavailable**: Install missing CLI binaries cleanly (`opencode`, `graphify`) or inject a custom runner during tests; read-only Graphify queries gracefully report missing artifacts without corrupting repos.
+- **Backup verification mismatch / tamper error**: Do **not** restore unverified archives onto live DBs; inspect `manifest.json` file checksums and confirm the exact recovery passphrase.
+- **Interrupted workflow or failed training**: Inspect recoverable runs in **WORKFORCE** (`workforce_graph` pauses cleanly at DB checkpoints) and failed worker diagnostics under `data/learning/training/jobs/<job_id>/worker.log`.

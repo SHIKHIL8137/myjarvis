@@ -95,6 +95,20 @@ class BackupVerifyIn(BaseModel):
     passphrase: str = Field(..., min_length=8, max_length=128)
 
 
+class MemoryUpdateIn(BaseModel):
+    content: str | None = Field(None, min_length=1, max_length=4000)
+    title: str | None = Field(None, max_length=200)
+    topic: str | None = Field(None, max_length=120)
+    privacy_level: str | None = Field(None, pattern="^(public|internal|private|confidential|restricted)$")
+    confidence: float | None = Field(None, ge=0.0, le=1.0)
+
+
+class MemorySupersedeIn(BaseModel):
+    new_content: str = Field(..., min_length=1, max_length=4000)
+    title: str = ""
+    topic: str = ""
+
+
 def create_v2_router(fallback=None) -> APIRouter:
     router = APIRouter(prefix="/api/v2")
     get_a = make_assistant_dep(fallback)
@@ -124,21 +138,68 @@ def create_v2_router(fallback=None) -> APIRouter:
     async def gateway_usage(a=Depends(get_a)):
         return a.orchestrator.gateway.usage_summary()
 
+    @router.get("/gateway/capabilities")
+    async def gateway_capabilities(a=Depends(get_a)):
+        gw = a.orchestrator.gateway
+        return {
+            "capabilities": gw.list_capabilities(),
+            "usage": gw.usage_summary(),
+            "internet_mode": a.settings.mode,
+            "allow_cloud": a.settings.providers.allow_cloud,
+            "allow_paid_models": a.settings.providers.allow_paid_models,
+        }
+
     # ---- 5-Way Memory --------------------------------------------------------------------------------
     @router.get("/memory/summary")
     async def memory_summary(a=Depends(get_a)):
         return a.orchestrator.memory.summary()
 
     @router.get("/memory/personal")
-    async def list_personal(category: str | None = None, q: str | None = None, a=Depends(get_a)):
+    async def list_personal(
+        category: str | None = None,
+        project_id: str | None = None,
+        q: str | None = None,
+        include_archived: bool = False,
+        a=Depends(get_a),
+    ):
         m = a.orchestrator.memory
         if q:
-            return {"items": m.search_personal_memory(q, k=10)}
-        return {"items": m.list_personal_memories(category=category)}
+            return {"items": m.search_personal_memory(q, k=15, project_id=project_id)}
+        return {
+            "items": m.list_personal_memories(
+                category=category,
+                project_id=project_id,
+                include_archived=include_archived,
+            )
+        }
 
     @router.post("/memory/personal")
     async def add_personal(body: PersonalMemIn, a=Depends(get_a)):
         return {"record": a.orchestrator.memory.add_personal_memory(**body.model_dump())}
+
+    @router.put("/memory/personal/{memory_id}")
+    async def update_personal(memory_id: str, body: MemoryUpdateIn, a=Depends(get_a)):
+        return {"record": a.orchestrator.memory.update_personal_memory(memory_id, **body.model_dump(exclude_none=True))}
+
+    @router.post("/memory/personal/{memory_id}/supersede")
+    async def supersede_personal(memory_id: str, body: MemorySupersedeIn, a=Depends(get_a)):
+        return {"record": a.orchestrator.memory.supersede_personal_memory(memory_id, **body.model_dump())}
+
+    @router.post("/memory/personal/{memory_id}/archive")
+    async def archive_personal(memory_id: str, a=Depends(get_a)):
+        return {"record": a.orchestrator.memory.archive_personal_memory(memory_id)}
+
+    @router.post("/memory/personal/{memory_id}/restore")
+    async def restore_personal(memory_id: str, a=Depends(get_a)):
+        return {"record": a.orchestrator.memory.restore_personal_memory(memory_id)}
+
+    @router.delete("/memory/personal/{memory_id}")
+    async def delete_personal(memory_id: str, hard: bool = False, a=Depends(get_a)):
+        return a.orchestrator.memory.delete_personal_memory(memory_id, hard=hard)
+
+    @router.post("/memory/purge-expired")
+    async def purge_expired_memories(a=Depends(get_a)):
+        return a.orchestrator.memory.purge_expired()
 
     @router.get("/memory/experience")
     async def list_experience(scope: str | None = None, project_id: str | None = None, q: str | None = None, a=Depends(get_a)):
@@ -184,9 +245,18 @@ def create_v2_router(fallback=None) -> APIRouter:
     async def list_agent_runs(limit: int = 25, a=Depends(get_a)):
         return {"runs": a.orchestrator.list_runs(limit=limit)}
 
+    @router.get("/workforce/worktrees")
+    async def list_worktrees(project_id: str | None = None, a=Depends(get_a)):
+        return {"worktrees": a.orchestrator.workforce.list_worktrees(project_id=project_id)}
+
     @router.post("/workforce/runs")
     async def trigger_workforce_run(body: WorkforceRunIn, a=Depends(get_a)):
         return a.orchestrator.start_workforce_workflow(**body.model_dump())
+
+    @router.post("/workforce/runs/{run_id}/cancel")
+    async def cancel_workforce_run(run_id: str, a=Depends(get_a)):
+        a.orchestrator._update_run(run_id, "cancelled", "Cancelled by owner")
+        return {"ok": True, "run_id": run_id, "state": "cancelled"}
 
     @router.post("/assistant/runs")
     async def trigger_assistant_run(body: AssistantRunIn, a=Depends(get_a)):
@@ -255,6 +325,14 @@ def create_v2_router(fallback=None) -> APIRouter:
     @router.post("/recovery/verify")
     async def verify_backup(body: BackupVerifyIn, a=Depends(get_a)):
         return a.orchestrator.recovery.verify_backup(Path(body.bundle_path), passphrase=body.passphrase)
+
+    @router.get("/recovery/instructions")
+    async def recovery_instructions(a=Depends(get_a)):
+        return {
+            "steps": a.orchestrator.recovery.recovery_steps_doc(),
+            "db": await a.orchestrator.db.health(),
+            "backup_root": str(a.orchestrator.recovery.backup_root),
+        }
 
     return router
 

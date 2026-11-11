@@ -57,11 +57,15 @@ def run_opencode_task(
     agent: str | None = None,
     bin_name: str = "opencode",
     timeout_s: int = 180,
+    policy=None,
 ) -> dict:
     """Execute a supervised OpenCode coding run strictly inside `workdir` without unrelated secret env vars."""
     wd = Path(workdir).resolve()
     if not wd.exists() or not wd.is_dir():
         raise OpenCodeError(f"OpenCode workdir does not exist: {wd}")
+    if policy is not None:
+        policy.validate_access(wd, "write")
+        timeout_s = min(int(timeout_s), int(getattr(policy, "timeout_s", timeout_s)))
 
     exe = _find_opencode(bin_name)
     cmd = [exe, "run", prompt, "--dir", str(wd), "--format", "json"]
@@ -71,7 +75,8 @@ def run_opencode_task(
         cmd.extend(["--agent", agent])
 
     # Scrubbed environment: never expose Jarvis API keys from data/secrets.json or unrelated env tokens
-    env = {k: v for k, v in os.environ.items() if k.upper() in _SAFE_ENV_KEYS}
+    allow = set(getattr(policy, "env_allowlist", _SAFE_ENV_KEYS)) if policy is not None else _SAFE_ENV_KEYS
+    env = {k: v for k, v in os.environ.items() if k.upper() in allow}
     env["PYTHONUTF8"] = "1"
     proc = subprocess.run(
         cmd,

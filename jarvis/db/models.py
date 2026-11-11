@@ -22,15 +22,25 @@ class Base(DeclarativeBase):
 class PersonalMemoryRow(Base):
     __tablename__ = "personal_memories"
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    namespace: Mapped[str] = mapped_column(String(48), default="personal_memory", index=True)
+    owner_scope: Mapped[str] = mapped_column(String(64), default="default", index=True)
+    project_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     category: Mapped[str] = mapped_column(String(32), index=True)  # explicit | preference | temporary
     scope: Mapped[str] = mapped_column(String(24), default="global")  # global | temporary
     topic: Mapped[str] = mapped_column(String(120), default="")
     title: Mapped[str] = mapped_column(String(200), default="")
     content: Mapped[str] = mapped_column(Text)
+    meta: Mapped[dict] = mapped_column(JSON, default=dict)
     source: Mapped[str] = mapped_column(String(32), default="explicit")
     confirmed: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
     confidence: Mapped[float] = mapped_column(Float, default=1.0)
-    expires_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    privacy_level: Mapped[str] = mapped_column(String(24), default="private", index=True)  # public | internal | private | restricted
+    embedding_model: Mapped[str] = mapped_column(String(120), default="hash-v1:256")
+    archived: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    deleted_at: Mapped[float | None] = mapped_column(Float, nullable=True, index=True)
+    superseded_by: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    supersedes_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    expires_at: Mapped[float | None] = mapped_column(Float, nullable=True, index=True)
     created_at: Mapped[float] = mapped_column(Float, default=_now)
     updated_at: Mapped[float] = mapped_column(Float, default=_now)
 
@@ -123,6 +133,7 @@ class ProjectRow(Base):
     default_branch: Mapped[str] = mapped_column(String(64), default="main")
     test_cmd: Mapped[str] = mapped_column(String(200), default="pytest -q")
     lint_cmd: Mapped[str] = mapped_column(String(200), default="ruff check")
+    privacy_level: Mapped[str] = mapped_column(String(24), default="private")
     tech_stack: Mapped[dict] = mapped_column(JSON, default=dict)
     graphify_status: Mapped[str] = mapped_column(String(32), default="unbuilt")
     graphify_last_built_at: Mapped[float | None] = mapped_column(Float, nullable=True)
@@ -351,21 +362,29 @@ class BackupManifestRow(Base):
 
 
 class VectorEntryRow(Base):
-    """Isolated 5-way vector chunks (float32 IEEE-754 LE normalized BLOB + metadata filtering)."""
+    """Isolated 5-way vector chunks (SQLite LE normalized BLOB + PostgreSQL pgvector metadata/expiry alignment)."""
     __tablename__ = "vector_entries"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     namespace: Mapped[str] = mapped_column(String(48), index=True)  # personal_memory | project_knowledge | experience_memory | external_knowledge | personal_documents
-    owner_id: Mapped[str] = mapped_column(String(64), default="default")
+    owner_id: Mapped[str] = mapped_column(String(64), default="default", index=True)
     project_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    memory_type: Mapped[str] = mapped_column(String(32), default="fact", index=True)
     doc_id: Mapped[str] = mapped_column(String(120), index=True)
     chunk_index: Mapped[int] = mapped_column(Integer, default=0)
     title: Mapped[str] = mapped_column(String(250), default="")
     content: Mapped[str] = mapped_column(Text)
     meta: Mapped[dict] = mapped_column(JSON, default=dict)
+    source: Mapped[str] = mapped_column(String(64), default="system")
+    confidence: Mapped[float] = mapped_column(Float, default=1.0)
+    privacy_level: Mapped[str] = mapped_column(String(24), default="private", index=True)
+    embedding_model: Mapped[str] = mapped_column(String(120), default="hash-v1:256", index=True)
     dim: Mapped[int] = mapped_column(Integer, default=256)
     embedding_blob: Mapped[bytes] = mapped_column(LargeBinary)
+    expires_at: Mapped[float | None] = mapped_column(Float, nullable=True, index=True)
+    created_at: Mapped[float] = mapped_column(Float, default=_now)
     updated_at: Mapped[float] = mapped_column(Float, default=_now)
 
 
 Index("ix_vec_ns_proj", VectorEntryRow.namespace, VectorEntryRow.project_id)
+Index("ix_vec_expiry", VectorEntryRow.namespace, VectorEntryRow.expires_at)
 

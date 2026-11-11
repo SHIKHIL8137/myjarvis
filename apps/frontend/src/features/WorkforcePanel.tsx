@@ -7,10 +7,31 @@ interface Props {
   onShowProjectGraph: (name: string, nodes: GraphNode[], links: GraphLink[]) => void;
 }
 
+interface ApprovalItem {
+  token: string;
+  action_type: string;
+  risk_tier: string;
+  target_resource: string;
+  preview_diff: string;
+  args?: {
+    project_name?: string;
+    task_description?: string;
+    changed_files?: Array<{ path: string; change_type: string; security_result: string }>;
+    manifest_sha256?: string;
+    qa_passed?: boolean;
+    security_clean?: boolean;
+    test_commands?: string;
+    test_results?: { returncode?: number; stdout_tail?: string };
+    warnings?: string[];
+    commit_sha?: string;
+  };
+}
+
 export const WorkforcePanel: React.FC<Props> = ({ onNotify, onShowProjectGraph }) => {
-  const [projects, setProjects] = useState<Array<{ id: string; name: string; root_path: string; graphify_status: string }>>([]);
+  const [projects, setProjects] = useState<Array<{ id: string; name: string; root_path: string; graphify_status: string; privacy_level?: string }>>([]);
   const [runs, setRuns] = useState<Array<{ id: string; workflow_name: string; state: string; input_summary: string; output_summary: string }>>([]);
-  const [approvals, setApprovals] = useState<Array<{ token: string; action_type: string; risk_tier: string; target_resource: string; preview_diff: string }>>([]);
+  const [worktrees, setWorktrees] = useState<Array<{ id: string; project_id: string; run_id: string; branch_name: string; worktree_path: string; status: string }>>([]);
+  const [approvals, setApprovals] = useState<ApprovalItem[]>([]);
   const [pName, setPName] = useState("");
   const [pPath, setPPath] = useState("");
   const [selProj, setSelProj] = useState("");
@@ -18,15 +39,17 @@ export const WorkforcePanel: React.FC<Props> = ({ onNotify, onShowProjectGraph }
 
   const refresh = async () => {
     try {
-      const [p, r, a] = await Promise.all([
+      const [p, r, a, wt] = await Promise.all([
         apiFetch<{ projects: typeof projects }>("/v2/projects"),
         apiFetch<{ runs: typeof runs }>("/v2/workforce/runs"),
         apiFetch<{ pending: typeof approvals }>("/v2/approvals"),
+        apiFetch<{ worktrees: typeof worktrees }>("/v2/workforce/worktrees"),
       ]);
       setProjects(p.projects || []);
       if (!selProj && p.projects?.length) setSelProj(p.projects[0].id);
       setRuns(r.runs || []);
       setApprovals(a.pending || []);
+      setWorktrees(wt.worktrees || []);
     } catch (e) {
       onNotify((e as Error).message);
     }
@@ -77,7 +100,8 @@ export const WorkforcePanel: React.FC<Props> = ({ onNotify, onShowProjectGraph }
           {projects.map((p) => (
             <div key={p.id} className="row" style={{ justifyContent: "space-between", padding: "5px 0" }}>
               <div>
-                <strong>{p.name}</strong> <span className="dim">({p.graphify_status})</span>
+                <strong>{p.name}</strong> <span className="pill">{p.graphify_status}</span>
+                {p.privacy_level && <span className="pill" style={{ marginLeft: 4 }}>{p.privacy_level}</span>}
                 <div className="dim">{p.root_path}</div>
               </div>
               <div className="row">
@@ -115,30 +139,67 @@ export const WorkforcePanel: React.FC<Props> = ({ onNotify, onShowProjectGraph }
       </div>
 
       <div className="card">
-        <h3>PENDING HUMAN APPROVALS (EXECUTE TIER)</h3>
-        {approvals.map((a) => (
-          <div key={a.token} style={{ marginBottom: 10 }}>
-            <div className="row" style={{ justifyContent: "space-between" }}>
-              <span><strong>{a.action_type}</strong> → {a.target_resource}</span>
-              <span className="pill warn">{a.risk_tier}</span>
+        <h3>PENDING OWNER MERGE APPROVALS</h3>
+        {approvals.map((a) => {
+          const d = a.args || {};
+          return (
+            <div key={a.token} style={{ marginBottom: 12, borderBottom: "1px solid var(--border)", paddingBottom: 10 }}>
+              <div className="row" style={{ justifyContent: "space-between" }}>
+                <span><strong>{d.project_name || a.action_type}</strong> → {a.target_resource}</span>
+                <div className="row">
+                  <span className={`pill ${d.qa_passed ? "ok" : "danger"}`}>QA: {d.qa_passed ? "PASS" : "FAIL"}</span>
+                  <span className={`pill ${d.security_clean ? "ok" : "danger"}`}>SEC: {d.security_clean ? "CLEAN" : "BLOCKED"}</span>
+                  <span className="pill warn">{a.risk_tier}</span>
+                </div>
+              </div>
+              {d.task_description && <div className="dim" style={{ margin: "4px 0" }}>Task: {d.task_description}</div>}
+              {d.test_commands && <div className="dim">QA Command: <code>{d.test_commands}</code> (rc={d.test_results?.returncode ?? 0})</div>}
+              {d.manifest_sha256 && <div className="dim">Manifest SHA-256: <code>{d.manifest_sha256.slice(0, 16)}…</code></div>}
+              {d.changed_files && d.changed_files.length > 0 && (
+                <div className="dim" style={{ margin: "4px 0" }}>
+                  Files: {d.changed_files.map((f) => `${f.path} [${f.change_type}/${f.security_result}]`).join(", ")}
+                </div>
+              )}
+              {d.warnings && d.warnings.length > 0 && (
+                <div className="pill warn" style={{ marginBottom: 6 }}>Warnings: {d.warnings.join("; ")}</div>
+              )}
+              <pre className="diff">{a.preview_diff || "(no diff preview)"}</pre>
+              <div className="row">
+                <button className="ok" onClick={async () => { try { await apiFetch(`/v2/approvals/${a.token}/decide`, { method: "POST", body: { approved: true } }); refresh(); } catch (e) { onNotify((e as Error).message); } }}>Approve & Merge</button>
+                <button className="danger" onClick={async () => { try { await apiFetch(`/v2/approvals/${a.token}/decide`, { method: "POST", body: { approved: false } }); refresh(); } catch (e) { onNotify((e as Error).message); } }}>Reject</button>
+              </div>
             </div>
-            <pre className="diff">{a.preview_diff || "(no diff preview)"}</pre>
-            <div className="row">
-              <button className="ok" onClick={async () => { await apiFetch(`/api/v2/approvals/${a.token}/decide`, { method: "POST", body: { approved: true } }); refresh(); }}>Approve & Merge</button>
-              <button className="danger" onClick={async () => { await apiFetch(`/api/v2/approvals/${a.token}/decide`, { method: "POST", body: { approved: false } }); refresh(); }}>Reject</button>
-            </div>
-          </div>
-        ))}
+          );
+        })}
         {!approvals.length && <p className="dim">No actions awaiting approval.</p>}
       </div>
 
       <div className="card">
-        <h3>RECENT AGENT RUNS</h3>
+        <h3>ISOLATED GIT WORKTREES</h3>
+        {worktrees.slice(0, 8).map((w) => (
+          <div key={w.id} className="row" style={{ justifyContent: "space-between", padding: "4px 0" }}>
+            <div>
+              <strong>{w.branch_name}</strong> <span className="dim">({w.run_id})</span>
+              <div className="dim">{w.worktree_path}</div>
+            </div>
+            <span className={`pill ${w.status === "merged" ? "ok" : w.status.includes("fail") || w.status.includes("block") ? "danger" : "warn"}`}>{w.status}</span>
+          </div>
+        ))}
+        {!worktrees.length && <p className="dim">No recorded worktrees.</p>}
+      </div>
+
+      <div className="card">
+        <h3>AGENT WORKFLOW RUNS</h3>
         {runs.map((r) => (
-          <div key={r.id} style={{ padding: "4px 0", borderBottom: "1px solid rgba(255,255,255,0.06)" }}>
+          <div key={r.id} style={{ padding: "5px 0", borderBottom: "1px solid rgba(255,255,255,0.06)" }}>
             <div className="row" style={{ justifyContent: "space-between" }}>
               <strong>[{r.workflow_name}] {r.input_summary.slice(0, 60)}</strong>
-              <span className="pill ok">{r.state}</span>
+              <div className="row">
+                <span className={`pill ${r.state === "completed" ? "ok" : r.state.includes("fail") || r.state.includes("block") ? "danger" : "warn"}`}>{r.state}</span>
+                {r.state === "awaiting_approval" && (
+                  <button className="ghost" onClick={async () => { await apiFetch(`/v2/workforce/runs/${r.id}/cancel`, { method: "POST" }); refresh(); }}>Cancel</button>
+                )}
+              </div>
             </div>
             {r.output_summary && <div className="dim">{r.output_summary}</div>}
           </div>
@@ -147,4 +208,3 @@ export const WorkforcePanel: React.FC<Props> = ({ onNotify, onShowProjectGraph }
     </div>
   );
 };
-

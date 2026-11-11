@@ -1,22 +1,37 @@
 import React, { useEffect, useState } from "react";
 import { apiFetch } from "../api/client";
 
+interface ManifestItem {
+  id: string;
+  tier: string;
+  bundle_path: string;
+  size_bytes: number;
+  verified_restore: boolean;
+  created_at?: number;
+  details?: {
+    tier3_copy?: string | null;
+    remote_uri?: string | null;
+    snapshot_counts?: Record<string, number>;
+  };
+}
+
 export const RecoveryPanel: React.FC<{ onNotify: (msg: string) => void }> = ({ onNotify }) => {
-  const [manifests, setManifests] = useState<Array<{ id: string; tier: string; bundle_path: string; size_bytes: number; verified_restore: boolean }>>([]);
-  const [usage, setUsage] = useState<Record<string, unknown>>({});
+  const [manifests, setManifests] = useState<ManifestItem[]>([]);
+  const [steps, setSteps] = useState<string[]>([]);
   const [pass, setPass] = useState("");
+  const [lastDrill, setLastDrill] = useState<Record<string, unknown> | null>(null);
   const [modeOnline, setModeOnline] = useState(false);
 
   const refresh = async () => {
     try {
-      const [m, u, net] = await Promise.all([
-        apiFetch<{ manifests: typeof manifests }>("/v2/recovery/manifests"),
-        apiFetch<Record<string, unknown>>("/v2/gateway/usage"),
+      const [m, net, inst] = await Promise.all([
+        apiFetch<{ manifests: ManifestItem[] }>("/v2/recovery/manifests"),
         apiFetch<{ online_enabled: boolean }>("/internet"),
+        apiFetch<{ steps: string[] }>("/v2/recovery/instructions"),
       ]);
       setManifests(m.manifests || []);
-      setUsage(u);
       setModeOnline(Boolean(net.online_enabled));
+      setSteps(inst.steps || []);
     } catch (e) {
       onNotify((e as Error).message);
     }
@@ -26,11 +41,13 @@ export const RecoveryPanel: React.FC<{ onNotify: (msg: string) => void }> = ({ o
     refresh();
   }, []);
 
+  const latest = manifests[0];
+
   return (
     <div className="scroll-body">
       <div className="card">
-        <h3>NETWORK SECURITY & MODEL GATEWAY GOVERNANCE</h3>
-        <div className="row" style={{ justifyContent: "space-between", marginBottom: 8 }}>
+        <h3>NETWORK POLICY</h3>
+        <div className="row" style={{ justifyContent: "space-between" }}>
           <span>Active Internet Policy: <strong>{modeOnline ? "Online Assisted Mode" : "Local Mode (Strict Offline)"}</strong></span>
           <button
             className={modeOnline ? "danger" : "ok"}
@@ -42,11 +59,18 @@ export const RecoveryPanel: React.FC<{ onNotify: (msg: string) => void }> = ({ o
             {modeOnline ? "Enforce Local Offline" : "Enable Online Assisted"}
           </button>
         </div>
-        <pre className="diff">{JSON.stringify(usage, null, 2)}</pre>
       </div>
 
       <div className="card">
         <h3>3-2-1 ENCRYPTED DISASTER RECOVERY</h3>
+        {latest && (
+          <div className="row" style={{ flexWrap: "wrap", marginBottom: 8 }}>
+            <span className="pill">Last Backup: {latest.created_at ? new Date(latest.created_at * 1000).toLocaleString() : "n/a"}</span>
+            <span className={`pill ${latest.verified_restore ? "ok" : "warn"}`}>Integrity: {latest.verified_restore ? "VERIFIED" : "UNVERIFIED"}</span>
+            {latest.details?.tier3_copy && <span className="pill ok">Secondary: synced</span>}
+            {latest.details?.snapshot_counts && <span className="pill">Vectors: {latest.details.snapshot_counts.vectors ?? 0}</span>}
+          </div>
+        )}
         <div className="row" style={{ marginBottom: 8 }}>
           <input type="password" value={pass} onChange={(e) => setPass(e.target.value)} placeholder="Backup vault passphrase (min 8 chars)" />
           <button
@@ -75,11 +99,12 @@ export const RecoveryPanel: React.FC<{ onNotify: (msg: string) => void }> = ({ o
               onClick={async () => {
                 if (pass.length < 8) return onNotify("Enter vault passphrase to verify restore");
                 try {
-                  const r = await apiFetch<{ verified_files: number }>("/v2/recovery/verify", {
+                  const r = await apiFetch<Record<string, unknown>>("/v2/recovery/verify", {
                     method: "POST",
                     body: { bundle_path: b.bundle_path, passphrase: pass },
                   });
-                  onNotify(`Verified ${r.verified_files} encrypted files!`);
+                  setLastDrill(r);
+                  onNotify(`Drill OK: ${r.verified_files} files, RTO ${r.rto_seconds}s`);
                   refresh();
                 } catch (e) {
                   onNotify((e as Error).message);
@@ -90,8 +115,15 @@ export const RecoveryPanel: React.FC<{ onNotify: (msg: string) => void }> = ({ o
             </button>
           </div>
         ))}
+        {lastDrill && <pre className="diff" style={{ marginTop: 8 }}>{JSON.stringify(lastDrill, null, 2)}</pre>}
+      </div>
+
+      <div className="card">
+        <h3>NEW-MACHINE RECOVERY WORKFLOW</h3>
+        <div className="dim" style={{ lineHeight: 1.5 }}>
+          {steps.map((s, idx) => <div key={idx}>{s}</div>)}
+        </div>
       </div>
     </div>
   );
 };
-

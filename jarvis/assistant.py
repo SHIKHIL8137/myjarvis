@@ -186,6 +186,7 @@ class Assistant:
         self._bg: set[asyncio.Task] = set()
         self.warm_status = {"stt": False, "tts": False, "brain": False}
         self.orchestrator = AgentOrchestrator(settings, bus=self.bus, brain=self.brain, data_dir=self.data_dir)
+        self.knowledge.vector_store = self.orchestrator.memory.vectors
 
     # ---- lifecycle -----------------------------------------------------------------------------------
     async def start(self):
@@ -195,6 +196,18 @@ class Assistant:
         self._spawn(self._watch_notes())
         self._spawn(self._watch_knowledge())
         self._spawn(self._watch_reminders())
+        self._spawn(self._watch_memory_expiry())
+
+    async def _watch_memory_expiry(self):
+        """Scheduled cleanup purging expired memories and vectors atomically."""
+        while True:
+            try:
+                res = await asyncio.to_thread(self.orchestrator.memory.purge_expired)
+                if res.get("sql_purged") or res.get("vectors_purged"):
+                    self.bus.publish({"type": "memory_purged", **res})
+            except Exception as e:
+                log.debug("memory expiry cleanup skipped: %s", e)
+            await asyncio.sleep(60)
 
     async def _watch_reminders(self):
         """Poll scheduled reminders without touching external networks."""
