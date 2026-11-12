@@ -8,6 +8,7 @@ import time
 from typing import Any, Awaitable, Callable
 import uuid
 
+from jarvis.core.logging_ctx import correlation_scope
 from jarvis.security.outcomes import (
     SIDE_EFFECTFUL_INTENTS,
     SIDE_EFFECTFUL_WORKER_KINDS,
@@ -136,6 +137,13 @@ class TaskRunContext:
         notes = await self.check_guardrails()
         return [str(n.get("instruction") or "") for n in notes if n.get("instruction")]
 
+    async def consume_steer_instructions(self) -> list[str]:
+        """Check guardrails and atomically mark pending steering notes as acknowledged."""
+        await self.check_guardrails()
+        consumed = await self.tasks.acknowledge_steer_notes(self.task_id)
+        await self.refresh()
+        return [str(n.get("instruction") or "") for n in consumed if n.get("instruction")]
+
 
 def _map_outcome_to_task_status(outcome: ToolOutcome | None) -> str:
     if outcome is None:
@@ -208,21 +216,29 @@ class BackgroundTaskRunner:
         token_budget: int = 120000,
         tool_budget: int = 40,
         deadline_at: float | None = None,
+        scheduled_for: float | None = None,
+        correlation_id: str | None = None,
+        parent_task_id: str | None = None,
         meta: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        is_future = scheduled_for is not None and float(scheduled_for) > time.time()
+        init_status = "scheduled" if is_future else "queued"
         task = await self.tasks.create_task(
             user_request=user_request,
             source=source,
             intent=intent,
-            status="queued",
+            status=init_status,
             worker_kind=worker_kind,
             max_attempts=max_attempts,
+            scheduled_for=scheduled_for,
             step_budget=step_budget,
             token_budget=token_budget,
             tool_budget=tool_budget,
             deadline_at=deadline_at,
             payload=payload,
-            current_step=f"Queued for {worker_kind}",
+            correlation_id=correlation_id,
+            parent_task_id=parent_task_id,
+            current_step=f"Scheduled for {worker_kind}" if is_future else f"Queued for {worker_kind}",
             meta=meta,
         )
         self.wake()
@@ -298,8 +314,12 @@ class BackgroundTaskRunner:
 
         ctx = TaskRunContext(self, task)
         try:
-            await ctx.check_guardrails()
-            raw_res = await handler(ctx, task)
+            with correlation_scope(
+                correlation_id=(str(task.get("correlation_id") or "") or None),
+                task_id=task["task_id"],
+            ):
+                await ctx.check_guardrails()
+                raw_res = await handler(ctx, task)
 
             # Respect owner cancellation even if issued mid-step without another check_guardrails() call.
             latest_before_finish = await self.tasks.get_task(task["task_id"])
@@ -481,6 +501,8 @@ class BackgroundTaskRunner:
                 clear_claim=True,
             )
         except TimeoutError as te:
+            snap_latest = await self.tasks.get_task(task["task_id"]) or task
+            partial = self.tasks.build_partial_report(snap_latest, reason=f"deadline_exceeded: {te}")
             to_out = ToolOutcome(
                 tool_name=kind,
                 status=ToolStatus.FAILED.value,
@@ -494,6 +516,7 @@ class BackgroundTaskRunner:
                 status="failed",
                 current_step="Deadline exceeded",
                 error_info=str(te),
+                partial_report=partial,
                 meta_patch={"outcome": to_out, "outcome_status": ToolStatus.FAILED.value, "verified": False},
                 clear_claim=True,
             )

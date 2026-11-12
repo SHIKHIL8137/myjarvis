@@ -9,6 +9,9 @@ from typing import Any, Callable, Iterable
 from sqlalchemy import and_, or_, select, update
 
 from ..config import DATA
+from ..core.contracts import TaskPartialReportContract, normalize_task_status
+from ..core.errors import TaskTransitionError
+from ..core.logging_ctx import correlation_id_var
 from ..db.engine import DatabaseManager
 from ..db.models import ApprovalRequestRow, AssistantTaskRow, FilesystemPermissionRequestRow, FilesystemPermissionRow
 from ..security.outcomes import ToolOutcome, ToolStatus, VerificationCheck
@@ -16,29 +19,78 @@ from ..security.outcomes import ToolOutcome, ToolStatus, VerificationCheck
 TASK_STATUSES: tuple[str, ...] = (
     "queued",
     "planning",
+    "scheduled",
     "awaiting_clarification",
     "awaiting_permission",
     "awaiting_approval",
+    "waiting",
     "running",
     "paused",
     "waiting_quota",
     "completed",
+    "done",
     "unverified",
     "started",
     "failed",
     "cancelled",
 )
-TERMINAL_TASK_STATUSES: frozenset[str] = frozenset({"completed", "unverified", "started", "failed", "cancelled"})
+TERMINAL_TASK_STATUSES: frozenset[str] = frozenset({"completed", "done", "unverified", "started", "failed", "cancelled"})
 ACTIVE_TASK_STATUSES: tuple[str, ...] = (
     "queued",
     "planning",
+    "scheduled",
     "awaiting_clarification",
     "awaiting_permission",
     "awaiting_approval",
+    "waiting",
     "running",
     "paused",
     "waiting_quota",
 )
+
+_WAIT_STATES: frozenset[str] = frozenset({"waiting", "awaiting_clarification", "awaiting_permission", "awaiting_approval"})
+_DONE_STATES: frozenset[str] = frozenset({"completed", "done", "unverified", "started"})
+
+VALID_TASK_TRANSITIONS: dict[str, frozenset[str]] = {
+    "queued": frozenset({"queued", "planning", "scheduled", "running", "paused", "waiting_quota", "failed", "cancelled", *_WAIT_STATES, *_DONE_STATES}),
+    "planning": frozenset({"planning", "queued", "scheduled", "running", "paused", "waiting_quota", "failed", "cancelled", *_WAIT_STATES, *_DONE_STATES}),
+    "scheduled": frozenset({"scheduled", "queued", "running", "paused", "failed", "cancelled"}),
+    "running": frozenset({"running", "queued", "scheduled", "paused", "waiting_quota", "failed", "cancelled", *_WAIT_STATES, *_DONE_STATES}),
+    "waiting": frozenset({"waiting", "queued", "running", "paused", "waiting_quota", "failed", "cancelled", *_WAIT_STATES, *_DONE_STATES}),
+    "awaiting_clarification": frozenset({"awaiting_clarification", "queued", "planning", "running", "paused", "failed", "cancelled", *_WAIT_STATES, *_DONE_STATES}),
+    "awaiting_permission": frozenset({"awaiting_permission", "queued", "planning", "running", "paused", "failed", "cancelled", *_WAIT_STATES, *_DONE_STATES}),
+    "awaiting_approval": frozenset({"awaiting_approval", "queued", "planning", "running", "paused", "failed", "cancelled", *_WAIT_STATES, *_DONE_STATES}),
+    "waiting_quota": frozenset({"waiting_quota", "queued", "running", "paused", "failed", "cancelled"}),
+    "paused": frozenset({"paused", "queued", "scheduled", "running", "failed", "cancelled"}),
+    "started": frozenset({"started", "running", "paused", "failed", "cancelled", *_WAIT_STATES, "completed", "done", "unverified"}),
+    "unverified": frozenset({"unverified", "queued", "paused", "failed", "cancelled"}),
+    "completed": frozenset({"completed"}),
+    "done": frozenset({"done"}),
+    "failed": frozenset({"failed", "queued", "cancelled"}),
+    "cancelled": frozenset({"cancelled"}),
+}
+
+
+_CANONICAL_RETURN_ALIAS = {"done": "completed", "waiting": "paused"}
+
+
+def validate_task_transition(current_status: str | None, next_status: str) -> str:
+    """Validate durable task state transitions, raising TaskTransitionError on illegal jumps."""
+    nxt = str(next_status or "").strip()
+    if nxt not in TASK_STATUSES:
+        raise TaskTransitionError(f"Unknown target task status: {nxt!r}")
+    if current_status is None:
+        return _CANONICAL_RETURN_ALIAS.get(nxt, nxt)
+    cur = str(current_status).strip()
+    if cur == nxt:
+        return _CANONICAL_RETURN_ALIAS.get(nxt, nxt)
+    allowed = VALID_TASK_TRANSITIONS.get(cur)
+    if allowed is not None and nxt not in allowed:
+        raise TaskTransitionError(
+            f"Illegal task state transition: {cur} -> {nxt}",
+            details={"current_status": cur, "next_status": nxt},
+        )
+    return _CANONICAL_RETURN_ALIAS.get(nxt, nxt)
 
 UNSAFE_AUTO_RESUME_INTENTS: frozenset[str] = frozenset(
     {
@@ -71,7 +123,7 @@ class AssistantTaskService:
     def __init__(
         self,
         db: DatabaseManager,
-        event_publisher: Callable[[dict[str, Any]], None] | None = None,
+        event_publisher: Callable[[dict[str, Any]], Any] | None = None,
         *,
         data_dir: Path | None = None,
     ):
@@ -79,7 +131,7 @@ class AssistantTaskService:
         self.data_dir = Path(data_dir) if data_dir is not None else Path(getattr(db, "data_dir", DATA))
         self._publish = event_publisher
 
-    def set_publisher(self, publisher: Callable[[dict[str, Any]], None] | None) -> None:
+    def set_publisher(self, publisher: Callable[[dict[str, Any]], Any] | None) -> None:
         self._publish = publisher
 
     def _emit(self, payload: dict[str, Any]) -> None:
@@ -100,12 +152,17 @@ class AssistantTaskService:
         worker_kind: str = "assistant",
         max_attempts: int = 3,
         not_before: float | None = None,
+        scheduled_for: float | None = None,
         deadline_at: float | None = None,
         step_budget: int = 20,
         token_budget: int = 120000,
         tool_budget: int = 40,
         payload: dict[str, Any] | None = None,
         checkpoint_json: dict[str, Any] | None = None,
+        partial_report: dict[str, Any] | None = None,
+        pause_reason: str = "",
+        correlation_id: str | None = None,
+        parent_task_id: str | None = None,
         plan: Iterable[Any] | None = None,
         selected_capabilities: Iterable[str] | None = None,
         selected_agents: Iterable[str] | None = None,
@@ -114,6 +171,8 @@ class AssistantTaskService:
     ) -> dict[str, Any]:
         eff_status = status if status in TASK_STATUSES else "queued"
         now = time.time()
+        eff_corr = (correlation_id or "").strip() or (correlation_id_var.get() if correlation_id_var.get() != "-" else "")
+        eff_not_before = scheduled_for if (scheduled_for is not None and not_before is None) else not_before
         row = AssistantTaskRow(
             user_request=str(user_request or ""),
             source=str(source or "text")[:24],
@@ -122,9 +181,10 @@ class AssistantTaskService:
             worker_kind=str(worker_kind or "assistant")[:48],
             attempts=0,
             max_attempts=max(1, int(max_attempts)),
-            not_before=not_before,
+            not_before=eff_not_before,
             next_retry_at=None,
             deadline_at=deadline_at,
+            scheduled_for=scheduled_for,
             step_budget=max(1, int(step_budget)),
             steps_used=0,
             token_budget=max(1, int(token_budget)),
@@ -137,14 +197,18 @@ class AssistantTaskService:
             tools_used=[],
             permissions_requested=[],
             current_step=str(current_step or "")[:200],
+            pause_reason=str(pause_reason or "")[:240],
             result="",
             generated_files=[],
             error_info="",
             quota_reason="",
             payload=dict(payload or {}),
             checkpoint_json=dict(checkpoint_json or {}),
+            partial_report=dict(partial_report or {}),
             steer_notes=[],
             completed_step_keys=[],
+            correlation_id=eff_corr[:64],
+            parent_task_id=(str(parent_task_id)[:36] if parent_task_id else None),
             claimed_by=None,
             claimed_at=None,
             meta=dict(meta or {}),
@@ -172,14 +236,18 @@ class AssistantTaskService:
         tools_used: Iterable[str] | None = None,
         permissions_requested: Iterable[Any] | None = None,
         current_step: str | None = None,
+        pause_reason: str | None = None,
         result: str | None = None,
         generated_files: Iterable[Any] | None = None,
         error_info: str | None = None,
         quota_reason: str | None = None,
         checkpoint_json: dict[str, Any] | None = None,
         checkpoint_patch: dict[str, Any] | None = None,
+        partial_report: dict[str, Any] | None = None,
         payload_patch: dict[str, Any] | None = None,
         not_before: float | None = None,
+        scheduled_for: float | None = None,
+        clear_scheduled_for: bool = False,
         clear_not_before: bool = False,
         next_retry_at: float | None = None,
         claimed_by: str | None = None,
@@ -188,6 +256,7 @@ class AssistantTaskService:
         append_tool: str | None = None,
         append_file: str | dict[str, Any] | None = None,
         append_permission: str | dict[str, Any] | None = None,
+        enforce_transition: bool = False,
     ) -> dict[str, Any] | None:
         if not task_id:
             return None
@@ -197,6 +266,8 @@ class AssistantTaskService:
             if row is None:
                 return None
             if status is not None and status in TASK_STATUSES:
+                if enforce_transition:
+                    validate_task_transition(row.status, status)
                 row.status = status
                 if status in TERMINAL_TASK_STATUSES:
                     row.claimed_by = None
@@ -229,6 +300,8 @@ class AssistantTaskService:
                 row.permissions_requested = cur_perms
             if current_step is not None:
                 row.current_step = str(current_step)[:200]
+            if pause_reason is not None:
+                row.pause_reason = str(pause_reason)[:240]
             if result is not None:
                 row.result = str(result)
             if generated_files is not None:
@@ -248,10 +321,16 @@ class AssistantTaskService:
                 merged_cp = dict(row.checkpoint_json or {})
                 merged_cp.update(checkpoint_patch)
                 row.checkpoint_json = merged_cp
+            if partial_report is not None:
+                row.partial_report = dict(partial_report)
             if payload_patch:
                 merged_p = dict(row.payload or {})
                 merged_p.update(payload_patch)
                 row.payload = merged_p
+            if clear_scheduled_for:
+                row.scheduled_for = None
+            elif scheduled_for is not None:
+                row.scheduled_for = scheduled_for
             if clear_not_before:
                 row.not_before = None
             elif not_before is not None:
@@ -290,11 +369,119 @@ class AssistantTaskService:
         async with self.db.async_session() as s:
             stmt = select(AssistantTaskRow).order_by(AssistantTaskRow.created_at.desc()).limit(max(1, min(limit, 200)))
             if status:
-                stmt = stmt.where(AssistantTaskRow.status == status)
+                st_clean = str(status).strip().lower()
+                if st_clean == "done":
+                    stmt = stmt.where(AssistantTaskRow.status.in_(("completed", "done")))
+                elif st_clean == "waiting":
+                    stmt = stmt.where(AssistantTaskRow.status.in_(tuple(_WAIT_STATES)))
+                else:
+                    stmt = stmt.where(AssistantTaskRow.status == status)
             elif active_only:
                 stmt = stmt.where(AssistantTaskRow.status.in_(ACTIVE_TASK_STATUSES))
             rows = (await s.execute(stmt)).scalars().all()
             return [self._to_dict(r) for r in rows]
+
+    @staticmethod
+    def build_partial_report(task_or_row: Any, *, reason: str) -> dict[str, Any]:
+        """Build structured partial progress report when a task pauses, suspends on quota, or times out."""
+        get_val = task_or_row.get if isinstance(task_or_row, dict) else lambda k, d=None: getattr(task_or_row, k, d)
+        completed_steps = [str(x) for x in (get_val("completed_step_keys") or [])]
+        cp = dict(get_val("checkpoint_json") or {})
+        budget = {
+            "steps_used": int(get_val("steps_used") or 0),
+            "step_budget": int(get_val("step_budget") or 20),
+            "tokens_used": int(get_val("tokens_used") or 0),
+            "token_budget": int(get_val("token_budget") or 120000),
+            "tools_used_count": int(get_val("tools_used_count") or 0),
+            "tool_budget": int(get_val("tool_budget") or 40),
+        }
+        report = TaskPartialReportContract(
+            task_id=str(get_val("task_id") or ""),
+            reason=str(reason or "stopped_before_completion")[:240],
+            completed_steps=completed_steps,
+            checkpoint_keys=sorted(str(k) for k in cp.keys()),
+            budget_usage=budget,
+            summary=(
+                f"Stopped ({reason}): {len(completed_steps)} completed step(s), "
+                f"steps={budget['steps_used']}/{budget['step_budget']}, "
+                f"tokens={budget['tokens_used']}/{budget['token_budget']}, "
+                f"tools={budget['tools_used_count']}/{budget['tool_budget']}."
+            ),
+            recorded_at=round(time.time(), 3),
+        )
+        return report.model_dump()
+
+    async def pause_task(self, task_id: str, *, reason: str = "Paused by owner") -> dict[str, Any] | None:
+        """Pause an active task while preserving checkpoints and recording a partial progress report."""
+        cur = await self.get_task(task_id)
+        if cur is None:
+            return None
+        validate_task_transition(cur["status"], "paused")
+        partial = self.build_partial_report(cur, reason=reason)
+        return await self.update_task(
+            task_id,
+            status="paused",
+            pause_reason=reason or "Paused by owner",
+            current_step=f"Paused: {(reason or 'Paused by owner')[:180]}",
+            partial_report=partial,
+            clear_claim=True,
+            enforce_transition=True,
+        )
+
+    async def resume_task(self, task_id: str, *, reason: str = "Manually resumed by owner") -> dict[str, Any] | None:
+        """Validate safety/approval gates and re-queue a paused, quota-suspended, or scheduled task."""
+        now = time.time()
+        async with self.db.async_session() as s:
+            row = await s.get(AssistantTaskRow, task_id)
+            if row is None:
+                return None
+            if row.status in ("awaiting_permission", "awaiting_approval", "awaiting_clarification"):
+                raise TaskTransitionError(
+                    "Task requires explicit permission or approval decision before resuming",
+                    details={"current_status": row.status},
+                )
+            if row.status not in ("paused", "waiting_quota", "queued", "scheduled"):
+                raise TaskTransitionError(
+                    f"Task cannot be resumed from status '{row.status}'",
+                    details={"current_status": row.status},
+                )
+            # Revalidate any bound FS/approval grants before resuming protected work
+            meta = dict(row.meta or {})
+            fs_reqs = (
+                await s.execute(select(FilesystemPermissionRequestRow).where(FilesystemPermissionRequestRow.task_id == row.task_id))
+            ).scalars().all()
+            if any(r.status == "pending" for r in fs_reqs):
+                raise TaskTransitionError("Pending filesystem permission request must be resolved before resuming")
+            if any(r.status == "expired" or (r.expires_at and r.expires_at <= now) for r in fs_reqs):
+                meta["approval_expired"] = True
+                row.meta = meta
+                row.status = "awaiting_permission"
+                await s.commit()
+                raise TaskTransitionError("Filesystem permission expired; re-approval required before resuming")
+            app_tok = meta.get("approval_token")
+            if app_tok:
+                ap_row = await s.get(ApprovalRequestRow, str(app_tok))
+                if ap_row and (ap_row.status in ("expired", "rejected", "cancelled") or (ap_row.expires_at and ap_row.expires_at <= now)):
+                    meta["approval_expired"] = True
+                    row.meta = meta
+                    row.status = "awaiting_approval"
+                    await s.commit()
+                    raise TaskTransitionError("Approval token expired or rejected; manual re-approval required")
+            validate_task_transition(row.status, "queued")
+            row.status = "queued"
+            row.pause_reason = ""
+            row.quota_reason = ""
+            row.not_before = None
+            row.scheduled_for = None
+            row.claimed_by = None
+            row.claimed_at = None
+            row.current_step = str(reason or "Manually resumed by owner")[:200]
+            row.updated_at = now
+            await s.commit()
+            await s.refresh(row)
+        data = self._to_dict(row)
+        self._emit(data)
+        return data
 
     async def cancel_task(self, task_id: str, *, reason: str = "Cancelled by owner") -> dict[str, Any] | None:
         cancelled_out = ToolOutcome(
@@ -320,7 +507,7 @@ class AssistantTaskService:
         worker_kinds: Iterable[str] | None = None,
         now: float | None = None,
     ) -> dict[str, Any] | None:
-        """Atomically claim the oldest runnable queued (or cooled-down waiting_quota) task."""
+        """Atomically claim the oldest runnable queued, due scheduled, or cooled-down waiting_quota task."""
         ts = now if now is not None else time.time()
         kinds = tuple(worker_kinds) if worker_kinds else None
         async with self.db.async_session() as s:
@@ -329,6 +516,10 @@ class AssistantTaskService:
                 .where(
                     or_(
                         AssistantTaskRow.status == "queued",
+                        and_(
+                            AssistantTaskRow.status == "scheduled",
+                            or_(AssistantTaskRow.scheduled_for.is_(None), AssistantTaskRow.scheduled_for <= ts),
+                        ),
                         and_(
                             AssistantTaskRow.status == "waiting_quota",
                             AssistantTaskRow.not_before.is_not(None),
@@ -349,7 +540,7 @@ class AssistantTaskService:
                     update(AssistantTaskRow)
                     .where(
                         AssistantTaskRow.task_id == row.task_id,
-                        AssistantTaskRow.status.in_(("queued", "waiting_quota")),
+                        AssistantTaskRow.status.in_(("queued", "scheduled", "waiting_quota")),
                         AssistantTaskRow.claimed_by.is_(None),
                     )
                     .values(
@@ -475,18 +666,50 @@ class AssistantTaskService:
         resume_after_s: float | None = None,
         current_step: str | None = None,
     ) -> dict[str, Any] | None:
-        """Pause task in `waiting_quota` without losing progress when step/token/tool/rate limit hits."""
+        """Pause task in `waiting_quota` without losing progress and save a graceful partial report."""
         now = time.time()
+        cur = await self.get_task(task_id)
+        partial = self.build_partial_report(cur or {"task_id": task_id}, reason=reason)
         resume_ts = (now + resume_after_s) if (resume_after_s is not None and resume_after_s > 0) else None
         return await self.update_task(
             task_id,
             status="waiting_quota",
             quota_reason=reason,
+            pause_reason=reason[:240],
+            partial_report=partial,
             current_step=current_step or f"Paused on quota/limit: {reason[:120]}",
             not_before=resume_ts,
             clear_not_before=(resume_ts is None),
             clear_claim=True,
         )
+
+    async def acknowledge_steer_notes(self, task_id: str) -> list[dict[str, Any]]:
+        """Mark all unacknowledged steering instructions as acknowledged and return newly consumed items."""
+        now = round(time.time(), 3)
+        consumed: list[dict[str, Any]] = []
+        async with self.db.async_session() as s:
+            row = await s.get(AssistantTaskRow, task_id)
+            if row is None:
+                return []
+            notes = list(row.steer_notes or [])
+            changed = False
+            new_notes: list[dict[str, Any]] = []
+            for item in notes:
+                d = dict(item)
+                if not d.get("acknowledged"):
+                    d["acknowledged"] = True
+                    d["acked_at"] = now
+                    consumed.append(dict(d))
+                    changed = True
+                new_notes.append(d)
+            if changed:
+                row.steer_notes = new_notes
+                row.updated_at = time.time()
+                await s.commit()
+                await s.refresh(row)
+        if changed:
+            self._emit(self._to_dict(row))
+        return consumed
 
     async def append_steer(
         self,
@@ -718,8 +941,8 @@ class AssistantTaskService:
                         row.meta = meta
                         row.updated_at = now
                         report["requeued"].append(row.task_id)
-                elif row.status == "queued":
-                    # Even a previously queued task must not retain stale claims or run if unsafe with approvals requested.
+                elif row.status in ("queued", "scheduled"):
+                    # Keep future schedule intact, clear any stale worker claim cleanly.
                     row.claimed_by = None
                     row.claimed_at = None
                     row.updated_at = now
@@ -735,10 +958,12 @@ class AssistantTaskService:
             "source": row.source,
             "intent": row.intent,
             "status": row.status,
+            "canonical_status": normalize_task_status(row.status).value,
             "worker_kind": row.worker_kind,
             "attempts": row.attempts,
             "max_attempts": row.max_attempts,
             "not_before": row.not_before,
+            "scheduled_for": row.scheduled_for,
             "next_retry_at": row.next_retry_at,
             "deadline_at": row.deadline_at,
             "step_budget": row.step_budget,
@@ -748,10 +973,14 @@ class AssistantTaskService:
             "tool_budget": row.tool_budget,
             "tools_used_count": row.tools_used_count,
             "quota_reason": row.quota_reason,
+            "pause_reason": row.pause_reason,
             "payload": dict(row.payload or {}),
             "checkpoint_json": dict(row.checkpoint_json or {}),
+            "partial_report": dict(row.partial_report or {}),
             "steer_notes": list(row.steer_notes or []),
             "completed_step_keys": list(row.completed_step_keys or []),
+            "correlation_id": row.correlation_id,
+            "parent_task_id": row.parent_task_id,
             "claimed_by": row.claimed_by,
             "claimed_at": row.claimed_at,
             "plan": list(row.plan or []),

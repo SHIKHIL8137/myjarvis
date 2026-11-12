@@ -351,8 +351,9 @@ class ModelGateway:
 
     def _build_cloud_adapter(self, prov: str):
         allowed = {h.lower() for h in self.settings.providers.allowed_cloud_hosts}
-        if prov == "custom" and getattr(self.settings.providers, "custom_base_url", ""):
-            custom_host = (urlsplit(self.settings.providers.custom_base_url).hostname or "").lower()
+        custom_url = str(self.settings.providers.custom_base_url or "")
+        if prov == "custom" and custom_url:
+            custom_host = (urlsplit(custom_url).hostname or "").lower()
             if custom_host:
                 allowed.add(custom_host)
         if prov in OPENAI_COMPAT_PROVIDERS:

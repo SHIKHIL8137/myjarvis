@@ -234,7 +234,6 @@ class Assistant:
         self.memory_store = PersonalMemoryStore(self.data_dir / "memory" / "records.jsonl", settings.memory)
         self.filesystem = SafeFilesystem(settings.filesystem)
         self.actions = ActionExecutor(settings.actions, self.filesystem)
-        self.proactive = ProactiveSuggestionEngine(settings.proactive)
         self.brain = brain or Brain(settings)
         self.history = History(self.data_dir / "history.jsonl", settings.history_turns)
         self.conversation_refs: set[str] = set()  # graph ids the current conversation retrieved (live graph links)
@@ -313,6 +312,7 @@ class Assistant:
         self._bg: set[asyncio.Task] = set()
         self.warm_status = {"stt": False, "tts": False, "brain": False}
         self.orchestrator = AgentOrchestrator(settings, bus=self.bus, brain=self.brain, data_dir=self.data_dir)
+        self.proactive = ProactiveSuggestionEngine(settings.proactive, db=self.orchestrator.db)
         self.knowledge.vector_store = self.orchestrator.memory.vectors
         try:
             self.translator.records.attach_db(self.orchestrator.db.sync_session)
@@ -352,15 +352,22 @@ class Assistant:
             await asyncio.sleep(60)
 
     async def _watch_reminders(self):
-        """Poll scheduled reminders without touching external networks."""
+        """Poll scheduled reminders and unified routines without touching external networks."""
         while True:
             try:
                 due = await asyncio.to_thread(self.orchestrator.reminders.poll_due)
                 for rem in due:
                     if self.settings.tts.enabled and "voice" in (rem.get("channel") or ""):
                         self.speaker.say(f"Reminder: {rem['title']}")
+                # Unified routine evaluation
+                if hasattr(self.orchestrator, "routines"):
+                    rt_events = await self.orchestrator.routines.poll_due_routines()
+                    for ev in rt_events:
+                        r_data = ev.get("routine") or {}
+                        if self.settings.tts.enabled and "voice" in (r_data.get("channel") or ""):
+                            self.speaker.say(f"Routine: {r_data.get('title', '')}")
             except Exception as e:
-                log.debug("reminder poll skipped: %s", e)
+                log.debug("reminder/routine poll skipped: %s", e)
             await asyncio.sleep(15)
 
     async def _watch_knowledge(self):
@@ -458,8 +465,9 @@ class Assistant:
             self.orchestrator.settings = self.settings
             if getattr(self.orchestrator, "fs_access", None) is not None:
                 self.orchestrator.fs_access.settings = self.settings
-            if getattr(self.orchestrator, "gateway", None) is not None:
-                self.orchestrator.gateway._fallback_settings = self.settings
+            gw = getattr(self.orchestrator, "gateway", None)
+            if gw is not None:
+                gw._fallback_settings = self.settings
             if getattr(self.orchestrator, "decision", None) is not None:
                 self.orchestrator.decision.refresh_settings(self.settings)
         if new.audio.voice_mode != prev_voice_mode:
@@ -832,7 +840,7 @@ class Assistant:
                 messages=msgs,
                 temperature=0.4,
                 max_tokens=int(getattr(self.brain.spec, "max_tokens", 1024) or 1024),
-                decision_layer=f"assistant:{role}",
+                decision_layer=3,
                 project_privacy_level="private",
                 cancel_event=cancel_event,
                 timeout_s=float(self.settings.gateway.request_timeout_s),
@@ -1671,10 +1679,19 @@ class Assistant:
             "Inspect available safe tests without bypassing execute permission",
             "Summarize findings and update task & knowledge graph",
         ]
-        skills_picked = []
+        skills_picked: list[str] = []
         try:
-            sel = self.orchestrator.capability_router.select("dev_review", text, max_skills=4)
-            skills_picked = [s.get("name") or s.get("skill_id") for s in (sel or []) if isinstance(s, dict)]
+            sel = self.orchestrator.capability_router.select_skills_for_task(
+                task_prompt=text,
+                intent="dev_review",
+                department="dev",
+                max_skills=4,
+            )
+            skills_picked = [
+                str(s.get("name") or s.get("skill_id"))
+                for s in (sel.get("selected") or [])
+                if isinstance(s, dict) and (s.get("name") or s.get("skill_id"))
+            ]
         except Exception:
             skills_picked = []
         agents = ["planner", "reviewer", "tester"]
@@ -2361,7 +2378,8 @@ class Assistant:
             return self.pending_clarification
         tasks = await self.orchestrator.tasks.list_tasks(status="awaiting_clarification", limit=5)
         for t in tasks:
-            meta = t.get("meta") if isinstance(t.get("meta"), dict) else {}
+            meta_raw = t.get("meta")
+            meta = meta_raw if isinstance(meta_raw, dict) else {}
             pc = meta.get("pending_clarification")
             if isinstance(pc, dict):
                 self.pending_clarification = pc

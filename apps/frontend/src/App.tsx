@@ -77,13 +77,29 @@ export const App: React.FC = () => {
   }, []);
 
   const navigate = useCallback((v: View, arg?: string) => {
-    if (v === "settings" || v === "gateway") {
+    if (v === "settings" || v === "gateway" || v === "skills") {
       setDest("settings");
       location.hash = "/settings";
       return;
     }
     setDest("assistant");
     location.hash = "/assistant";
+    if (v === "workforce") {
+      setRequestedDrawer("agents");
+      return;
+    }
+    if (v === "memory" || v === "learning") {
+      setRequestedDrawer("memory");
+      return;
+    }
+    if (v === "projects") {
+      setRequestedDrawer("aliases");
+      return;
+    }
+    if (v === "recovery") {
+      setRequestedDrawer("actions");
+      return;
+    }
     if (v === "graph" || (arg && (arg.startsWith("project:") || arg.startsWith("memory:") || arg.includes(":")))) {
       setShowGraphStage(true);
       if (arg) {

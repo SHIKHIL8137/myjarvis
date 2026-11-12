@@ -482,6 +482,9 @@ class PreferencesSpec(BaseModel):
     tts_provider: str = "piper"
     personality_preset: str = Field("professional", pattern="^(professional|friendly|concise|technical|detailed|custom)$")
     custom_instructions: str = Field("", max_length=600)
+    quiet_hours: dict[str, object] = Field(
+        default_factory=lambda: {"enabled": False, "start": "22:00", "end": "07:00"}
+    )
 
 
 class MonitoringSpec(BaseModel):
@@ -658,10 +661,20 @@ def delete_provider_api_key(provider: str, secrets_path: Path | None = None) -> 
 
 
 def setup_logging() -> None:
+    from .core.logging_ctx import CorrelationAndRedactionFilter, StructuredJsonFormatter
+
     (ROOT / "logs").mkdir(exist_ok=True)
     h = logging.handlers.RotatingFileHandler(ROOT / "logs" / "jarvis.log", maxBytes=1_000_000, backupCount=3, encoding="utf-8")
-    h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    use_json = os.environ.get("JARVIS_LOG_FORMAT", "").strip().lower() == "json"
+    if use_json:
+        h.setFormatter(StructuredJsonFormatter())
+    else:
+        h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s [corr=%(correlation_id)s] %(name)s: %(message)s"))
+    h.addFilter(CorrelationAndRedactionFilter())
     root = logging.getLogger()
+    for existing in root.handlers:
+        if not any(isinstance(f, CorrelationAndRedactionFilter) for f in existing.filters):
+            existing.addFilter(CorrelationAndRedactionFilter())
     if not any(isinstance(x, logging.handlers.RotatingFileHandler) for x in root.handlers):
         root.addHandler(h)
         root.setLevel(logging.INFO)

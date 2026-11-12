@@ -7,9 +7,11 @@ import logging
 from pathlib import Path
 
 from fastapi import FastAPI, Query, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from . import audit, graph_live
 from . import sysinfo
@@ -19,7 +21,8 @@ from .api_v2 import create_v2_router
 from .api_workspace import create_workspace_router
 from .assistant import Assistant
 from .brain import BrainError
-from .core.errors import JarvisError
+from .core.errors import ErrorEnvelope, JarvisError
+from .core.logging_ctx import correlation_scope, sanitize_correlation_id
 from .filesystem import FilesystemPermissionError
 from .memory_store import infer_memory_category
 from .config import (
@@ -158,83 +161,104 @@ def create_app(settings: Settings | None = None, assistant: Assistant | None = N
     app.state.a = assistant or Assistant(settings)
     A = lambda: app.state.a  # noqa: E731
 
-    # ---- security + central errors -------------------------------------------------------------------
+    # ---- security + correlation + central errors -----------------------------------------------------
+    def _err_resp(error: str, *, code: str, status_code: int, details: dict | None = None) -> JSONResponse:
+        env = ErrorEnvelope(error=error, code=code, details=details or {})
+        resp = JSONResponse(env.to_dict(include_detail=True), status_code=status_code)
+        resp.headers["X-Correlation-ID"] = env.correlation_id
+        return resp
+
     @app.middleware("http")
     async def guard(request: Request, call_next):
-        host = request.headers.get("host", "")
-        is_sandbox_gw = (
-            request.url.path.startswith("/api/v2/sandbox/v1/")
-            and not request.headers.get("origin")
-            and (request.headers.get("authorization") or "").lower().startswith("bearer ")
-        )
-        sandbox_hosts = allowed_hosts | {f"host.docker.internal:{settings.port}"}
-        if (host not in sandbox_hosts) if is_sandbox_gw else (host not in allowed_hosts):
-            return JSONResponse({"error": "forbidden host"}, status_code=403)
-        origin = request.headers.get("origin")
-        if origin and origin.split("://", 1)[-1] not in allowed_hosts:
-            return JSONResponse({"error": "forbidden origin"}, status_code=403)
-        if not is_sandbox_gw and request.method in ("POST", "PUT", "DELETE", "PATCH") and request.headers.get("x-jarvis") != "1":
-            return JSONResponse({"error": "missing X-Jarvis header"}, status_code=403)
-        resp = await call_next(request)
-        if request.method != "GET" and resp.status_code < 400:
-            for prefix, event in GRAPH_MUTATION_PREFIXES.items():
-                if request.url.path.startswith(prefix):
-                    graph_live.emit(A().bus, event, resync=True)
-                    break
-        resp.headers["Content-Security-Policy"] = (
-            "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; "
-            "script-src 'self' 'unsafe-eval'; connect-src 'self'; media-src 'self' blob:; frame-ancestors 'none'"
-        )
-        resp.headers["X-Content-Type-Options"] = "nosniff"
-        resp.headers["Referrer-Policy"] = "no-referrer"
-        if request.url.path.startswith("/api"):
-            resp.headers["Cache-Control"] = "no-store"
-        return resp
+        corr_id = sanitize_correlation_id(request.headers.get("x-correlation-id"), prefix="req")
+        with correlation_scope(correlation_id=corr_id, request_id=corr_id):
+            host = request.headers.get("host", "")
+            is_sandbox_gw = (
+                request.url.path.startswith("/api/v2/sandbox/v1/")
+                and not request.headers.get("origin")
+                and (request.headers.get("authorization") or "").lower().startswith("bearer ")
+            )
+            sandbox_hosts = allowed_hosts | {f"host.docker.internal:{settings.port}"}
+            if (host not in sandbox_hosts) if is_sandbox_gw else (host not in allowed_hosts):
+                return _err_resp("forbidden host", code="forbidden_host", status_code=403)
+            origin = request.headers.get("origin")
+            if origin and origin.split("://", 1)[-1] not in allowed_hosts:
+                return _err_resp("forbidden origin", code="forbidden_origin", status_code=403)
+            if not is_sandbox_gw and request.method in ("POST", "PUT", "DELETE", "PATCH") and request.headers.get("x-jarvis") != "1":
+                return _err_resp("missing X-Jarvis header", code="csrf_header_required", status_code=403)
+            resp = await call_next(request)
+            if request.method != "GET" and resp.status_code < 400:
+                for prefix, event in GRAPH_MUTATION_PREFIXES.items():
+                    if request.url.path.startswith(prefix):
+                        graph_live.emit(A().bus, event, resync=True)
+                        break
+            resp.headers["X-Correlation-ID"] = corr_id
+            resp.headers["Content-Security-Policy"] = (
+                "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; "
+                "script-src 'self' 'unsafe-eval'; connect-src 'self'; media-src 'self' blob:; frame-ancestors 'none'"
+            )
+            resp.headers["X-Content-Type-Options"] = "nosniff"
+            resp.headers["Referrer-Policy"] = "no-referrer"
+            if request.url.path.startswith("/api"):
+                resp.headers["Cache-Control"] = "no-store"
+            return resp
 
     @app.exception_handler(JarvisError)
     async def _jarvis_err(_, e: JarvisError):
-        return JSONResponse({"error": str(e), "code": e.code, **({"details": e.details} if e.details else {})}, status_code=e.status_code)
+        return _err_resp(str(e), code=e.code, status_code=e.status_code, details=e.details)
+
+    @app.exception_handler(StarletteHTTPException)
+    async def _http_err(_, e: StarletteHTTPException):
+        msg = str(e.detail) if e.detail is not None else "HTTP error"
+        code_map = {400: "bad_request", 403: "forbidden", 404: "not_found", 408: "timeout", 409: "conflict", 422: "validation_error", 429: "rate_limited", 503: "service_unavailable"}
+        return _err_resp(msg, code=code_map.get(e.status_code, f"http_{e.status_code}"), status_code=e.status_code)
+
+    @app.exception_handler(RequestValidationError)
+    async def _req_val_err(_, e: RequestValidationError):
+        errs = e.errors()
+        msg = "; ".join(f"{'.'.join(str(x) for x in err.get('loc', []))}: {err.get('msg', 'invalid')}" for err in errs[:4]) or "validation error"
+        return _err_resp(msg, code="validation_error", status_code=422, details={"errors": errs[:10]})
 
     @app.exception_handler(BrainError)
     async def _brain_err(_, e):
-        return JSONResponse({"error": str(e)}, status_code=503)
+        return _err_resp(str(e), code="brain_unavailable", status_code=503)
 
     @app.exception_handler(SearchOfflineError)
     async def _offline_err(_, e):
-        return JSONResponse({"error": str(e)}, status_code=403)
+        return _err_resp(str(e), code="search_offline", status_code=403)
 
     @app.exception_handler(SearchError)
     async def _search_err(_, e):
-        return JSONResponse({"error": str(e)}, status_code=502)
+        return _err_resp(str(e), code="search_error", status_code=502)
 
     @app.exception_handler(KeyError)
     async def _nf(_, e):
-        return JSONResponse({"error": f"not found: {e}"}, status_code=404)
+        return _err_resp(f"not found: {e}", code="not_found", status_code=404)
 
     @app.exception_handler(ValueError)
     async def _bad(_, e):
-        return JSONResponse({"error": str(e)}, status_code=422)
+        return _err_resp(str(e), code="validation_error", status_code=422)
 
     @app.exception_handler(ActionPermissionError)
     async def _perm(_, e):
-        return JSONResponse({"error": str(e)}, status_code=403)
+        return _err_resp(str(e), code="permission_denied", status_code=403)
 
     @app.exception_handler(PermissionError)
     async def _perm2(_, e):
-        return JSONResponse({"error": str(e)}, status_code=403)
+        return _err_resp(str(e), code="permission_denied", status_code=403)
 
     @app.exception_handler(FilesystemPermissionError)
     async def _fs_err(_, e):
-        return JSONResponse({"error": str(e)}, status_code=403)
+        return _err_resp(str(e), code="filesystem_permission_denied", status_code=403)
 
     @app.exception_handler(FileNotFoundError)
     async def _fnf(_, e):
-        return JSONResponse({"error": str(e)}, status_code=404)
+        return _err_resp(str(e), code="file_not_found", status_code=404)
 
     @app.exception_handler(Exception)
     async def _any(_, e):
         log.exception("unhandled error")
-        return JSONResponse({"error": "internal error (see logs/jarvis.log)"}, status_code=500)
+        return _err_resp("internal error (see logs/jarvis.log)", code="internal_error", status_code=500)
 
     # ---- health / status -----------------------------------------------------------------------------
     @app.get("/api/health")

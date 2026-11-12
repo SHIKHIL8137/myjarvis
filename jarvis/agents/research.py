@@ -107,6 +107,8 @@ class ResearchClaim:
     verification_note: str = ""
     citation_valid: bool = False
     quote_verified: bool = False
+    quote_spans: list[dict[str, Any]] = field(default_factory=list)
+    provenance: str = "synthesized_claim"  # "extracted_quote" | "synthesized_claim" | "inference"
     evidence_supports_claim: bool = False
     evidence_contradicts_claim: bool = False
     verification_status: str = "unverified"  # "verified" | "supported_reported" | "disputed" | "inference" | "unverified"
@@ -568,6 +570,75 @@ def _assess_deterministic_support(
     return True, False, "Deterministic citation and evidence support verified"
 
 
+def _locate_quote_span(content: str, quote: str, source_id: str) -> dict[str, Any] | None:
+    """Locate start/end character offsets for a verified excerpt inside raw snapshot content."""
+    clean_q = str(quote or "").strip()
+    if not clean_q or not content:
+        return None
+    idx = content.find(clean_q)
+    if idx >= 0:
+        return {
+            "source_id": source_id,
+            "start_offset": idx,
+            "end_offset": idx + len(clean_q),
+            "matched_text": content[idx : idx + len(clean_q)][:240],
+        }
+    low_idx = content.lower().find(clean_q.lower())
+    if low_idx >= 0:
+        return {
+            "source_id": source_id,
+            "start_offset": low_idx,
+            "end_offset": low_idx + len(clean_q),
+            "matched_text": content[low_idx : low_idx + len(clean_q)][:240],
+        }
+    words = [re.escape(w) for w in clean_q.split() if w]
+    if words:
+        pattern = r"\s+".join(words[:18])
+        m = re.search(pattern, content, flags=re.IGNORECASE)
+        if m:
+            return {
+                "source_id": source_id,
+                "start_offset": m.start(),
+                "end_offset": m.end(),
+                "matched_text": m.group(0)[:240],
+            }
+    return None
+
+
+def build_freshness_and_limitations(
+    snapshots: list[ResearchSnapshot],
+    verification: VerificationReport,
+    *,
+    online_allowed: bool,
+    warnings: list[str] | None = None,
+) -> tuple[dict[str, Any], list[str]]:
+    """Compute evidence freshness metadata and explicit research gaps/limitations."""
+    timestamps = [float(s.fetched_at) for s in snapshots if getattr(s, "fetched_at", None)]
+    freshness = {
+        "source_count": len(snapshots),
+        "independent_source_count": verification.independent_source_count,
+        "oldest_fetched_at": min(timestamps) if timestamps else None,
+        "newest_fetched_at": max(timestamps) if timestamps else None,
+        "online_allowed": bool(online_allowed),
+    }
+    limitations: list[str] = []
+    if not online_allowed:
+        limitations.append("Offline Local Mode active: live external web search was disabled; only approved local/KB evidence used.")
+    if not snapshots:
+        limitations.append("Zero verified source snapshots were retained for this query.")
+    elif verification.independent_source_count < 2:
+        limitations.append("Fewer than 2 independent canonical sources corroborated the findings.")
+    if verification.unverified_claim_count > 0:
+        limitations.append(f"{verification.unverified_claim_count} claim(s) lacked full verified citation/quote support.")
+    if verification.disputed_claim_count > 0 or verification.contradictions_found:
+        limitations.append(f"{len(verification.contradictions_found)} cross-source contradiction(s) detected and flagged.")
+    for w in warnings or []:
+        if "denied" in w.lower() or "integrity" in w.lower() or "unavailable" in w.lower():
+            if w not in limitations:
+                limitations.append(w)
+    return freshness, limitations
+
+
 def verify_claims_against_snapshots(
     claims: list[ResearchClaim],
     snapshots: dict[str, ResearchSnapshot],
@@ -605,6 +676,8 @@ def verify_claims_against_snapshots(
         if cl.kind == "inference":
             cl.citation_valid = False
             cl.quote_verified = False
+            cl.quote_spans = []
+            cl.provenance = "inference"
             cl.evidence_supports_claim = True
             cl.evidence_contradicts_claim = bool(cl.contradicted)
             cl.verification_status = "inference"
@@ -615,6 +688,8 @@ def verify_claims_against_snapshots(
         if cl.kind == "unverified":
             cl.citation_valid = False
             cl.quote_verified = False
+            cl.quote_spans = []
+            cl.provenance = "synthesized_claim"
             cl.evidence_supports_claim = False
             cl.verification_status = "unverified"
             continue
@@ -651,13 +726,21 @@ def verify_claims_against_snapshots(
         unique_canon = {s.canonical_url or canonicalize_url(s.url) or s.url or s.source_id for s in cited_snaps}
         cl.independent_source_count = len(unique_canon)
 
-        # 2) Verbatim normalized quote verification
+        # 2) Verbatim normalized quote verification + offset span provenance
         has_quote = bool(cl.quote and cl.quote.strip())
+        cl.quote_spans = []
         if has_quote:
             nq = normalize_for_quote_match(cl.quote)
             quote_snaps = [snapshots[cid] for cid in valid_cits if nq in normalized_snaps[cid]]
             cl.quote_verified = bool(quote_snaps)
-            if not cl.quote_verified:
+            if cl.quote_verified:
+                cl.provenance = "extracted_quote"
+                for qsnap in quote_snaps:
+                    span = _locate_quote_span(qsnap.content, cl.quote, qsnap.source_id)
+                    if span is not None:
+                        cl.quote_spans.append(span)
+            else:
+                cl.provenance = "synthesized_claim"
                 mismatches.append({"claim_index": idx, "citations": valid_cits, "quote": cl.quote[:160]})
                 cl.evidence_supports_claim = False
                 cl.verification_status = "unverified"
@@ -665,6 +748,7 @@ def verify_claims_against_snapshots(
                 continue
         else:
             cl.quote_verified = False
+            cl.provenance = "synthesized_claim"
             quote_snaps = cited_snaps
             missing_quotes.append(idx)
 
@@ -811,6 +895,7 @@ class DeepResearchEngine:
         search_service=None,
         knowledge_pipeline=None,
         document_service: DocumentService | None = None,
+        fs_access: Any = None,
         online_allowed_fn: Callable[[], bool] | None = None,
         synthesizer_fn: SynthesizerFn | None = None,
         claim_assessor_fn: ClaimAssessorFn | None = None,
@@ -819,6 +904,7 @@ class DeepResearchEngine:
         self.search_service = search_service
         self.knowledge_pipeline = knowledge_pipeline
         self.document_service = document_service or DocumentService(self.data_dir / "outputs" / "documents")
+        self.fs_access = fs_access
         self.online_allowed_fn = online_allowed_fn or (lambda: False)
         self.synthesizer_fn = synthesizer_fn
         self.claim_assessor_fn = claim_assessor_fn
@@ -875,6 +961,91 @@ class DeepResearchEngine:
     ) -> tuple[list[ResearchSnapshot], list[dict[str, Any]], list[str]]:
         return verify_checkpoint_snapshots(task_id, checkpoint, data_dir=self.data_dir)
 
+    async def _investigate_local_folders(
+        self,
+        task_id: str,
+        subquery: str,
+        local_folders: list[str],
+        *,
+        snapshots: list[ResearchSnapshot],
+        seen_urls: set[str],
+    ) -> list[str]:
+        warnings: list[str] = []
+        if not local_folders or len(snapshots) >= MAX_TOTAL_PAGES:
+            return warnings
+        if self.fs_access is None:
+            warnings.append("Local folder access denied: filesystem permission manager unavailable")
+            return warnings
+
+        from ..departments.assistant.documents import parse_document_untrusted
+
+        allowed_exts = {".md", ".txt", ".py", ".json", ".csv", ".rst", ".yaml", ".yml", ".toml", ".pdf", ".docx", ".xlsx"}
+        q_terms = _content_terms(subquery, include_polarity=False)
+        added = 0
+
+        for raw_dir in local_folders:
+            if len(snapshots) >= MAX_TOTAL_PAGES or added >= 4:
+                break
+            perm = await self.fs_access.authorize(raw_dir, "list_directory", task_id=task_id)
+            if not getattr(perm, "allowed", False):
+                warnings.append(f"Local folder access denied ({getattr(perm, 'reason', 'permission required')}): {raw_dir}")
+                continue
+            folder = Path(getattr(perm, "canonical_path", raw_dir) or raw_dir)
+            if not folder.exists() or not folder.is_dir():
+                warnings.append(f"Local folder not found: {raw_dir}")
+                continue
+
+            candidates: list[Path] = []
+            for p in sorted(folder.rglob("*")):
+                if len(candidates) >= 24:
+                    break
+                if p.is_file() and p.suffix.lower() in allowed_exts and p.stat().st_size <= 512_000:
+                    candidates.append(p)
+            # Rank by subquery term overlap cleanly
+            candidates.sort(
+                key=lambda fp: (
+                    len(q_terms.intersection(_content_terms(fp.name, include_polarity=False))),
+                    fp.name,
+                ),
+                reverse=True,
+            )
+            for fp in candidates:
+                if len(snapshots) >= MAX_TOTAL_PAGES or added >= 4:
+                    break
+                fperm = await self.fs_access.authorize(fp, "read_file", task_id=task_id)
+                if not getattr(fperm, "allowed", False):
+                    continue
+                canon = f"file://{fp.resolve().as_posix()}"
+                if canon in seen_urls:
+                    continue
+                try:
+                    parsed = parse_document_untrusted(fp, max_chars=8000)
+                    text = str(parsed.get("raw_text") or parsed.get("text") or "").strip()
+                    if not text:
+                        text = fp.read_text(encoding="utf-8", errors="ignore").strip()
+                except Exception:
+                    try:
+                        text = fp.read_text(encoding="utf-8", errors="ignore").strip()
+                    except Exception:
+                        text = ""
+                if not text:
+                    continue
+                seen_urls.add(canon)
+                sid = f"S{len(snapshots) + 1}"
+                snapshots.append(
+                    self._store_snapshot(
+                        task_id,
+                        source_id=sid,
+                        title=fp.name,
+                        url=canon,
+                        source_type="local_file",
+                        content=text[:8000],
+                        query=subquery,
+                    )
+                )
+                added += 1
+        return warnings
+
     async def _investigate_query(
         self,
         task_id: str,
@@ -883,11 +1054,23 @@ class DeepResearchEngine:
         online_allowed: bool,
         snapshots: list[ResearchSnapshot],
         seen_urls: set[str],
+        local_folders: list[str] | None = None,
         max_pages: int = MAX_PAGES_PER_QUERY,
     ) -> list[str]:
         warnings: list[str] = []
         if len(snapshots) >= MAX_TOTAL_PAGES:
             return warnings
+
+        if local_folders:
+            warnings.extend(
+                await self._investigate_local_folders(
+                    task_id,
+                    subquery,
+                    local_folders,
+                    snapshots=snapshots,
+                    seen_urls=seen_urls,
+                )
+            )
 
         if self.knowledge_pipeline is not None:
             try:
@@ -1241,6 +1424,22 @@ class DeepResearchEngine:
                 lines.append(
                     f"- **[{s.source_id}]** {s.title} — {s.url} (`{s.source_type}`, sha256=`{s.sha256[:16]}...`, snapshot=`{s.snapshot_path}`)"
                 )
+        freshness, limitations = build_freshness_and_limitations(
+            snapshots,
+            verification,
+            online_allowed=online_allowed,
+            warnings=warnings,
+        )
+        lines.extend(
+            [
+                "",
+                "## Freshness, Coverage & Known Limitations",
+                "",
+                f"- **Sources captured**: {freshness['source_count']} ({freshness['independent_source_count']} independent canonical sources)",
+            ]
+        )
+        for lim in limitations:
+            lines.append(f"- **Limitation**: {lim}")
         lines.append("")
         return "\n".join(lines)
 
@@ -1252,9 +1451,11 @@ class DeepResearchEngine:
         ctx: TaskRunContext | None = None,
         export_format: str | None = "md",
         steer_notes: list[str] | None = None,
+        local_folders: list[str] | None = None,
     ) -> dict[str, Any]:
         """Run or resume full PLAN -> INVESTIGATE -> REVIEW -> WRITE -> VERIFY -> REVISE pipeline."""
         online_allowed = bool(self.online_allowed_fn())
+        eff_local_folders = [str(f).strip() for f in (local_folders or []) if str(f).strip()]
         checkpoint = ctx.checkpoint if ctx is not None else {}
         done_steps = ctx.completed_step_keys if ctx is not None else set()
         effective_steer = list(steer_notes or [])
@@ -1302,6 +1503,7 @@ class DeepResearchEngine:
                 online_allowed=online_allowed,
                 snapshots=snapshots,
                 seen_urls=seen_urls,
+                local_folders=eff_local_folders,
             )
             warnings.extend(w)
             if ctx is not None:
@@ -1500,6 +1702,12 @@ class DeepResearchEngine:
                 current_step=f"Verified report ({verification.verified_claim_count} verified, {verification.disputed_claim_count} disputed, {verification.unverified_claim_count} unverified)",
             )
 
+        freshness, limitations = build_freshness_and_limitations(
+            snapshots,
+            verification,
+            online_allowed=online_allowed,
+            warnings=warnings,
+        )
         return {
             "ok": True,
             "task_id": task_id,
@@ -1511,6 +1719,9 @@ class DeepResearchEngine:
             "integrity_warnings": integrity_warnings,
             "claims": [c.to_dict() for c in claims],
             "verification": verification.to_dict(),
+            "contradictions": list(verification.contradictions_found),
+            "freshness": freshness,
+            "limitations": limitations,
             "warnings": warnings,
             "markdown": markdown,
             "summary": summary,
@@ -1537,6 +1748,7 @@ async def run_deep_research_background_task(
         question=str(payload.get("question") or task.get("user_request") or ""),
         ctx=ctx,
         export_format=export_fmt if export_req else None,
+        local_folders=list(payload.get("local_folders") or []),
     )
     ver = res["verification"]
     all_corrupted = bool(res.get("integrity_warnings")) and len(res.get("sources") or []) == 0
@@ -1573,8 +1785,15 @@ async def run_deep_research_background_task(
         outcome=task_outcome.to_dict(),
         artifact_outcome=res.get("outcome") if export_req else None,
         meta_patch={
+            "research_question": res["question"],
+            "research_summary": res["summary"],
+            "research_claims": res["claims"],
             "research_verification": res["verification"],
             "research_sources": res["sources"],
+            "research_freshness": res["freshness"],
+            "research_limitations": res["limitations"],
+            "research_contradictions": res["contradictions"],
+            "research_warnings": res["warnings"],
             "research_mode": res["mode"],
             "integrity_warnings": res.get("integrity_warnings") or [],
             "rejected_snapshots": res.get("rejected_snapshots") or [],

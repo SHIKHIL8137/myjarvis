@@ -15,10 +15,27 @@ from .config import ProactiveSpec
 class ProactiveSuggestionEngine:
     """Computes dismissible HUD suggestion cards without ever running tools automatically."""
 
-    def __init__(self, spec: ProactiveSpec | None = None) -> None:
+    def __init__(self, spec: ProactiveSpec | None = None, db: Any = None) -> None:
         self.spec = spec or ProactiveSpec()
+        self.db = db
         self._dismissed_until: dict[str, float] = {}
         self._lock = threading.Lock()
+        if self.db is not None:
+            self._load_dismissals_sync()
+
+    def _load_dismissals_sync(self) -> None:
+        if self.db is None:
+            return
+        now = time.time()
+        try:
+            from .db.models import ProactiveDismissalRow
+            with self.db.sync_session() as s:
+                rows = s.query(ProactiveDismissalRow).filter(ProactiveDismissalRow.dismissed_until > now).all()
+                with self._lock:
+                    for r in rows:
+                        self._dismissed_until[r.id] = float(r.dismissed_until)
+        except Exception:
+            pass
 
     def update_spec(self, spec: ProactiveSpec) -> None:
         self.spec = spec
@@ -27,11 +44,32 @@ class ProactiveSuggestionEngine:
         until = time.time() + float(self.spec.cooldown_s)
         with self._lock:
             self._dismissed_until[suggestion_id] = until
+        if self.db is not None:
+            try:
+                from .db.models import ProactiveDismissalRow
+                with self.db.sync_session() as s:
+                    row = s.get(ProactiveDismissalRow, suggestion_id)
+                    if row is None:
+                        row = ProactiveDismissalRow(id=suggestion_id, dismissed_until=until)
+                        s.add(row)
+                    else:
+                        row.dismissed_until = until
+                    s.commit()
+            except Exception:
+                pass
         return {"dismissed": suggestion_id, "cooldown_until": round(until, 2)}
 
     def clear_dismissals(self) -> None:
         with self._lock:
             self._dismissed_until.clear()
+        if self.db is not None:
+            try:
+                from .db.models import ProactiveDismissalRow
+                with self.db.sync_session() as s:
+                    s.query(ProactiveDismissalRow).delete()
+                    s.commit()
+            except Exception:
+                pass
 
     def _is_suppressed(self, sid: str, now: float) -> bool:
         with self._lock:

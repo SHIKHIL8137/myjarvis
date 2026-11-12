@@ -45,6 +45,22 @@ export interface AssistantTaskItem {
   source: string;
   intent: string;
   status: string;
+  canonical_status?: string;
+  pause_reason?: string;
+  scheduled_for?: number | null;
+  steps_used?: number;
+  step_budget?: number;
+  tokens_used?: number;
+  token_budget?: number;
+  tools_used_count?: number;
+  tool_budget?: number;
+  completed_step_keys?: string[];
+  partial_report?: {
+    summary?: string;
+    completed_steps?: string[];
+    remaining_budget?: Record<string, number>;
+    reason?: string;
+  } | null;
   plan: string[];
   selected_capabilities: string[];
   selected_agents: string[];
@@ -141,11 +157,12 @@ interface ProactiveSuggestionItem {
 const READ_OP_SET = new Set(["list_directory", "read_file", "search_files", "read_metadata"]);
 
 function taskTone(status: string): "ok" | "warn" | "danger" | "info" | "" {
-  if (status === "completed") return "ok";
-  if (status === "running" || status === "planning" || status === "queued") return "info";
+  if (status === "completed" || status === "done") return "ok";
+  if (status === "running" || status === "planning" || status === "queued" || status === "scheduled") return "info";
   if (
     status === "unverified" ||
     status === "started" ||
+    status === "waiting" ||
     status === "awaiting_clarification" ||
     status === "awaiting_permission" ||
     status === "awaiting_approval" ||
@@ -154,7 +171,7 @@ function taskTone(status: string): "ok" | "warn" | "danger" | "info" | "" {
   ) {
     return "warn";
   }
-  if (status === "failed" || status === "cancelled") return "danger";
+  if (status === "failed" || status === "cancelled" || status === "budget_exhausted") return "danger";
   return "";
 }
 
@@ -187,6 +204,8 @@ export const AssistantHome: React.FC<AssistantHomeProps> = ({
   const [coreMode, setCoreMode] = useState<CoreMode>("ring");
   const [tasks, setTasks] = useState<AssistantTaskItem[]>([]);
   const [tasksOpen, setTasksOpen] = useState(false);
+  const [taskFilter, setTaskFilter] = useState<string>("all");
+  const [steerInputs, setSteerInputs] = useState<Record<string, string>>({});
   const [transcripts, setTranscripts] = useState<VoiceTranscriptItem[]>([]);
   const [voiceOpen, setVoiceOpen] = useState(false);
   const [opsTab, setOpsTab] = useState<OpsTab | null>(null);
@@ -218,14 +237,18 @@ export const AssistantHome: React.FC<AssistantHomeProps> = ({
 
   useEffect(() => {
     if (!requestedDrawer) return;
-    if (requestedDrawer === "tasks") {
-      setTasksOpen(true);
-    } else if (requestedDrawer === "voice") {
+    if (requestedDrawer === "voice") {
       setVoiceOpen(true);
-    } else if (["history", "aliases", "memory", "desktop", "system"].includes(requestedDrawer)) {
+    } else if (requestedDrawer === "agents" || requestedDrawer === "workforce") {
+      setOpsTab("agents");
+    } else if (requestedDrawer === "actions" || requestedDrawer === "recovery" || requestedDrawer === "approvals") {
+      setOpsTab("actions");
+    } else if (
+      ["tasks", "agents", "research", "routines", "actions", "history", "aliases", "memory", "desktop", "system"].includes(
+        requestedDrawer
+      )
+    ) {
       setOpsTab(requestedDrawer as OpsTab);
-    } else if (requestedDrawer === "approvals") {
-      setOpsTab("desktop");
     }
     onClearRequestedDrawer?.();
   }, [requestedDrawer, onClearRequestedDrawer]);
@@ -534,6 +557,54 @@ export const AssistantHome: React.FC<AssistantHomeProps> = ({
     }
   };
 
+  const pauseTask = async (taskId: string) => {
+    try {
+      const r = await apiFetch<{ task: AssistantTaskItem }>(`/v2/tasks/${taskId}/pause`, {
+        method: "POST",
+        body: { reason: "Paused by operator" },
+      });
+      if (r.task) {
+        setTasks((prev) => [r.task, ...prev.filter((t) => t.task_id !== taskId)]);
+      }
+      onNotify("Task paused.");
+    } catch (e) {
+      onNotify((e as Error).message);
+    }
+  };
+
+  const resumeTask = async (taskId: string) => {
+    try {
+      const r = await apiFetch<{ task: AssistantTaskItem }>(`/v2/tasks/${taskId}/resume`, {
+        method: "POST",
+        body: { note: "Resumed from HUD" },
+      });
+      if (r.task) {
+        setTasks((prev) => [r.task, ...prev.filter((t) => t.task_id !== taskId)]);
+      }
+      onNotify("Task resumed.");
+    } catch (e) {
+      onNotify((e as Error).message);
+    }
+  };
+
+  const steerTask = async (taskId: string) => {
+    const instruction = (steerInputs[taskId] || "").trim();
+    if (!instruction) return;
+    try {
+      const r = await apiFetch<{ task: AssistantTaskItem }>(`/v2/tasks/${taskId}/steer`, {
+        method: "POST",
+        body: { instruction },
+      });
+      if (r.task) {
+        setTasks((prev) => [r.task, ...prev.filter((t) => t.task_id !== taskId)]);
+      }
+      setSteerInputs((prev) => ({ ...prev, [taskId]: "" }));
+      onNotify("Steering instruction queued.");
+    } catch (e) {
+      onNotify((e as Error).message);
+    }
+  };
+
   const clearConversation = async () => {
     try {
       await apiFetch("/history", { method: "DELETE" });
@@ -710,12 +781,17 @@ export const AssistantHome: React.FC<AssistantHomeProps> = ({
             >
               Voice ({transcripts.length})
             </button>
-            {(["history", "aliases", "memory", "desktop", "system"] as OpsTab[]).map((t) => (
+            {(["tasks", "agents", "research", "routines", "actions", "history", "aliases", "memory", "desktop", "system"] as OpsTab[]).map((t) => (
               <button
                 key={t}
                 className={opsTab === t ? "active" : "ghost"}
                 onClick={() => setOpsTab((cur) => (cur === t ? null : t))}
               >
+                {t === "tasks" && "Tasks"}
+                {t === "agents" && "Agents"}
+                {t === "research" && "Research"}
+                {t === "routines" && "Routines"}
+                {t === "actions" && "Actions"}
                 {t === "history" && "History"}
                 {t === "aliases" && "Aliases"}
                 {t === "memory" && "Memory"}
@@ -809,23 +885,51 @@ export const AssistantHome: React.FC<AssistantHomeProps> = ({
         {/* Contextual Tasks Panel: shown on active work or user click */}
         {tasksOpen && (
           <div className="contextual-tasks-panel" aria-label="Contextual Assistant Tasks">
-            <div className="row between" style={{ marginBottom: 6 }}>
-              <span className="eyebrow">Central Task Manager</span>
+            <div className="row between wrap" style={{ marginBottom: 6, gap: 8 }}>
+              <div className="row wrap" style={{ gap: 6 }}>
+                <span className="eyebrow">Central Task Manager</span>
+                {(["all", "active", "scheduled", "paused", "completed", "failed"] as const).map((f) => (
+                  <button
+                    key={f}
+                    className={taskFilter === f ? "primary" : "ghost"}
+                    style={{ fontSize: 11, padding: "2px 8px" }}
+                    onClick={() => setTaskFilter(f)}
+                  >
+                    {f}
+                  </button>
+                ))}
+              </div>
               <button className="ghost icon" onClick={() => setTasksOpen(false)} aria-label="Close tasks panel">✕</button>
             </div>
             {tasks.length === 0 ? (
               <p className="dim">No assistant tasks recorded yet.</p>
             ) : (
               <div className="task-cards-list">
-                {tasks.slice(0, 8).map((t) => {
+                {tasks
+                  .filter((t) => {
+                    if (taskFilter === "all") return true;
+                    if (taskFilter === "active") {
+                      return ["queued", "planning", "awaiting_clarification", "awaiting_permission", "awaiting_approval", "running", "waiting_quota", "scheduled"].includes(t.status);
+                    }
+                    if (taskFilter === "completed") return t.status === "completed" || t.canonical_status === "done";
+                    if (taskFilter === "failed") return ["failed", "cancelled", "budget_exhausted"].includes(t.status);
+                    return t.status === taskFilter;
+                  })
+                  .map((t) => {
                   const outcome = (t.meta?.outcome || null) as { status?: string; verified?: boolean; summary?: string; error?: string } | null;
                   const artifactOutcome = (t.meta?.artifact_outcome || null) as { status?: string; summary?: string; error?: string } | null;
                   const partialFailure = Boolean(t.meta?.partial_failure);
+                  const isActiveTask = ["queued", "planning", "awaiting_clarification", "awaiting_permission", "awaiting_approval", "running", "paused", "waiting_quota", "scheduled"].includes(t.status);
+                  const canPause = ["queued", "planning", "running", "scheduled"].includes(t.status);
+                  const canResume = ["paused", "waiting_quota", "awaiting_permission", "awaiting_approval"].includes(t.status);
                   return (
                     <div key={t.task_id} className="task-mini-card">
                       <div className="row between wrap">
                         <div className="row wrap" style={{ gap: 6 }}>
                           <span className={`pill ${taskTone(t.status)}`}>{t.status}</span>
+                          {t.canonical_status && t.canonical_status !== t.status && (
+                            <span className="chip static">{t.canonical_status}</span>
+                          )}
                           {outcome?.status && outcome.status !== "done" && outcome.status !== t.status && (
                             <span className={`pill ${taskTone(outcome.status)}`}>outcome: {outcome.status}</span>
                           )}
@@ -836,12 +940,44 @@ export const AssistantHome: React.FC<AssistantHomeProps> = ({
                           )}
                         </div>
                         <span className="mono dim">{t.intent} · {t.source} · {fmtTime(t.created_at)}</span>
-                        {["queued", "planning", "awaiting_permission", "awaiting_approval", "running", "paused", "waiting_quota"].includes(t.status) && (
-                          <button className="danger" onClick={() => cancelTask(t.task_id)}>Cancel</button>
-                        )}
+                        <div className="row wrap" style={{ gap: 4 }}>
+                          {canPause && (
+                            <button className="ghost" onClick={() => pauseTask(t.task_id)}>Pause</button>
+                          )}
+                          {canResume && (
+                            <button className="primary" onClick={() => resumeTask(t.task_id)}>Resume</button>
+                          )}
+                          {isActiveTask && (
+                            <button className="danger" onClick={() => cancelTask(t.task_id)}>Cancel</button>
+                          )}
+                        </div>
                       </div>
                       <div className="task-req">{t.user_request}</div>
+                      {(t.step_budget ?? 0) > 0 && (
+                        <div className="dim mono" style={{ fontSize: 11 }}>
+                          Budget: {t.steps_used ?? 0}/{t.step_budget} steps · {t.tokens_used ?? 0}/{t.token_budget ?? 0} tok · {t.tools_used_count ?? 0}/{t.tool_budget ?? 0} tools
+                        </div>
+                      )}
                       {t.current_step && <div className="dim" style={{ fontSize: 11.5 }}>{t.current_step}</div>}
+                      {t.pause_reason && <div className="dim" style={{ fontSize: 11 }}>Pause reason: {t.pause_reason}</div>}
+                      {t.partial_report?.summary && (
+                        <div className="dim" style={{ fontSize: 11, marginTop: 2 }}>
+                          Partial report: {t.partial_report.summary}
+                        </div>
+                      )}
+                      {isActiveTask && (
+                        <div className="row" style={{ gap: 6, marginTop: 4 }}>
+                          <input
+                            type="text"
+                            value={steerInputs[t.task_id] || ""}
+                            onChange={(e) => setSteerInputs((prev) => ({ ...prev, [t.task_id]: e.target.value }))}
+                            placeholder="Send steering note..."
+                            aria-label={`Steer task ${t.task_id}`}
+                            style={{ flex: 1, fontSize: 12, padding: "4px 8px" }}
+                          />
+                          <button className="ghost" onClick={() => steerTask(t.task_id)}>Steer</button>
+                        </div>
+                      )}
                       {outcome?.summary && (outcome.status === "unverified" || outcome.status === "started") && (
                         <div className="dim" style={{ fontSize: 11 }}>Outcome: {outcome.summary}</div>
                       )}

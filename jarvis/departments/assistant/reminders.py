@@ -1,6 +1,9 @@
 """Persistent local-first reminder & alarm engine backed by SQLAlchemy + EventBus notifications."""
+from datetime import datetime
 import time
 import uuid
+
+from apscheduler.triggers.cron import CronTrigger
 
 from ...core.event_bus import EventBus
 from ...db.engine import DatabaseManager
@@ -50,9 +53,22 @@ class ReminderService:
         with self.db.sync_session() as s:
             rows = s.query(ReminderRow).filter(ReminderRow.status == "scheduled", ReminderRow.due_at <= ts).all()
             for row in rows:
-                row.status = "triggered"
                 row.triggered_at = round(ts, 3)
+                if row.recurrence_cron:
+                    try:
+                        trig = CronTrigger.from_crontab(row.recurrence_cron)
+                        nxt = trig.get_next_fire_time(None, datetime.fromtimestamp(ts))
+                        if nxt is not None:
+                            row.due_at = nxt.timestamp()
+                            row.status = "scheduled"
+                        else:
+                            row.status = "triggered"
+                    except Exception:
+                        row.status = "triggered"
+                else:
+                    row.status = "triggered"
                 d = self._to_dict(row)
+                d["next_due_at"] = row.due_at if row.status == "scheduled" else None
                 fired.append(d)
                 if self.bus:
                     self.bus.publish({"type": "reminder_due", "reminder": d})

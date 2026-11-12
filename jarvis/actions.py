@@ -644,12 +644,20 @@ class ActionExecutor:
             elif action in ("keyboard_type", "mouse_click"):
                 if not bool(getattr(self.spec, "allow_input_automation", False)):
                     raise ActionPermissionError("Desktop input automation is disabled")
-                res = {"action": action, "executed": True, "platform_supported": os.name == "nt", "args": dict(args)}
+                is_win = os.name == "nt"
+                verified = is_win
+                status_val = ToolStatus.STARTED.value if is_win else ToolStatus.UNVERIFIED.value
+                summary_val = (
+                    f"Dispatched verified OS input action `{action}`"
+                    if is_win
+                    else f"Input action `{action}` dispatched but unverified on non-Windows host"
+                )
+                res = {"action": action, "executed": is_win, "platform_supported": is_win, "args": dict(args)}
                 outcome = ToolOutcome(
                     tool_name=action,
-                    status=ToolStatus.STARTED.value,
-                    summary=f"Approved input action `{action}` dispatched",
-                    checks=[VerificationCheck("approved_input_dispatched", True, action).to_dict()],
+                    status=status_val,
+                    summary=summary_val,
+                    checks=[VerificationCheck("os_input_platform_verified", verified, f"platform={os.name}").to_dict()],
                 )
             elif action == "open_url":
                 safe_u = sanitize_url(str(args["url"]))

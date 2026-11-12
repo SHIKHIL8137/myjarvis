@@ -19,7 +19,7 @@ from .api_deps import (
 from .api_decision import create_decision_subrouter
 from .api_skills import create_skills_subrouter
 from .config import PROVIDER_ENV_VARS, delete_provider_api_key, has_provider_api_key, set_provider_api_key
-from .departments.assistant.documents import parse_document
+from .core.errors import TaskTransitionError, UndoConflictError
 from .filesystem_access import ALL_OPS, FS_OPERATION_GROUPS, FilesystemSecurityError
 from .gateway.gateway import CloudGatewayError
 from .gateway.interface import GatewayRequest
@@ -108,6 +108,26 @@ class TaskSteerIn(BaseModel):
     instruction: str = Field(..., min_length=1, max_length=1000)
     author: str = "owner"
     resume_if_paused: bool = False
+
+
+class TaskCreateIn(BaseModel):
+    goal: str = Field(..., min_length=1, max_length=4000)
+    worker_kind: str = Field("assistant", min_length=1, max_length=48)
+    intent: str = Field("background_task", min_length=1, max_length=64)
+    scheduled_for: float | None = None
+    deadline_s: float | None = Field(None, gt=0.0, le=86400.0)
+    step_budget: int = Field(20, ge=1, le=200)
+    token_budget: int = Field(120000, ge=100, le=2_000_000)
+    tool_budget: int = Field(40, ge=1, le=200)
+    max_attempts: int = Field(3, ge=1, le=10)
+    payload: dict = Field(default_factory=dict)
+    plan: list = Field(default_factory=list)
+    meta: dict = Field(default_factory=dict)
+    run_now: bool = False
+
+
+class TaskPauseIn(BaseModel):
+    reason: str = Field("Paused by owner", min_length=1, max_length=240)
 
 
 class DocParseIn(BaseModel):
@@ -225,6 +245,23 @@ class RouteTestIn(BaseModel):
     require_vision: bool = False
     json_mode: bool = False
     project_privacy_level: str = Field("private", pattern="^(public|internal|private|confidential|restricted)$")
+
+
+class RoutineCreateIn(BaseModel):
+    title: str = Field(..., min_length=1, max_length=300)
+    description: str = Field("", max_length=600)
+    trigger_type: str = Field("once", pattern="^(once|daily|weekly|monthly|every_n_minutes|startup|conditional)$")
+    trigger_spec: dict = Field(default_factory=dict)
+    action_type: str = Field("notification", min_length=1, max_length=64)
+    action_payload: dict = Field(default_factory=dict)
+    late_policy: str = Field("run_once_if_within_grace", pattern="^(skip|run_once_if_within_grace|run_immediately)$")
+    grace_period_s: int = Field(3600, ge=10, le=604800)
+    channel: str = Field("voice+ui", min_length=1, max_length=32)
+    enabled: bool = True
+
+
+class RoutineToggleIn(BaseModel):
+    enabled: bool
 
 
 def create_v2_router(fallback=None) -> APIRouter:
@@ -492,8 +529,14 @@ def create_v2_router(fallback=None) -> APIRouter:
 
     @router.post("/documents/parse")
     async def parse_user_document(body: DocParseIn, a=Depends(get_a)):
-        safe_path = a.filesystem.resolve_safe(body.path, must_exist=True)
-        return parse_document(safe_path)
+        perm = await a.orchestrator.fs_access.authorize(body.path, "read_file")
+        if not getattr(perm, "allowed", False):
+            raise HTTPException(403, f"Filesystem permission denied: {getattr(perm, 'reason', 'Access required')}")
+        from .departments.assistant.documents import parse_document_untrusted
+        canon = Path(getattr(perm, "canonical_path", body.path) or body.path)
+        if not canon.exists() or not canon.is_file():
+            raise HTTPException(404, f"Document not found: {body.path}")
+        return parse_document_untrusted(canon)
 
     @router.get("/documents/download/{filename}")
     async def download_document(filename: str, a=Depends(get_a)):
@@ -801,7 +844,7 @@ def create_v2_router(fallback=None) -> APIRouter:
         a.bus.publish({"type": "filesystem_permissions_changed"})
         return {"ok": True}
 
-    # ---- P10.20 Centralized Assistant Tasks ----------------------------------------------------------
+    # ---- P10.20 / P1 Centralized Assistant Tasks -----------------------------------------------------
     @router.get("/tasks")
     async def list_assistant_tasks(
         status: str | None = None,
@@ -811,6 +854,30 @@ def create_v2_router(fallback=None) -> APIRouter:
     ):
         return {"tasks": await a.orchestrator.tasks.list_tasks(status=status, active_only=active_only, limit=limit)}
 
+    @router.post("/tasks")
+    async def create_assistant_task(body: TaskCreateIn, a=Depends(get_a)):
+        deadline_at = (time.time() + float(body.deadline_s)) if body.deadline_s else None
+        task = await a.orchestrator.task_runner.enqueue(
+            body.goal,
+            worker_kind=body.worker_kind,
+            intent=body.intent,
+            source="api",
+            payload=body.payload,
+            max_attempts=body.max_attempts,
+            step_budget=body.step_budget,
+            token_budget=body.token_budget,
+            tool_budget=body.tool_budget,
+            deadline_at=deadline_at,
+            scheduled_for=body.scheduled_for,
+            meta={"safe_resumable": True, **(body.meta or {})},
+        )
+        if body.plan:
+            task = await a.orchestrator.tasks.update_task(task["task_id"], plan=body.plan) or task
+        if body.run_now and not (body.scheduled_for and body.scheduled_for > time.time()):
+            await a.orchestrator.task_runner.run_once()
+            task = await a.orchestrator.tasks.get_task(task["task_id"]) or task
+        return {"ok": True, "task": task}
+
     @router.get("/tasks/{task_id}")
     async def get_assistant_task(task_id: str, a=Depends(get_a)):
         t = await a.orchestrator.tasks.get_task(task_id)
@@ -818,9 +885,23 @@ def create_v2_router(fallback=None) -> APIRouter:
             raise HTTPException(404, f"Task {task_id} not found")
         return t
 
+    @router.post("/tasks/{task_id}/pause")
+    async def pause_assistant_task(task_id: str, body: TaskPauseIn | None = None, a=Depends(get_a)):
+        reason = body.reason if body is not None else "Paused by owner"
+        try:
+            t = await a.orchestrator.tasks.pause_task(task_id, reason=reason)
+        except TaskTransitionError as e:
+            raise HTTPException(409, str(e)) from e
+        if t is None:
+            raise HTTPException(404, f"Task {task_id} not found")
+        return {"ok": True, "task": t}
+
     @router.post("/tasks/{task_id}/cancel")
     async def cancel_assistant_task(task_id: str, reason: str = "Cancelled by owner", a=Depends(get_a)):
-        t = await a.orchestrator.tasks.cancel_task(task_id, reason=reason)
+        try:
+            t = await a.orchestrator.tasks.cancel_task(task_id, reason=reason)
+        except TaskTransitionError as e:
+            raise HTTPException(409, str(e)) from e
         if t is None:
             raise HTTPException(404, f"Task {task_id} not found")
         await a.orchestrator.fs_access.consume_task_once_permissions(task_id)
@@ -844,20 +925,12 @@ def create_v2_router(fallback=None) -> APIRouter:
 
     @router.post("/tasks/{task_id}/resume")
     async def resume_assistant_task(task_id: str, a=Depends(get_a)):
-        t = await a.orchestrator.tasks.get_task(task_id)
-        if t is None:
+        try:
+            updated = await a.orchestrator.tasks.resume_task(task_id)
+        except TaskTransitionError as e:
+            raise HTTPException(409, str(e)) from e
+        if updated is None:
             raise HTTPException(404, f"Task {task_id} not found")
-        if t["status"] in ("awaiting_permission", "awaiting_approval"):
-            raise HTTPException(409, "Task requires explicit permission or approval decision before resuming")
-        if t["status"] not in ("paused", "waiting_quota", "queued"):
-            raise HTTPException(409, f"Task cannot be resumed from status '{t['status']}'")
-        updated = await a.orchestrator.tasks.update_task(
-            task_id,
-            status="queued",
-            current_step="Manually resumed by owner",
-            clear_not_before=True,
-            clear_claim=True,
-        )
         a.orchestrator.task_runner.wake()
         return {"ok": True, "task": updated}
 
@@ -893,12 +966,33 @@ def create_v2_router(fallback=None) -> APIRouter:
     @router.post("/actions/execute")
     async def execute_desktop_action(body: ActionExecuteIn, a=Depends(get_a)):
         try:
-            return a.actions.request_or_execute(
+            res = a.actions.request_or_execute(
                 body.action,
                 body.args,
                 confirmed_token=body.confirmed_token,
             )
+            if not res.get("confirmation_required"):
+                out = res.get("outcome") or {}
+                await a.orchestrator.undo.record_execution(
+                    action_type=body.action,
+                    target=str(out.get("target") or body.args.get("path") or body.args.get("url") or ""),
+                    permission_level=str(res.get("level") or "READ"),
+                    status=str(out.get("status") or res.get("status") or "done"),
+                    verified=bool(res.get("verified", False)),
+                    summary=str(out.get("summary") or ""),
+                    checks=list(out.get("checks") or []),
+                    evidence=dict(res.get("result") or {}),
+                )
+            return res
         except ActionPermissionError as e:
+            await a.orchestrator.undo.record_execution(
+                action_type=body.action,
+                target=str(body.args.get("path") or body.args.get("app") or body.args.get("url") or ""),
+                status="denied",
+                verified=False,
+                summary=str(e),
+                error=str(e),
+            )
             raise HTTPException(403, str(e)) from e
         except KeyError as e:
             raise HTTPException(404, f"Unknown confirmation token: {e}") from e
@@ -910,7 +1004,19 @@ def create_v2_router(fallback=None) -> APIRouter:
     @router.post("/actions/{token}/confirm")
     async def confirm_desktop_action(token: str, a=Depends(get_a)):
         try:
-            return a.actions.confirm(token)
+            res = a.actions.confirm(token)
+            out = res.get("outcome") or {}
+            await a.orchestrator.undo.record_execution(
+                action_type=str(res.get("action") or "action"),
+                target=str(out.get("target") or ""),
+                permission_level=str(res.get("level") or "MODIFY"),
+                status=str(out.get("status") or res.get("status") or "done"),
+                verified=bool(res.get("verified", False)),
+                summary=str(out.get("summary") or ""),
+                checks=list(out.get("checks") or []),
+                evidence=dict(res.get("result") or {}),
+            )
+            return res
         except KeyError as e:
             raise HTTPException(404, "Unknown confirmation token") from e
         except TimeoutError as e:
@@ -919,6 +1025,24 @@ def create_v2_router(fallback=None) -> APIRouter:
             raise HTTPException(409, str(e)) from e
         except ActionPermissionError as e:
             raise HTTPException(403, str(e)) from e
+
+    @router.get("/actions/executions")
+    async def list_action_executions(limit: int = 50, a=Depends(get_a)):
+        return {"ok": True, "executions": await a.orchestrator.undo.list_executions(limit=limit)}
+
+    @router.get("/undo")
+    async def list_undo_entries(status: str | None = None, limit: int = 50, a=Depends(get_a)):
+        return {"ok": True, "entries": await a.orchestrator.undo.list_undo_entries(status=status, limit=limit)}
+
+    @router.post("/undo/{undo_id}")
+    async def apply_action_undo(undo_id: str, a=Depends(get_a)):
+        try:
+            entry = await a.orchestrator.undo.apply_undo(undo_id)
+            return {"ok": True, "entry": entry}
+        except KeyError as e:
+            raise HTTPException(404, f"Undo entry '{undo_id}' not found") from e
+        except UndoConflictError as e:
+            raise HTTPException(409, str(e)) from e
 
     @router.post("/actions/{token}/reject")
     async def reject_desktop_action(token: str, a=Depends(get_a)):
@@ -945,6 +1069,67 @@ def create_v2_router(fallback=None) -> APIRouter:
             await a.orchestrator.task_runner.run_once()
             task = await a.orchestrator.tasks.get_task(task["task_id"]) or task
         return {"ok": True, "task": task}
+
+    @router.get("/research")
+    async def list_research_reports(limit: int = 20, a=Depends(get_a)):
+        all_tasks = await a.orchestrator.tasks.list_tasks(limit=max(limit * 3, 60))
+        reports: list[dict] = []
+        for t in all_tasks:
+            if t.get("worker_kind") != "deep_research" and t.get("intent") != "web_research":
+                continue
+            meta = dict(t.get("meta") or {})
+            ver = dict(meta.get("research_verification") or {})
+            reports.append(
+                {
+                    "task_id": t["task_id"],
+                    "question": str(meta.get("research_question") or t.get("user_request") or ""),
+                    "status": t.get("status"),
+                    "canonical_status": t.get("canonical_status"),
+                    "mode": str(meta.get("research_mode") or "local_kb_only"),
+                    "summary": str(meta.get("research_summary") or ""),
+                    "verified_claim_count": int(ver.get("verified_claim_count") or 0),
+                    "disputed_claim_count": int(ver.get("disputed_claim_count") or 0),
+                    "unverified_claim_count": int(ver.get("unverified_claim_count") or 0),
+                    "source_count": len(meta.get("research_sources") or []),
+                    "freshness": dict(meta.get("research_freshness") or {}),
+                    "limitations": list(meta.get("research_limitations") or []),
+                    "created_at": t.get("created_at"),
+                    "completed_at": t.get("completed_at"),
+                }
+            )
+            if len(reports) >= limit:
+                break
+        return {"ok": True, "reports": reports}
+
+    @router.get("/research/{task_id}")
+    async def get_research_report(task_id: str, a=Depends(get_a)):
+        t = await a.orchestrator.tasks.get_task(task_id)
+        if t is None:
+            raise HTTPException(404, f"Research report {task_id} not found")
+        meta = dict(t.get("meta") or {})
+        return {
+            "ok": True,
+            "report": {
+                "task_id": t["task_id"],
+                "question": str(meta.get("research_question") or t.get("user_request") or ""),
+                "status": t.get("status"),
+                "canonical_status": t.get("canonical_status"),
+                "mode": str(meta.get("research_mode") or "local_kb_only"),
+                "summary": str(meta.get("research_summary") or ""),
+                "markdown": t.get("result") or "",
+                "claims": list(meta.get("research_claims") or []),
+                "sources": list(meta.get("research_sources") or []),
+                "verification": dict(meta.get("research_verification") or {}),
+                "freshness": dict(meta.get("research_freshness") or {}),
+                "limitations": list(meta.get("research_limitations") or []),
+                "contradictions": list(meta.get("research_contradictions") or []),
+                "warnings": list(meta.get("research_warnings") or []),
+                "integrity_warnings": list(meta.get("integrity_warnings") or []),
+                "generated_files": list(t.get("generated_files") or []),
+                "created_at": t.get("created_at"),
+                "completed_at": t.get("completed_at"),
+            },
+        }
 
     # ---- Stage E System Monitoring & Proactive Suggestions ------------------------------------------
     @router.get("/system/health")
@@ -1038,6 +1223,84 @@ def create_v2_router(fallback=None) -> APIRouter:
             json_mode=body.json_mode,
             project_privacy_level=body.project_privacy_level,
         )
+
+    # ---- P3 Markdown Agent Profiles & Coordination --------------------------------------------------
+    @router.get("/agents")
+    async def list_agent_profiles(scope: str | None = None, a=Depends(get_a)):
+        coord = a.orchestrator.agent_profiles
+        return {
+            "ok": True,
+            "profiles": [p.model_dump() for p in coord.list_profiles(scope=scope)],
+            "diagnostics": coord.get_diagnostics(),
+        }
+
+    @router.post("/agents/reload")
+    async def reload_agent_profiles(a=Depends(get_a)):
+        coord = a.orchestrator.agent_profiles
+        coord.reload_profiles()
+        return {
+            "ok": True,
+            "profiles": [p.model_dump() for p in coord.list_profiles()],
+            "diagnostics": coord.get_diagnostics(),
+        }
+
+    @router.get("/agents/{name}")
+    async def get_agent_profile(name: str, a=Depends(get_a)):
+        prof = a.orchestrator.agent_profiles.get_profile(name)
+        if prof is None:
+            raise HTTPException(404, f"Agent profile '{name}' not found")
+        return {"ok": True, "profile": prof.model_dump()}
+
+    # ---- P4 Unified Routines & Quiet Hours ----------------------------------------------------------
+    @router.get("/routines")
+    async def list_routines(enabled: bool | None = None, limit: int = 50, a=Depends(get_a)):
+        items = await a.orchestrator.routines.list_routines(enabled=enabled, limit=limit)
+        runs = await a.orchestrator.routines.list_runs(limit=25)
+        return {
+            "ok": True,
+            "routines": items,
+            "recent_runs": runs,
+            "quiet_hours": dict(getattr(a.settings.preferences, "quiet_hours", {}) or {}),
+        }
+
+    @router.post("/routines")
+    async def create_routine(body: RoutineCreateIn, a=Depends(get_a)):
+        r = await a.orchestrator.routines.create_routine(
+            title=body.title,
+            description=body.description,
+            trigger_type=body.trigger_type,
+            trigger_spec=body.trigger_spec,
+            action_type=body.action_type,
+            action_payload=body.action_payload,
+            late_policy=body.late_policy,
+            grace_period_s=body.grace_period_s,
+            channel=body.channel,
+            enabled=body.enabled,
+        )
+        return {"ok": True, "routine": r}
+
+    @router.get("/routines/runs")
+    async def list_routine_runs(routine_id: str | None = None, limit: int = 50, a=Depends(get_a)):
+        return {"ok": True, "runs": await a.orchestrator.routines.list_runs(routine_id=routine_id, limit=limit)}
+
+    @router.post("/routines/{routine_id}/toggle")
+    async def toggle_routine(routine_id: str, body: RoutineToggleIn, a=Depends(get_a)):
+        r = await a.orchestrator.routines.toggle_routine(routine_id, body.enabled)
+        if r is None:
+            raise HTTPException(404, f"Routine '{routine_id}' not found")
+        return {"ok": True, "routine": r}
+
+    @router.post("/routines/{routine_id}/run-now")
+    async def run_routine_now(routine_id: str, a=Depends(get_a)):
+        ev = await a.orchestrator.routines.run_now(routine_id)
+        if ev is None:
+            raise HTTPException(404, f"Routine '{routine_id}' not found")
+        return {"ok": True, **ev}
+
+    @router.post("/routines/poll")
+    async def poll_due_routines_now(a=Depends(get_a)):
+        triggered = await a.orchestrator.routines.poll_due_routines()
+        return {"ok": True, "triggered": triggered, "count": len(triggered)}
 
     router.include_router(create_skills_subrouter(fallback))
     router.include_router(create_decision_subrouter(fallback))

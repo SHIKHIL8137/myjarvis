@@ -47,3 +47,4 @@ models/
 notes/.trash/
 bench_results.json
 *.pdf
+*.zip

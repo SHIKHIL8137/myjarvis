@@ -58,6 +58,11 @@ _P10_COLUMN_DDLS: dict[str, list[tuple[str, str]]] = {
         ("completed_step_keys", "TEXT NOT NULL DEFAULT '[]'"),
         ("claimed_by", "VARCHAR(64)"),
         ("claimed_at", "FLOAT"),
+        ("scheduled_for", "FLOAT"),
+        ("pause_reason", "VARCHAR(240) NOT NULL DEFAULT ''"),
+        ("partial_report", "TEXT NOT NULL DEFAULT '{}'"),
+        ("correlation_id", "VARCHAR(64) NOT NULL DEFAULT ''"),
+        ("parent_task_id", "VARCHAR(36)"),
     ],
     "voice_transcripts": [
         ("source_language", "VARCHAR(24) NOT NULL DEFAULT 'unknown'"),

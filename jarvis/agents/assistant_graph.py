@@ -73,7 +73,7 @@ def build_assistant_graph(
 
     def export_doc(state: AssistantGraphState) -> dict:
         p = state.get("payload") or {}
-        skills_used = [s.get("skill_id") for s in (state.get("selected_skills") or []) if s.get("skill_id")]
+        skills_used = [str(s.get("skill_id")) for s in (state.get("selected_skills") or []) if s.get("skill_id")]
         res = docs.generate(
             p.get("format", "pdf"),
             filename=p.get("filename", "jarvis-report"),
@@ -152,7 +152,7 @@ def build_assistant_graph(
             }
 
         hits = state.get("context_hits") or []
-        skills_used = [s.get("skill_id") for s in (state.get("selected_skills") or []) if s.get("skill_id")]
+        skills_used = [str(s.get("skill_id")) for s in (state.get("selected_skills") or []) if s.get("skill_id")]
         note = f" Skills active: {', '.join(skills_used)}." if (skills_used and state.get("skill_prompt_block")) else ""
         return {"status": "completed", "summary": f"Gathered {len(hits)} relevant personal/experience items.{note}"}
 

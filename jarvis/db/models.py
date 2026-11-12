@@ -514,6 +514,7 @@ class AssistantTaskRow(Base):
     not_before: Mapped[float | None] = mapped_column(Float, nullable=True, index=True)
     next_retry_at: Mapped[float | None] = mapped_column(Float, nullable=True)
     deadline_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    scheduled_for: Mapped[float | None] = mapped_column(Float, nullable=True, index=True)
     step_budget: Mapped[int] = mapped_column(Integer, default=20)
     steps_used: Mapped[int] = mapped_column(Integer, default=0)
     token_budget: Mapped[int] = mapped_column(Integer, default=120000)
@@ -526,14 +527,18 @@ class AssistantTaskRow(Base):
     tools_used: Mapped[list] = mapped_column(JSON, default=list)
     permissions_requested: Mapped[list] = mapped_column(JSON, default=list)
     current_step: Mapped[str] = mapped_column(String(200), default="")
+    pause_reason: Mapped[str] = mapped_column(String(240), default="")
     result: Mapped[str] = mapped_column(Text, default="")
     generated_files: Mapped[list] = mapped_column(JSON, default=list)
     error_info: Mapped[str] = mapped_column(Text, default="")
     quota_reason: Mapped[str] = mapped_column(String(200), default="")
     payload: Mapped[dict] = mapped_column(JSON, default=dict)
     checkpoint_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    partial_report: Mapped[dict] = mapped_column(JSON, default=dict)
     steer_notes: Mapped[list] = mapped_column(JSON, default=list)
     completed_step_keys: Mapped[list] = mapped_column(JSON, default=list)
+    correlation_id: Mapped[str] = mapped_column(String(64), default="")
+    parent_task_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     claimed_by: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     claimed_at: Mapped[float | None] = mapped_column(Float, nullable=True)
     meta: Mapped[dict] = mapped_column(JSON, default=dict)
@@ -581,4 +586,91 @@ class CommandHistoryRow(Base):
     created_at: Mapped[float] = mapped_column(Float, default=_now, index=True)
     updated_at: Mapped[float] = mapped_column(Float, default=_now)
     completed_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+
+class RoutineRow(Base):
+    """Unified recurring, one-time, and conditional scheduled routines."""
+
+    __tablename__ = "routines"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    title: Mapped[str] = mapped_column(String(300))
+    description: Mapped[str] = mapped_column(String(600), default="")
+    trigger_type: Mapped[str] = mapped_column(String(32), default="once", index=True)  # once, daily, weekly, monthly, every_n_minutes, startup, conditional
+    trigger_spec: Mapped[dict] = mapped_column(JSON, default=dict)
+    action_type: Mapped[str] = mapped_column(String(64), default="notification")
+    action_payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    late_policy: Mapped[str] = mapped_column(String(32), default="run_once_if_within_grace")
+    grace_period_s: Mapped[int] = mapped_column(Integer, default=3600)
+    channel: Mapped[str] = mapped_column(String(32), default="voice+ui")
+    status: Mapped[str] = mapped_column(String(32), default="active", index=True)
+    last_run_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    next_run_at: Mapped[float | None] = mapped_column(Float, nullable=True, index=True)
+    run_count: Mapped[int] = mapped_column(Integer, default=0)
+    meta: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[float] = mapped_column(Float, default=_now)
+    updated_at: Mapped[float] = mapped_column(Float, default=_now)
+
+
+class RoutineRunRow(Base):
+    """Execution history and idempotency journal for routine runs."""
+
+    __tablename__ = "routine_runs"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    routine_id: Mapped[str] = mapped_column(String(36), index=True)
+    idempotency_key: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    status: Mapped[str] = mapped_column(String(32), default="completed", index=True)  # skipped_quiet_hours, skipped_late, completed, failed
+    scheduled_for: Mapped[float | None] = mapped_column(Float, nullable=True)
+    started_at: Mapped[float] = mapped_column(Float, default=_now)
+    completed_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    summary: Mapped[str] = mapped_column(Text, default="")
+    error: Mapped[str] = mapped_column(Text, default="")
+    task_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    meta: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class ProactiveDismissalRow(Base):
+    """Persistent storage for proactive suggestion dismissals across restarts."""
+
+    __tablename__ = "proactive_dismissals"
+    id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    dismissed_until: Mapped[float] = mapped_column(Float, index=True)
+    created_at: Mapped[float] = mapped_column(Float, default=_now)
+
+
+class UndoEntryRow(Base):
+    """Reversible action snapshots for files, notes, and reminders with conflict detection."""
+
+    __tablename__ = "undo_entries"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    action_type: Mapped[str] = mapped_column(String(64), index=True)
+    target_path: Mapped[str] = mapped_column(String(800), default="", index=True)
+    resource_id: Mapped[str] = mapped_column(String(64), default="", index=True)
+    status: Mapped[str] = mapped_column(String(32), default="available", index=True)  # available, undone, expired, conflict, non_reversible
+    reversible: Mapped[bool] = mapped_column(Boolean, default=True)
+    before_sha256: Mapped[str] = mapped_column(String(64), default="")
+    after_sha256: Mapped[str] = mapped_column(String(64), default="")
+    snapshot_data: Mapped[dict] = mapped_column(JSON, default=dict)
+    reason: Mapped[str] = mapped_column(String(400), default="")
+    created_at: Mapped[float] = mapped_column(Float, default=_now, index=True)
+    expires_at: Mapped[float | None] = mapped_column(Float, nullable=True, index=True)
+    undone_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+
+class ActionExecutionRow(Base):
+    """Full lifecycle audit journal for all actions (VALIDATE->AUTHORIZE->CONFIRM->EXECUTE->VERIFY->RECORD->REPORT)."""
+
+    __tablename__ = "action_executions"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    action_type: Mapped[str] = mapped_column(String(64), index=True)
+    target: Mapped[str] = mapped_column(String(800), default="")
+    permission_level: Mapped[str] = mapped_column(String(32), default="READ")
+    status: Mapped[str] = mapped_column(String(32), default="started", index=True)  # started, done, unverified, failed, ask, denied
+    verified: Mapped[bool] = mapped_column(Boolean, default=False)
+    summary: Mapped[str] = mapped_column(Text, default="")
+    checks: Mapped[list] = mapped_column(JSON, default=list)
+    evidence: Mapped[dict] = mapped_column(JSON, default=dict)
+    undo_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    error: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[float] = mapped_column(Float, default=_now, index=True)
 

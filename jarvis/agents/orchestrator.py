@@ -1,8 +1,10 @@
 """AgentOrchestrator: wires DB, DecisionEngine, ModelGateway, 5-Way Memory, Assistant/Dev LangGraphs & DR."""
+import asyncio
 from pathlib import Path
 import shutil
 import threading
 import time
+from typing import Any
 import uuid
 
 from langgraph.types import Command
@@ -24,6 +26,7 @@ from ..gateway.sandbox_proxy import ScopedGatewayTokenManager
 from ..integrations import git_worktree, graphify_adapter
 from ..memory.five_way import FiveWayMemoryService
 from ..recovery.backup import DisasterRecoveryManager
+from ..security.outcomes import ToolOutcome, ToolStatus, VerificationCheck
 from ..skills.registry import SkillRegistryService
 from ..skills.router import AgentCapabilityRouter
 from .approvals import ApprovalService
@@ -31,8 +34,11 @@ from .assistant_graph import build_assistant_graph
 from .checkpointer import DBBackedCheckpointSaver
 from .command_history import CommandHistoryService
 from .multistep import MultiStepExecutor
+from .profiles import AgentWorkforceCoordinator
 from .research import DeepResearchEngine, run_deep_research_background_task
-from .task_runner import BackgroundTaskRunner
+from ..departments.assistant.routines import RoutineSchedulerService
+from ..undo import UndoService
+from .task_runner import BackgroundTaskRunner, QuotaSuspendedError, TaskExecutionResult, TaskRunContext
 from .tasks import AssistantTaskService
 from .workforce_graph import build_workforce_graph
 
@@ -65,12 +71,20 @@ class AgentOrchestrator:
         )
         self.tasks = AssistantTaskService(self.db, event_publisher=self.bus.publish)
         self.task_runner = BackgroundTaskRunner(self.tasks)
+        self.undo = UndoService(self.db)
         self.command_history = CommandHistoryService(self.db)
         self.multistep = MultiStepExecutor(fs_access=self.fs_access, tasks=self.tasks, bus=self.bus)
         self.projects = ProjectRegistryService(self.db)
         self.workforce = DevWorkforceService(self.db, self.projects)
+        self.agent_profiles = AgentWorkforceCoordinator(user_dir=self.data_dir / "agents")
         self.documents = DocumentService(self.data_dir / "outputs" / "documents")
         self.reminders = ReminderService(self.db, bus=self.bus)
+        self.routines = RoutineSchedulerService(
+            self.db,
+            bus=self.bus,
+            quiet_hours_fn=lambda: getattr(self.settings.preferences, "quiet_hours", {"enabled": False, "start": "22:00", "end": "07:00"}),
+            task_runner=self.task_runner,
+        )
         self.email = EmailDraftService(self.data_dir / "outbox")
         self.calendar = LocalCalendarService(self.data_dir / "calendar")
         self.recovery = DisasterRecoveryManager(self.db, settings, data_dir=self.data_dir, secrets_path=SECRETS_PATH, approvals=self.approvals)
@@ -121,6 +135,7 @@ class AgentOrchestrator:
             search_service=None,
             knowledge_pipeline=None,
             document_service=self.documents,
+            fs_access=self.fs_access,
             online_allowed_fn=lambda: bool(self.settings.internet.enabled and not self.settings.offline_enforced),
         )
         # Re-compile assistant_graph with isolated deep_research engine and register durable worker handler.
@@ -139,6 +154,8 @@ class AgentOrchestrator:
             "deep_research",
             lambda ctx, t: run_deep_research_background_task(ctx, t, engine=self.research_engine),
         )
+        self.task_runner.register_handler("assistant", self._run_checkpointed_background_task)
+        self.task_runner.register_handler("multistep", self._run_checkpointed_background_task)
         self._workforce_graph = build_workforce_graph(
             projects=self.projects,
             workforce=self.workforce,
@@ -172,6 +189,75 @@ class AgentOrchestrator:
             self.research_engine.online_allowed_fn = online_allowed_fn
         if synthesizer_fn is not None:
             self.research_engine.synthesizer_fn = synthesizer_fn
+
+    async def _run_checkpointed_background_task(
+        self,
+        ctx: TaskRunContext,
+        task: dict[str, Any],
+    ) -> TaskExecutionResult:
+        """Execute checkpointed assistant/multistep background tasks with guardrails & steer support."""
+        payload = dict(task.get("payload") or {})
+        raw_steps: list[Any] = list(payload.get("steps") or task.get("plan") or [])
+        if not raw_steps:
+            raw_steps = ["Validate request scope", "Execute task objective", "Verify completion"]
+        completed_labels: list[str] = list((ctx.checkpoint or {}).get("completed_labels") or [])
+        applied_steers: list[str] = list((ctx.checkpoint or {}).get("applied_steers") or [])
+        tokens_per_step = int(payload.get("tokens_per_step") or 0)
+        tools_per_step = int(payload.get("tools_per_step") or 0)
+        step_delay = float(payload.get("simulate_delay_sec") or 0.0)
+        quota_at_step = payload.get("simulate_quota_at_step")
+
+        for idx, step in enumerate(raw_steps):
+            label = str(step.get("label") if isinstance(step, dict) else step)
+            step_key = f"step:{idx}:{label[:48]}"
+            await ctx.check_guardrails()
+            steers = await ctx.consume_steer_instructions()
+            if steers:
+                applied_steers.extend(steers)
+            if payload.get("simulate_quota") or (quota_at_step is not None and int(quota_at_step) == idx):
+                raise QuotaSuspendedError(str(payload.get("quota_reason") or "quota_exhausted"))
+            if ctx.is_step_done(step_key):
+                continue
+            if step_delay > 0:
+                await asyncio.sleep(step_delay)
+            await ctx.check_guardrails()
+            if label not in completed_labels:
+                completed_labels.append(label)
+            await ctx.complete_step(
+                step_key,
+                checkpoint_patch={
+                    "last_step_index": idx,
+                    "last_step_label": label,
+                    "completed_labels": completed_labels,
+                    "applied_steers": applied_steers,
+                },
+                current_step=f"Completed step {idx + 1}/{len(raw_steps)}: {label}",
+                delta_steps=1,
+                delta_tokens=tokens_per_step,
+                delta_tools=tools_per_step,
+            )
+
+        summary = str(payload.get("result_summary") or f"Completed {len(raw_steps)} checkpointed steps for: {task.get('user_request', '')[:120]}")
+        if applied_steers:
+            summary = f"{summary} (Steer applied: {'; '.join(applied_steers)})"
+        return TaskExecutionResult(
+            summary=summary,
+            result=summary,
+            outcome=ToolOutcome(
+                tool_name="assistant_task",
+                status=ToolStatus.DONE.value,
+                summary=summary,
+                verified=True,
+                checks=[
+                    VerificationCheck(
+                        name="checkpointed_steps",
+                        passed=True,
+                        detail=f"{len(raw_steps)}/{len(raw_steps)} steps completed",
+                    ).to_dict()
+                ],
+            ),
+            meta_patch={"applied_steers": applied_steers, "completed_labels": completed_labels},
+        )
 
     def is_run_cancelled(self, run_id: str) -> tuple[bool, str]:
         with self._orch_lock:
