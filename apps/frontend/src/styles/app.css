@@ -916,6 +916,24 @@ dialog.confirm::backdrop { background: rgba(2, 4, 9, 0.72); }
   opacity: 0.48;
 }
 
+.field-hint {
+  display: block;
+  margin-top: 2px;
+  font-size: 11.5px;
+  line-height: 1.35;
+  color: var(--text-dim);
+  font-weight: 400;
+}
+
+.recommended-banner {
+  padding: 10px 12px;
+  border-radius: var(--radius);
+  border: 1px solid rgba(56, 189, 248, 0.35);
+  background: rgba(8, 22, 42, 0.72);
+  display: grid;
+  gap: 6px;
+}
+
 @media (max-width: 980px) {
   .assistant-home,
   .assistant-home.with-graph {

@@ -487,3 +487,33 @@ def test_p10_20_consolidated_frontend_dist_served(assistant, settings):
     assert "JARVIS ASSISTANT" in js
     assert "SETTINGS" in js
     assert "Secondary Modules" not in js
+
+
+def test_p10_20_settings_devices_inventory_and_output_device_patch(assistant, settings, monkeypatch):
+    client = TestClient(create_app(settings, assistant=assistant))
+
+    # Normal device inventory exposes structured inputs/outputs cleanly
+    r = client.get("/api/v2/settings/devices")
+    assert r.status_code == 200
+    body = r.json()
+    assert "audio" in body
+    assert isinstance(body["audio"].get("inputs"), list)
+    assert isinstance(body["audio"].get("outputs"), list)
+    assert "available" in body["audio"]
+
+    # Handles sounddevice errors cleanly without failing Settings load
+    import sounddevice as sd
+    monkeypatch.setattr(sd, "query_devices", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("no host audio")))
+    r_err = client.get("/api/v2/settings/devices")
+    assert r_err.status_code == 200
+    err_audio = r_err.json()["audio"]
+    assert err_audio["inputs"] == []
+    assert err_audio["outputs"] == []
+    assert err_audio["available"] is False
+    assert "no host audio" in (err_audio.get("error") or "")
+
+    # Updating Speaker Output Device persists on tts.output_device
+    r_put = client.put("/api/v2/settings", json={"tts": {"output_device": 2}}, headers=H)
+    assert r_put.status_code == 200
+    assert r_put.json()["settings"]["tts"]["output_device"] == 2
+

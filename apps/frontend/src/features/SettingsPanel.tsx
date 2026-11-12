@@ -1,11 +1,12 @@
 import React, { useCallback, useEffect, useState } from "react";
 import { apiFetch } from "../api/client";
+import { AudioVideoPanel, SettingsErrorBoundary, type HostAudioInventory } from "../components/AudioVideoPanel";
 import { fmtTime, type ShellProps } from "../shell";
 
 type SectionId = "providers" | "voice" | "permissions" | "system";
 
 interface ConsolidatedSettings {
-  tts: { enabled: boolean; voice: string; speed: number };
+  tts: { enabled: boolean; voice: string; speed: number; output_device?: number | string | null };
   stt: {
     model: string;
     language: string;
@@ -127,11 +128,7 @@ interface FsAuditItem {
 }
 
 interface DeviceInfo {
-  audio?: {
-    available?: boolean;
-    inputs?: Array<{ index: number; name: string }>;
-    outputs?: Array<{ index: number; name: string }>;
-  };
+  audio?: HostAudioInventory;
 }
 
 const ALL_OPS = [
@@ -302,12 +299,16 @@ export const SettingsPanel: React.FC<ShellProps> = ({ onNotify }) => {
 
       {/* SECTION 1: AI PROVIDERS & MODEL ROUTING */}
       {section === "providers" && (
-        <>
+        <SettingsErrorBoundary title="AI Providers & Routing">
           <div className="card">
-            <h3>Primary Model & Task Routing</h3>
+            <h3>Primary Model &amp; Task Routing</h3>
+            <p className="field-hint" style={{ marginBottom: 10 }}>
+              Choose which local or cloud model answers requests, and how Jarvis assigns quick, reasoning, coding, and memory roles.
+            </p>
             <div className="grid-2">
               <label className="field">
                 Active Local Brain (Ollama)
+                <span className="field-hint">Model used for normal Jarvis conversations.</span>
                 <select
                   value={models.find((m) => m.current)?.key || ""}
                   onChange={(e) => mutate(`Switched brain to ${e.target.value}`, () => apiFetch("/models/switch", { method: "POST", body: { model: e.target.value } }))}
@@ -322,6 +323,7 @@ export const SettingsPanel: React.FC<ShellProps> = ({ onNotify }) => {
 
               <label className="field">
                 Active Gateway Provider
+                <span className="field-hint">Service used to connect to the selected model.</span>
                 <select
                   value={provDraft.active_provider || "ollama"}
                   onChange={(e) => setProvDraft((d) => ({ ...d, active_provider: e.target.value }))}
@@ -335,6 +337,7 @@ export const SettingsPanel: React.FC<ShellProps> = ({ onNotify }) => {
 
               <label className="field">
                 Fast Model Role
+                <span className="field-hint">Model role for quick responses.</span>
                 <input
                   value={provDraft.fast_model || ""}
                   onChange={(e) => setProvDraft((d) => ({ ...d, fast_model: e.target.value }))}
@@ -344,6 +347,7 @@ export const SettingsPanel: React.FC<ShellProps> = ({ onNotify }) => {
 
               <label className="field">
                 Advanced Reasoning Model Role
+                <span className="field-hint">Model role for complex reasoning.</span>
                 <input
                   value={provDraft.advanced_model || ""}
                   onChange={(e) => setProvDraft((d) => ({ ...d, advanced_model: e.target.value }))}
@@ -353,6 +357,7 @@ export const SettingsPanel: React.FC<ShellProps> = ({ onNotify }) => {
 
               <label className="field">
                 Coding Model Role
+                <span className="field-hint">Model role for coding tasks.</span>
                 <input
                   value={provDraft.coding_model || ""}
                   onChange={(e) => setProvDraft((d) => ({ ...d, coding_model: e.target.value }))}
@@ -362,6 +367,7 @@ export const SettingsPanel: React.FC<ShellProps> = ({ onNotify }) => {
 
               <label className="field">
                 Embedding Model
+                <span className="field-hint">Converts text into vectors for semantic search and memory.</span>
                 <input
                   value={provDraft.embedding_model || ""}
                   onChange={(e) => setProvDraft((d) => ({ ...d, embedding_model: e.target.value }))}
@@ -371,6 +377,7 @@ export const SettingsPanel: React.FC<ShellProps> = ({ onNotify }) => {
 
               <label className="field">
                 Fallback Provider
+                <span className="field-hint">Backup provider if the primary one fails.</span>
                 <select
                   value={provDraft.fallback_provider || "ollama"}
                   onChange={(e) => setProvDraft((d) => ({ ...d, fallback_provider: e.target.value }))}
@@ -384,6 +391,7 @@ export const SettingsPanel: React.FC<ShellProps> = ({ onNotify }) => {
 
               <label className="field">
                 Context Window (num_ctx)
+                <span className="field-hint">Amount of conversation/context the model can process (4096 recommended on 4 GB VRAM).</span>
                 <select value={cfg.num_ctx} onChange={(e) => patchSettings("Context window updated", { num_ctx: Number(e.target.value) })}>
                   {[...new Set([2048, 4096, 8192, cfg.num_ctx])].sort((a, b) => a - b).map((n) => (
                     <option key={n} value={n}>{n}</option>
@@ -393,6 +401,7 @@ export const SettingsPanel: React.FC<ShellProps> = ({ onNotify }) => {
 
               <label className="field">
                 Custom Provider Base URL (OpenAI-compatible)
+                <span className="field-hint">Endpoint URL when connecting to a self-hosted or third-party OpenAI-compatible gateway.</span>
                 <input
                   value={provDraft.custom_base_url || ""}
                   onChange={(e) => setProvDraft((d) => ({ ...d, custom_base_url: e.target.value }))}
@@ -402,6 +411,7 @@ export const SettingsPanel: React.FC<ShellProps> = ({ onNotify }) => {
 
               <label className="field">
                 Custom Model ID
+                <span className="field-hint">Exact model identifier served by your custom provider endpoint.</span>
                 <input
                   value={provDraft.custom_model || ""}
                   onChange={(e) => setProvDraft((d) => ({ ...d, custom_model: e.target.value }))}
@@ -410,7 +420,8 @@ export const SettingsPanel: React.FC<ShellProps> = ({ onNotify }) => {
               </label>
 
               <label className="field">
-                Gateway Request Timeout (seconds)
+                Request Timeout (seconds)
+                <span className="field-hint">Maximum time Jarvis waits for a provider response (30–45s recommended).</span>
                 <input
                   type="number"
                   min={5}
@@ -436,6 +447,7 @@ export const SettingsPanel: React.FC<ShellProps> = ({ onNotify }) => {
               <button
                 aria-pressed={cfg.providers.streaming}
                 className="ghost"
+                title="Stream reply tokens live instead of waiting for the full completion"
                 onClick={() => patchSettings("Streaming updated", { providers: { streaming: !cfg.providers.streaming } })}
               >
                 Streaming: {cfg.providers.streaming ? "On" : "Off"}
@@ -443,6 +455,7 @@ export const SettingsPanel: React.FC<ShellProps> = ({ onNotify }) => {
               <button
                 aria-pressed={cfg.providers.allow_cloud}
                 className="ghost"
+                title="Permit routed model calls to cloud providers when keys are configured"
                 onClick={() => patchSettings("Cloud policy updated", { providers: { allow_cloud: !cfg.providers.allow_cloud } })}
               >
                 Allow Cloud: {cfg.providers.allow_cloud ? "On" : "Off"}
@@ -450,6 +463,7 @@ export const SettingsPanel: React.FC<ShellProps> = ({ onNotify }) => {
               <button
                 aria-pressed={cfg.providers.allow_paid_models}
                 className="ghost"
+                title="Explicit safety lock preventing paid cloud models unless authorized"
                 onClick={() => patchSettings("Paid models updated", { providers: { allow_paid_models: !cfg.providers.allow_paid_models } })}
               >
                 Paid Models: {cfg.providers.allow_paid_models ? "Authorized" : "Blocked"}
@@ -457,6 +471,7 @@ export const SettingsPanel: React.FC<ShellProps> = ({ onNotify }) => {
               <button
                 aria-pressed={cfg.internet.enabled}
                 className={cfg.internet.enabled ? "warn" : "ok"}
+                title="Toggle Local Mode (offline) vs Online Assisted Mode (web search + external providers)"
                 onClick={() =>
                   mutate(
                     cfg.internet.enabled ? "Switched to Local Mode" : "Online Assisted Mode enabled",
@@ -575,194 +590,161 @@ export const SettingsPanel: React.FC<ShellProps> = ({ onNotify }) => {
               ))}
             </div>
           </div>
-        </>
+        </SettingsErrorBoundary>
       )}
 
       {/* SECTION 2: VOICE & AUDIO */}
       {section === "voice" && (
-        <div className="card">
-          <h3>Voice, Speech-to-Text, Text-to-Speech & Audio Devices</h3>
-          <div className="grid-2">
-            <label className="field">
-              STT Provider
-              <select
-                value={cfg.preferences.stt_provider || "faster-whisper"}
-                onChange={(e) => patchSettings("STT provider saved", { preferences: { stt_provider: e.target.value } })}
-              >
-                <option value="faster-whisper">faster-whisper (Local)</option>
-                <option value="whisper-cpp">whisper-cpp</option>
-              </select>
-            </label>
+        <SettingsErrorBoundary title="Voice & Audio">
+          {/* Recommended Settings Overview */}
+          <div className="recommended-banner">
+            <div className="row between wrap" style={{ gap: 6 }}>
+              <strong>Recommended Settings</strong>
+              <span className="pill info">Balanced Local Setup</span>
+            </div>
+            <div className="row wrap" style={{ gap: 6 }}>
+              <span className="chip static">STT Model: small (or base for lower RAM)</span>
+              <span className="chip static">Language: Auto-detect</span>
+              <span className="chip static">Preset: Balanced</span>
+              <span className="chip static">Preprocessing: Light</span>
+              <span className="chip static">Translation: Transcribe only</span>
+              <span className="chip static">Listening: Continuous / PTT + Suppress Mic During TTS On</span>
+            </div>
+          </div>
 
-            <label className="field">
-              Whisper STT Model
-              <select value={cfg.stt.model} onChange={(e) => patchSettings("STT model changed", { stt: { model: e.target.value } })}>
-                {[...new Set([cfg.stt.model, ...(cfg.stt_models || [])])].map((m) => (
-                  <option key={m} value={m}>{m}</option>
-                ))}
-              </select>
-            </label>
+          {/* 2A: SPEECH RECOGNITION */}
+          <div className="card">
+            <h3>Speech Recognition</h3>
+            <p className="field-hint" style={{ marginBottom: 10 }}>
+              Converts microphone speech into text locally on your computer.
+            </p>
+            <div className="grid-2">
+              <label className="field">
+                STT Provider
+                <span className="field-hint">Speech-to-text engine backend (Recommended: faster-whisper Local).</span>
+                <select
+                  value={cfg.preferences?.stt_provider || "faster-whisper"}
+                  onChange={(e) => patchSettings("STT provider saved", { preferences: { stt_provider: e.target.value } })}
+                >
+                  <option value="faster-whisper">faster-whisper (Local)</option>
+                  <option value="whisper-cpp">whisper-cpp</option>
+                </select>
+              </label>
 
-            <label className="field">
-              Speech Language
-              <select value={cfg.stt.language} onChange={(e) => patchSettings("STT language changed", { stt: { language: e.target.value } })}>
-                {(Array.isArray(cfg.stt_languages)
-                  ? cfg.stt_languages.map((l) => [l, l] as [string, string])
-                  : Object.entries(cfg.stt_languages || { auto: "Auto-detect", en: "English", ml: "Malayalam", mixed: "Mixed ML+EN" })
-                ).map(([code, label]) => (
-                  <option key={code} value={code}>{label} ({code})</option>
-                ))}
-              </select>
-            </label>
+              <label className="field">
+                STT Model
+                <span className="field-hint">
+                  Model size for speech recognition. Larger models reduce word errors at higher CPU/RAM usage (Recommended: small, or base for lower RAM).
+                </span>
+                <select
+                  value={cfg.stt?.model || "base"}
+                  onChange={(e) => patchSettings("STT model changed", { stt: { model: e.target.value } })}
+                >
+                  {[...new Set([cfg.stt?.model || "base", ...(cfg.stt_models || [])])].map((m) => (
+                    <option key={m} value={m}>{m}</option>
+                  ))}
+                </select>
+              </label>
 
-            <label className="field">
-              TTS Provider
-              <select
-                value={cfg.preferences.tts_provider || "piper"}
-                onChange={(e) => patchSettings("TTS provider saved", { preferences: { tts_provider: e.target.value } })}
-              >
-                <option value="piper">piper (Local Neural)</option>
-              </select>
-            </label>
+              <label className="field">
+                Language Selection &amp; Auto Language Detection
+                <span className="field-hint">
+                  Spoken language hint passed to speech recognition. Auto-detect identifies spoken language automatically per clip (Recommended: Auto-detect for multilingual use, or pin English/Malayalam).
+                </span>
+                <select
+                  value={cfg.stt?.language || "auto"}
+                  onChange={(e) => patchSettings("STT language changed", { stt: { language: e.target.value } })}
+                >
+                  {(Array.isArray(cfg.stt_languages)
+                    ? cfg.stt_languages.map((l) => [l, l] as [string, string])
+                    : Object.entries(cfg.stt_languages || { auto: "Auto-detect", en: "English", ml: "Malayalam", mixed: "Mixed ML+EN" })
+                  ).map(([code, label]) => (
+                    <option key={code} value={code}>{label} ({code})</option>
+                  ))}
+                </select>
+              </label>
 
-            <label className="field">
-              Piper Voice
-              <select value={cfg.tts.voice} onChange={(e) => patchSettings("TTS voice changed", { tts: { voice: e.target.value } })}>
-                {(cfg.voices || []).map((v) => (
-                  <option key={v} value={v}>{v}</option>
-                ))}
-              </select>
-            </label>
+              <label className="field">
+                Recognition Quality Preset (Fast / Balanced / High Accuracy)
+                <span className="field-hint">
+                  Trades speed for decoding beam search and retries: Fast gives quickest reply, Balanced works best overall, High Accuracy runs deeper passes (Recommended: Balanced).
+                </span>
+                <select
+                  value={cfg.stt?.quality || "balanced"}
+                  onChange={(e) => patchSettings("Recognition quality updated", { stt: { quality: e.target.value } })}
+                >
+                  <option value="fast">Fast (low latency)</option>
+                  <option value="balanced">Balanced (recommended)</option>
+                  <option value="high">High Accuracy (slower beam/retry)</option>
+                </select>
+              </label>
 
-            <label className="field">
-              Speech Rate ({cfg.tts.speed}x)
+              <label className="field">
+                Audio Preprocessing
+                <span className="field-hint">
+                  Applies high-pass filtering and loudness normalization before recognition (Recommended: Light; use Off for clean studio audio).
+                </span>
+                <select
+                  value={cfg.stt?.preprocessing_profile || "light"}
+                  onChange={(e) =>
+                    patchSettings("Preprocessing profile updated", { stt: { preprocessing_profile: e.target.value } })
+                  }
+                >
+                  <option value="off">Off (raw bandlimited 16kHz only)</option>
+                  <option value="light">Light (HPF + safe headroom normalize · Recommended)</option>
+                  <option value="standard">Standard (+ conservative spectral gate)</option>
+                </select>
+              </label>
+
+              <label className="field">
+                Malayalam Model Availability (Optional Local Checkpoint)
+                <span className="field-hint">
+                  Optional local specialised Malayalam provider or checkpoint path (e.g. malayalam_whisper or indic_conformer). If not installed locally, Jarvis never auto-downloads weights and falls back cleanly to Faster-Whisper.
+                </span>
+                <input
+                  type="text"
+                  defaultValue={cfg.stt?.malayalam_model || ""}
+                  placeholder="Optional (leave blank unless local weights are installed)"
+                  onBlur={(e) => {
+                    const val = e.target.value.trim();
+                    if (val !== (cfg.stt?.malayalam_model || "")) {
+                      patchSettings("Malayalam ASR model path updated", { stt: { malayalam_model: val } });
+                    }
+                  }}
+                />
+              </label>
+            </div>
+
+            <label className="field" style={{ marginTop: 10 }}>
+              Vocabulary Hints
+              <span className="field-hint">
+                Comma-separated names, project words, and technical terms so speech recognition spells them accurately (leave default or add your common terms).
+              </span>
               <input
-                type="range"
-                min={0.6}
-                max={1.8}
-                step={0.05}
-                value={cfg.tts.speed}
-                onChange={(e) => patchSettings("Speech speed updated", { tts: { speed: Number(e.target.value) } })}
+                type="text"
+                defaultValue={cfg.stt?.vocab_hints || ""}
+                onBlur={(e) => {
+                  const val = e.target.value.trim();
+                  if (val !== (cfg.stt?.vocab_hints || "")) {
+                    patchSettings("Vocabulary hints saved", { stt: { vocab_hints: val } });
+                  }
+                }}
               />
             </label>
-
-            <label className="field">
-              Listening Mode
-              <select
-                value={cfg.audio.voice_mode}
-                onChange={(e) =>
-                  patchSettings("Voice mode updated", {
-                    audio: { voice_mode: e.target.value },
-                    wake: { enabled: e.target.value === "wake_word" },
-                  })
-                }
-              >
-                <option value="continuous">Continuous listening</option>
-                <option value="wake_word">Wake word triggered</option>
-                <option value="ptt">Push to talk (PTT)</option>
-              </select>
-            </label>
-
-            <label className="field">
-              Microphone Input Device
-              <select
-                value={cfg.audio.input_device === null ? "" : String(cfg.audio.input_device)}
-                onChange={(e) =>
-                  patchSettings("Input device updated", {
-                    audio: { input_device: e.target.value === "" ? null : Number(e.target.value) },
-                  })
-                }
-              >
-                <option value="">System Default Input</option>
-                {(devices.audio?.inputs || []).map((d) => (
-                  <option key={d.index} value={d.index}>{d.index}: {d.name}</option>
-                ))}
-              </select>
-            </label>
-
-            <label className="field">
-              Speaker Output Device
-              <select
-                value={cfg.audio.output_device === null ? "" : String(cfg.audio.output_device)}
-                onChange={(e) =>
-                  patchSettings("Output device updated", {
-                    audio: { output_device: e.target.value === "" ? null : Number(e.target.value) },
-                  })
-                }
-              >
-                <option value="">System Default Output</option>
-                {(devices.audio?.outputs || []).map((d) => (
-                  <option key={d.index} value={d.index}>{d.index}: {d.name}</option>
-                ))}
-              </select>
-            </label>
           </div>
 
-          <div className="row wrap" style={{ marginTop: 12 }}>
-            <button
-              aria-pressed={cfg.tts.enabled}
-              onClick={() => patchSettings(cfg.tts.enabled ? "Spoken replies muted" : "Spoken replies enabled", { tts: { enabled: !cfg.tts.enabled } })}
-            >
-              Spoken Replies: {cfg.tts.enabled ? "On" : "Off"}
-            </button>
-            <button
-              aria-pressed={cfg.audio.barge_in_enabled}
-              className="ghost"
-              onClick={() => patchSettings("Barge-in updated", { audio: { barge_in_enabled: !cfg.audio.barge_in_enabled } })}
-            >
-              Voice Barge-in: {cfg.audio.barge_in_enabled ? "On" : "Off"}
-            </button>
-            <button
-              aria-pressed={cfg.audio.suppress_mic_during_tts}
-              className="ghost"
-              onClick={() => patchSettings("Echo suppression updated", { audio: { suppress_mic_during_tts: !cfg.audio.suppress_mic_during_tts } })}
-            >
-              Suppress Mic During TTS: {cfg.audio.suppress_mic_during_tts ? "On" : "Off"}
-            </button>
-            <button
-              aria-pressed={cfg.audio.prefer_native_sample_rate ?? true}
-              className="ghost"
-              onClick={() =>
-                patchSettings("Native sample rate capture updated", {
-                  audio: { prefer_native_sample_rate: !(cfg.audio.prefer_native_sample_rate ?? true) },
-                })
-              }
-            >
-              Native Mic Sample Rate: {(cfg.audio.prefer_native_sample_rate ?? true) ? "On" : "Off"}
-            </button>
-          </div>
-
-          <h4 style={{ marginTop: 14, marginBottom: 8 }}>Recognition Accuracy, Preprocessing &amp; Translation</h4>
-          <div className="grid-2">
-            <label className="field">
-              Recognition Quality Preset
-              <select
-                value={cfg.stt.quality || "balanced"}
-                onChange={(e) => patchSettings("Recognition quality updated", { stt: { quality: e.target.value } })}
-              >
-                <option value="fast">Fast (low latency)</option>
-                <option value="balanced">Balanced (recommended)</option>
-                <option value="high">High Accuracy (slower beam/retry)</option>
-              </select>
-            </label>
-
-            <label className="field">
-              Audio Preprocessing Profile
-              <select
-                value={cfg.stt.preprocessing_profile || "light"}
-                onChange={(e) =>
-                  patchSettings("Preprocessing profile updated", { stt: { preprocessing_profile: e.target.value } })
-                }
-              >
-                <option value="off">Off (raw bandlimited 16kHz only)</option>
-                <option value="light">Light (HPF + safe headroom normalize · Recommended)</option>
-                <option value="standard">Standard (+ conservative spectral gate)</option>
-              </select>
-            </label>
-
-            <label className="field">
-              Translation Mode &amp; Target Language
-              <div className="row" style={{ gap: 6 }}>
+          {/* 2B: TRANSLATION */}
+          <div className="card">
+            <h3>Translation</h3>
+            <p className="field-hint" style={{ marginBottom: 10 }}>
+              Transcription and translation are separate operations: Speech Recognition saves your original transcript verbatim first, and optional Translation converts that text into a second language afterwards without overwriting the original transcript.
+            </p>
+            <div className="grid-2">
+              <label className="field">
+                Translation Mode (Transcribe only vs Translate)
+                <span className="field-hint">
+                  Transcribe only skips translation and keeps spoken text as-is; Auto-translate translates recognized speech into your chosen Target Language (Recommended: Transcribe only unless live translation is needed).
+                </span>
                 <select
                   value={cfg.translation?.mode || "transcribe_only"}
                   onChange={(e) =>
@@ -771,9 +753,16 @@ export const SettingsPanel: React.FC<ShellProps> = ({ onNotify }) => {
                     })
                   }
                 >
-                  <option value="transcribe_only">Transcribe only</option>
-                  <option value="translate">Auto-translate</option>
+                  <option value="transcribe_only">Transcribe only (Recommended default)</option>
+                  <option value="translate">Auto-translate after recognition</option>
                 </select>
+              </label>
+
+              <label className="field">
+                Target Language
+                <span className="field-hint">
+                  Destination language for translated text. Source language is supplied automatically by Speech Recognition above (Recommended: None when Transcribe only).
+                </span>
                 <select
                   value={cfg.translation?.target_language || "none"}
                   onChange={(e) =>
@@ -788,82 +777,236 @@ export const SettingsPanel: React.FC<ShellProps> = ({ onNotify }) => {
                   <option value="hi">Hindi (hi)</option>
                   <option value="ta">Tamil (ta)</option>
                 </select>
-              </div>
-            </label>
+              </label>
+            </div>
 
-            <label className="field">
-              Local Malayalam Specialized Model (optional CTranslate2/ONNX path)
-              <input
-                type="text"
-                defaultValue={cfg.stt.malayalam_model || ""}
-                placeholder="e.g. D:/models/whisper-small-malayalam-ct2"
-                onBlur={(e) => {
-                  const val = e.target.value.trim();
-                  if (val !== (cfg.stt.malayalam_model || "")) {
-                    patchSettings("Malayalam ASR model path updated", { stt: { malayalam_model: val } });
-                  }
-                }}
-              />
-            </label>
-          </div>
+            <div className="perm-row" style={{ marginTop: 8 }}>
+              <small className="dim">
+                <strong>Source language:</strong> Currently follows detected or pinned Speech Language (
+                <span className="mono">{cfg.stt?.language || "auto"}</span>). Original, corrected, and translated text are stored independently.
+              </small>
+            </div>
 
-          <label className="field" style={{ marginTop: 8 }}>
-            Domain Vocabulary Hints (names, technical terms, comma-separated)
-            <input
-              type="text"
-              defaultValue={cfg.stt.vocab_hints || ""}
-              onBlur={(e) => {
-                const val = e.target.value.trim();
-                if (val !== (cfg.stt.vocab_hints || "")) {
-                  patchSettings("Vocabulary hints saved", { stt: { vocab_hints: val } });
+            <div className="row wrap" style={{ marginTop: 10, gap: 10 }}>
+              <button
+                aria-pressed={Boolean(cfg.translation?.auto_correct)}
+                className="ghost"
+                title="Fixes minor punctuation and vocabulary typos while rejecting paraphrases or number/date changes"
+                onClick={() =>
+                  patchSettings("Transcript post-correction updated", {
+                    translation: { auto_correct: !cfg.translation?.auto_correct },
+                  })
                 }
-              }}
-            />
-          </label>
-
-          <div className="row wrap" style={{ marginTop: 10 }}>
-            <button
-              aria-pressed={Boolean(cfg.translation?.auto_correct)}
-              className="ghost"
-              onClick={() =>
-                patchSettings("Transcript post-correction updated", {
-                  translation: { auto_correct: !cfg.translation?.auto_correct },
-                })
-              }
-            >
-              Guarded Post-Correction: {cfg.translation?.auto_correct ? "On" : "Off"}
-            </button>
-            <button
-              aria-pressed={cfg.translation?.verify_translations ?? true}
-              className="ghost"
-              onClick={() =>
-                patchSettings("Translation semantic verification updated", {
-                  translation: { verify_translations: !(cfg.translation?.verify_translations ?? true) },
-                })
-              }
-            >
-              Verify Translations: {(cfg.translation?.verify_translations ?? true) ? "On" : "Off"}
-            </button>
-            <button
-              aria-pressed={cfg.translation?.preserve_mixed_code_switching ?? true}
-              className="ghost"
-              onClick={() =>
-                patchSettings("Mixed code-switching preservation updated", {
-                  translation: {
-                    preserve_mixed_code_switching: !(cfg.translation?.preserve_mixed_code_switching ?? true),
-                  },
-                })
-              }
-            >
-              Preserve Mixed Code-Switching: {(cfg.translation?.preserve_mixed_code_switching ?? true) ? "On" : "Off"}
-            </button>
+              >
+                Guarded Correction: {cfg.translation?.auto_correct ? "On" : "Off"}
+              </button>
+              <button
+                aria-pressed={cfg.translation?.verify_translations ?? true}
+                className="ghost"
+                title="Structural check comparing numbers, negations, intent, tech terms, and target script (not semantic proof)"
+                onClick={() =>
+                  patchSettings("Translation structural verification updated", {
+                    translation: { verify_translations: !(cfg.translation?.verify_translations ?? true) },
+                  })
+                }
+              >
+                Structural Translation Verification: {(cfg.translation?.verify_translations ?? true) ? "On" : "Off"}
+              </button>
+              <button
+                aria-pressed={cfg.translation?.preserve_mixed_code_switching ?? true}
+                className="ghost"
+                title="Keeps English technical words intact inside Malayalam or Hindi sentences"
+                onClick={() =>
+                  patchSettings("Mixed code-switching preservation updated", {
+                    translation: {
+                      preserve_mixed_code_switching: !(cfg.translation?.preserve_mixed_code_switching ?? true),
+                    },
+                  })
+                }
+              >
+                Preserve Mixed Code-Switching: {(cfg.translation?.preserve_mixed_code_switching ?? true) ? "On" : "Off"}
+              </button>
+            </div>
+            <p className="field-hint" style={{ marginTop: 6 }}>
+              <strong>Guarded Correction</strong> cleans punctuation/vocab only while preserving numbers and meaning (Recommended: Off unless needed).{" "}
+              <strong>Structural Translation Verification</strong> checks numbers, negations, tech terms, and target script structurally—it flags issues rather than claiming full semantic proof (Recommended: On).
+            </p>
           </div>
-        </div>
+
+          {/* 2C: SPEECH OUTPUT */}
+          <div className="card">
+            <h3>Speech Output</h3>
+            <p className="field-hint" style={{ marginBottom: 10 }}>
+              Controls how Jarvis speaks replies aloud using local text-to-speech.
+            </p>
+            <div className="grid-2">
+              <label className="field">
+                TTS Provider
+                <span className="field-hint">Local text-to-speech synthesizer backend (Recommended: piper).</span>
+                <select
+                  value={cfg.preferences?.tts_provider || "piper"}
+                  onChange={(e) => patchSettings("TTS provider saved", { preferences: { tts_provider: e.target.value } })}
+                >
+                  <option value="piper">piper (Local Neural)</option>
+                </select>
+              </label>
+
+              <label className="field">
+                Piper Voice
+                <span className="field-hint">Installed local voice model used for spoken output (Recommended: en_GB-alan-medium).</span>
+                <select
+                  value={cfg.tts?.voice || ""}
+                  onChange={(e) => patchSettings("TTS voice changed", { tts: { voice: e.target.value } })}
+                >
+                  {(cfg.voices || []).map((v) => (
+                    <option key={v} value={v}>{v}</option>
+                  ))}
+                </select>
+              </label>
+
+              <label className="field">
+                Speech Rate ({cfg.tts?.speed ?? 1.0}x)
+                <span className="field-hint">Playback speed multiplier for spoken responses (Recommended: 1.0x–1.15x).</span>
+                <input
+                  type="range"
+                  min={0.6}
+                  max={1.8}
+                  step={0.05}
+                  value={cfg.tts?.speed ?? 1.0}
+                  onChange={(e) => patchSettings("Speech speed updated", { tts: { speed: Number(e.target.value) } })}
+                />
+              </label>
+
+              <label className="field">
+                Speaker Output Device
+                <span className="field-hint">
+                  Host audio playback device used by Piper TTS (Recommended: System Default Output).
+                </span>
+                <select
+                  value={cfg.tts?.output_device === null || cfg.tts?.output_device === undefined ? "" : String(cfg.tts.output_device)}
+                  onChange={(e) =>
+                    patchSettings("Output device updated", {
+                      tts: { output_device: e.target.value === "" ? null : Number(e.target.value) },
+                    })
+                  }
+                >
+                  <option value="">System Default Output</option>
+                  {(devices.audio?.outputs || []).map((d) => (
+                    <option key={d.index} value={d.index}>{d.index}: {d.name}</option>
+                  ))}
+                </select>
+              </label>
+            </div>
+            <div className="row wrap" style={{ marginTop: 10 }}>
+              <button
+                aria-pressed={Boolean(cfg.tts?.enabled)}
+                onClick={() => patchSettings(cfg.tts?.enabled ? "Spoken replies muted" : "Spoken replies enabled", { tts: { enabled: !cfg.tts?.enabled } })}
+              >
+                Spoken Replies: {cfg.tts?.enabled ? "On" : "Off"}
+              </button>
+              <span className="field-hint" style={{ alignSelf: "center" }}>
+                Turn On for voice conversations or Off for silent text-only replies.
+              </span>
+            </div>
+          </div>
+
+          {/* 2D: LISTENING */}
+          <div className="card">
+            <h3>Listening</h3>
+            <p className="field-hint" style={{ marginBottom: 10 }}>
+              Controls how Jarvis listens to your microphone and handles audio capture.
+            </p>
+            <div className="grid-2">
+              <label className="field">
+                Listening Mode (Continuous / Wake Word / Push to Talk)
+                <span className="field-hint">
+                  Continuous listens hands-free whenever Host Mic is active; Wake word listens after hearing &ldquo;Hey Jarvis&rdquo;; Push to talk records only while triggered (Recommended: Continuous or Push to talk).
+                </span>
+                <select
+                  value={cfg.audio?.voice_mode || "continuous"}
+                  onChange={(e) =>
+                    patchSettings("Voice mode updated", {
+                      audio: { voice_mode: e.target.value },
+                      wake: { enabled: e.target.value === "wake_word" },
+                    })
+                  }
+                >
+                  <option value="continuous">Continuous listening</option>
+                  <option value="wake_word">Wake word triggered</option>
+                  <option value="ptt">Push to talk (PTT)</option>
+                </select>
+              </label>
+
+              <label className="field">
+                Microphone Selection (Host Input Device)
+                <span className="field-hint">
+                  Microphone hardware used by the host voice loop (Recommended: System Default Input).
+                </span>
+                <select
+                  value={cfg.audio?.input_device === null || cfg.audio?.input_device === undefined ? "" : String(cfg.audio.input_device)}
+                  onChange={(e) =>
+                    patchSettings("Input device updated", {
+                      audio: { input_device: e.target.value === "" ? null : Number(e.target.value) },
+                    })
+                  }
+                >
+                  <option value="">System Default Input</option>
+                  {(devices.audio?.inputs || []).map((d) => (
+                    <option key={d.index} value={d.index}>{d.index}: {d.name}</option>
+                  ))}
+                </select>
+              </label>
+            </div>
+
+            <div className="row wrap" style={{ marginTop: 12 }}>
+              <button
+                aria-pressed={Boolean(cfg.audio?.barge_in_enabled)}
+                className="ghost"
+                title="Allows interrupting Jarvis while it is speaking"
+                onClick={() => patchSettings("Barge-in updated", { audio: { barge_in_enabled: !cfg.audio?.barge_in_enabled } })}
+              >
+                Voice Barge-in: {cfg.audio?.barge_in_enabled ? "On" : "Off"}
+              </button>
+              <button
+                aria-pressed={Boolean(cfg.audio?.suppress_mic_during_tts)}
+                className="ghost"
+                title="Half-duplex echo prevention: pauses host mic while Jarvis speaks (Recommended: On)"
+                onClick={() => patchSettings("Echo suppression updated", { audio: { suppress_mic_during_tts: !cfg.audio?.suppress_mic_during_tts } })}
+              >
+                Suppress Mic During TTS: {cfg.audio?.suppress_mic_during_tts ? "On" : "Off"}
+              </button>
+              <button
+                aria-pressed={cfg.audio?.prefer_native_sample_rate ?? true}
+                className="ghost"
+                title="Captures at hardware native rate and resamples with polyphase filter to 16 kHz (Recommended: On)"
+                onClick={() =>
+                  patchSettings("Native sample rate capture updated", {
+                    audio: { prefer_native_sample_rate: !(cfg.audio?.prefer_native_sample_rate ?? true) },
+                  })
+                }
+              >
+                Native Mic Sample Rate (Audio Capture): {(cfg.audio?.prefer_native_sample_rate ?? true) ? "On" : "Off"}
+              </button>
+            </div>
+            <p className="field-hint" style={{ marginTop: 6 }}>
+              Audio Capture uses polyphase resampling when Native Mic Sample Rate is On, and pauses mic input during TTS when Suppress Mic During TTS is On to prevent speaker bleed/echo (Recommended: both On).
+            </p>
+          </div>
+
+          {/* 2E: AUDIO & VIDEO DEVICES (SAFE BROWSER & HOST DIAGNOSTICS) */}
+          <SettingsErrorBoundary title="Audio & Video Devices">
+            <AudioVideoPanel
+              hostAudio={devices.audio}
+              onRefreshHostDevices={loadAll}
+              onNotify={onNotify}
+            />
+          </SettingsErrorBoundary>
+        </SettingsErrorBoundary>
       )}
 
       {/* SECTION 3: PERMISSIONS & PRIVACY */}
       {section === "permissions" && (
-        <>
+        <SettingsErrorBoundary title="Permissions & Privacy">
           <div className="card">
             <h3>Security & Cloud Privacy Policies</h3>
             <div className="grid-2">
@@ -1039,12 +1182,12 @@ export const SettingsPanel: React.FC<ShellProps> = ({ onNotify }) => {
               )}
             </div>
           </div>
-        </>
+        </SettingsErrorBoundary>
       )}
 
       {/* SECTION 4: SYSTEM & DATA */}
       {section === "system" && (
-        <>
+        <SettingsErrorBoundary title="System & Data">
           <div className="card">
             <h3>Workspace & Display Preferences</h3>
             <div className="grid-2">
@@ -1150,10 +1293,10 @@ export const SettingsPanel: React.FC<ShellProps> = ({ onNotify }) => {
           </div>
 
           <div className="card">
-            <h3>System & Database Health Snapshot</h3>
+            <h3>System &amp; Database Health Snapshot</h3>
             {overview ? <pre className="diff">{JSON.stringify(overview, null, 2)}</pre> : <p className="dim">Unavailable</p>}
           </div>
-        </>
+        </SettingsErrorBoundary>
       )}
     </div>
   );

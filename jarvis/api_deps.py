@@ -144,11 +144,55 @@ def apply_settings_patch(a, patch: dict, *, allow_gateway_and_prefs: bool = True
     return build_consolidated_settings(a)
 
 
+def _safe_audio_inventory() -> dict:
+    """Return host audio input/output devices plus default names without raising when disconnected."""
+    defaults: dict[str, str | None] = {"input": None, "output": None}
+    err: str | None = None
+    try:
+        defaults = sysinfo.audio()
+    except Exception as e:
+        err = str(e)
+
+    inputs: list[dict] = []
+    outputs: list[dict] = []
+    try:
+        import sounddevice as sd
+
+        raw_devs = list(sd.query_devices() or [])
+        mme_devs = []
+        for idx, dev in enumerate(raw_devs):
+            try:
+                host_name = str(sd.query_hostapis(dev["hostapi"])["name"])
+            except Exception:
+                host_name = ""
+            if host_name == "MME":
+                mme_devs.append((idx, dev))
+        selected = mme_devs if mme_devs else list(enumerate(raw_devs))
+        for idx, dev in selected:
+            name = str(dev.get("name") or f"Device {idx}")
+            if int(dev.get("max_input_channels") or 0) > 0:
+                inputs.append({"index": int(idx), "name": name})
+            if int(dev.get("max_output_channels") or 0) > 0:
+                outputs.append({"index": int(idx), "name": name})
+    except Exception as e:
+        if not err:
+            err = str(e)
+
+    return {
+        "available": bool(inputs or outputs or defaults.get("input") or defaults.get("output")),
+        "input": defaults.get("input"),
+        "output": defaults.get("output"),
+        "inputs": inputs,
+        "outputs": outputs,
+        "error": err,
+    }
+
+
 def list_settings_devices(a) -> dict:
     """Return safe desktop audio/voice/model inventory without probing network."""
     return {
         "voices": sorted(p.stem for p in (ROOT / "models" / "piper").glob("*.onnx")),
         "stt_models": list_local_models(),
         "stt_languages": SUPPORTED_LANGUAGES,
-        "audio": sysinfo.audio(),
+        "audio": _safe_audio_inventory(),
     }
