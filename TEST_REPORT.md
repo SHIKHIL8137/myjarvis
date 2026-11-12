@@ -179,3 +179,16 @@ Executed with real hardware (`[1] Microphone Array (Realtek(R) Audio)` at 44.1 k
   - `tsc --noEmit`: exited `0`.
   - `npm --prefix apps/frontend test` (`node --test "src/**/*.test.ts"`): **12 passed, 0 failed** (`150.18ms`).
   - `npm --prefix apps/frontend run build` (`tsc --noEmit && vite build`): exited `0`, `47 modules transformed` (`dist/assets/index-C-2dcxd9.js` `315.55 kB`, `dist/assets/index-c9dVwR21.css` `25.72 kB`, `1.00s`).
+
+## Workspace Root Isolation, Project Resolution & Pending Selection Continuity (2026-11-12)
+
+- **Focused Filesystem, Permission, Resolution, Clarification, Continuity & Intent Suite (`.venv\Scripts\python.exe -m pytest tests/test_fs_project_resolution_flow.py tests/test_p10_20_manager_and_fs_security.py tests/test_stage_a_filesystem_intelligence.py tests/test_stage_b_orchestration_continuity.py tests/test_intent_and_tasks.py tests/test_p10_19_autonomous_voice_os.py -q`)**: **31 passed, 0 failed** (`40.99s`), including `6` comprehensive tests in `tests/test_fs_project_resolution_flow.py` covering temp/pytest/`node_modules` rejection (`422` on `PUT /api/v2/filesystem/policy` and discovery exclusion), non-temp workspace root resolution, multi-match numbered clarification (`awaiting_clarification`), ordinal/name/project/parent-directory clarification replies, SQLite persistence across `Assistant` reloads, expiration handling (`clarification_expired`), unresolved relative tool-path rejection (`outcome="not_found"`), `active_project` continuity follow-ups, least-privilege permission revalidation, and `data/settings.json` isolation (`JARVIS_OVERRIDES_FILE`).
+- **Full Non-Live Python Test Suite (`.venv\Scripts\python.exe -m pytest -m "not live and not pg" -q -rs`)**: **257 passed, 0 failed, 2 skipped, 2 deselected** (`319.53s` / `0:05:19`, post-final edit).
+  - Skipped (`2`, live Docker daemon not running on host): `tests\test_p10_11_hardening.py:221`, `tests\test_p10_12_hardening.py:165`.
+  - Deselected (`2`, marker filter `-m "not live and not pg"`): `2` live/PostgreSQL tests.
+- **Static Checks**:
+  - `ruff check` across `jarvis/assistant.py`, `jarvis/filesystem_access.py`, `jarvis/api_deps.py`, `jarvis/config.py`, `jarvis/agents/tasks.py`, `jarvis/decision/rules.py`, `tests/conftest.py`, `tests/test_fs_project_resolution_flow.py`: `All checks passed!`.
+  - `mypy --follow-imports=silent` across `jarvis/filesystem_access.py`, `jarvis/api_deps.py`, `jarvis/config.py`, `jarvis/agents/tasks.py`, `jarvis/decision/rules.py`, `tests/test_fs_project_resolution_flow.py`: `Success: no issues found in 6 source files`.
+- **Frontend (`apps/frontend`)**:
+  - `npm test` (`node --test "src/**/*.test.ts"`): **12 passed, 0 failed** (`212.16ms`).
+  - `tsc --noEmit && vite build`: exited `0`, `47 modules transformed` (`dist/assets/index-BG7dtOgg.js` `317.99 kB`, `dist/assets/index-c9dVwR21.css` `25.72 kB`, `1.08s`).

@@ -163,6 +163,7 @@ export const VoiceDock: React.FC<VoiceDockProps> = ({
         memories: ev.memory_ids?.length || 0,
         permissionRequest: (ev.permission_request as FsPermissionRequest) || m.permissionRequest,
         approvalRequest: (ev.approval as OwnerApprovalRequest) || m.approvalRequest,
+        clarification: (ev.clarification as ChatFeedItem["clarification"]) || m.clarification,
         task: (ev.task as AssistantTaskItem) || m.task,
       }));
     } else if (ev.type === "tool") {
@@ -203,6 +204,7 @@ export const VoiceDock: React.FC<VoiceDockProps> = ({
         ),
         permissionRequest: (ev.permission_request as FsPermissionRequest) || m.permissionRequest,
         approvalRequest: (ev.approval as OwnerApprovalRequest) || m.approvalRequest,
+        clarification: (ev.clarification as ChatFeedItem["clarification"]) || m.clarification,
         task: (ev.task as AssistantTaskItem) || m.task,
         stats: statsStr,
       }));

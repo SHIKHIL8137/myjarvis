@@ -41,6 +41,14 @@ def have_mic() -> bool:
 needs_mic = pytest.mark.skipif(not have_mic(), reason="no input audio device")
 
 
+@pytest.fixture(autouse=True)
+def _isolate_test_settings_overrides(tmp_path, monkeypatch):
+    """Isolate per-test overrides so tests never read or contaminate live data/settings.json."""
+    ov_path = tmp_path / "isolated_settings.json"
+    monkeypatch.setenv("JARVIS_OVERRIDES_FILE", str(ov_path))
+    yield
+
+
 @pytest.fixture
 def notes_dir(tmp_path):
     d = tmp_path / "notes"

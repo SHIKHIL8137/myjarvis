@@ -3,11 +3,13 @@ import asyncio
 import datetime
 import json
 import logging
+import os
 from pathlib import Path
 import re
 import threading
 import time
 from typing import AsyncIterator
+import uuid
 
 from . import audit, commands, graph_live, sysinfo
 from .proactive import ProactiveSuggestionEngine
@@ -18,8 +20,9 @@ from .agents.orchestrator import AgentOrchestrator
 from .brain import Brain, BrainError, ToolsUnsupportedError
 from .config import DATA, Settings
 from .core.event_bus import EventBus
+from .decision.rules import HARD_STOP
 from .filesystem import FilesystemPermissionError, SafeFilesystem
-from .filesystem_access import FilesystemSecurityError, WRITE_OPS
+from .filesystem_access import FilesystemSecurityError, WRITE_OPS, is_temporary_or_generated_path
 from .gateway.interface import GatewayRequest
 from .history import History
 from .learning.evaluation import ModelEvaluator
@@ -237,6 +240,7 @@ class Assistant:
         self.conversation_refs: set[str] = set()  # graph ids the current conversation retrieved (live graph links)
         self.used_tools: set[str] = set()  # real capability/web tools invoked during this session
         self.active_project: dict | None = None  # resolved project root context for follow-up continuity
+        self.pending_clarification: dict | None = None  # pending folder/project disambiguation state
         self.os_state = "Idle"
 
         online_fn = lambda: bool(self.settings.internet.enabled and audit.is_online_enabled())  # noqa: E731
@@ -1083,43 +1087,87 @@ class Assistant:
     def rollback_model(self, target_version_id: str | None = None) -> dict:
         return rollback_active_model(self.registry, target_version_id=target_version_id, audit_log=self.learning_audit)
 
-    async def _resolve_fs_target_arg(self, raw_path: str | None) -> str:
-        """Resolve an explicit path, alias, registered project, known user folder, or configured root."""
+    async def _resolve_fs_tool_target(self, raw_path: str | None) -> dict:
+        """Resolve an explicit path, alias, registered project, known user folder, or active project context safely."""
         raw = str(raw_path or "").strip().strip("\"'")
         active_root = str((self.active_project or {}).get("root_path") or "") or None
+        active_source = str((self.active_project or {}).get("source") or "") or None
         if raw:
-            res = await self.orchestrator.fs_access.resolve_project_target(raw, active_root=active_root)
+            res = await self.orchestrator.fs_access.resolve_project_target(
+                raw,
+                active_root=active_root,
+                active_source=active_source,
+            )
             if res.get("matched"):
-                return str(res["resolved_path"])
+                return {"status": "resolved", "path": str(res["resolved_path"]), "resolution": res}
+            if res.get("ambiguous"):
+                return {
+                    "status": "ambiguous",
+                    "path": "",
+                    "candidates": list(res.get("candidates") or []),
+                    "query_name": str(res.get("query_name") or raw),
+                    "error": f"Multiple project folders matched `{raw}`.",
+                }
             low = raw.lower()
             if low in ("documents", "my documents"):
-                return str(Path.home() / "Documents")
+                return {"status": "resolved", "path": str(Path.home() / "Documents")}
             if low in ("downloads", "my downloads"):
-                return str(Path.home() / "Downloads")
+                return {"status": "resolved", "path": str(Path.home() / "Downloads")}
             if low in ("desktop", "my desktop"):
-                return str(Path.home() / "Desktop")
+                return {"status": "resolved", "path": str(Path.home() / "Desktop")}
             if low in ("pictures", "my pictures"):
-                return str(Path.home() / "Pictures")
+                return {"status": "resolved", "path": str(Path.home() / "Pictures")}
             if low in ("workspace", "notes"):
                 roots = list(getattr(self.settings.filesystem, "allowed_roots", []) or [])
                 if roots:
-                    return str(roots[0])
-            return raw
+                    return {"status": "resolved", "path": str(roots[0])}
+            is_explicit = os.path.isabs(raw) or bool(
+                re.match(r"^(?:[A-Za-z]:[\\/]|\\\\|/|\.\.?(?:[\\/]|$)|~(?:[\\/]|$))", raw)
+            )
+            if is_explicit:
+                return {"status": "resolved", "path": raw}
+            if active_root and ".." not in Path(raw).parts:
+                candidate = Path(active_root) / raw
+                if candidate.exists():
+                    return {"status": "resolved", "path": str(candidate)}
+            return {
+                "status": "not_found",
+                "path": "",
+                "error": (
+                    f"Unresolved relative path `{raw}`: no saved project alias, registered project, "
+                    "active project subfolder, or trusted workspace root matched."
+                ),
+            }
 
         if active_root:
-            return active_root
+            return {"status": "resolved", "path": active_root}
         active_perms = [
             p
             for p in await self.orchestrator.fs_access.list_permissions(status="active")
             if p.get("scope") in ("session", "persistent")
+            and not is_temporary_or_generated_path(p["canonical_folder_path"])
         ]
         if active_perms:
-            return str(active_perms[0]["canonical_folder_path"])
+            return {"status": "resolved", "path": str(active_perms[0]["canonical_folder_path"])}
         aliases = await self.orchestrator.fs_access.list_aliases()
         if aliases:
-            return str(aliases[0]["folder_path"])
-        roots = list(getattr(self.settings.filesystem, "allowed_roots", []) or [])
-        return str(roots[0]) if roots else str(self.settings.notes_path)
+            return {"status": "resolved", "path": str(aliases[0]["folder_path"])}
+        roots = [
+            r for r in (getattr(self.settings.filesystem, "allowed_roots", []) or [])
+            if not is_temporary_or_generated_path(r)
+        ]
+        if roots:
+            return {"status": "resolved", "path": str(roots[0])}
+        return {
+            "status": "not_found",
+            "path": "",
+            "error": "No active project, saved alias, or approved folder context is available.",
+        }
+
+    async def _resolve_fs_target_arg(self, raw_path: str | None) -> str:
+        """Resolve an explicit path, alias, registered project, known user folder, or configured root."""
+        res = await self._resolve_fs_tool_target(raw_path)
+        return str(res.get("path") or "")
 
     async def _execute_fs_tool(
         self,
@@ -1140,7 +1188,19 @@ class Assistant:
             alias_hit = await fs_access.resolve_alias(original_text)
             if alias_hit:
                 raw_path = str(alias_hit["resolved_path"])
-        target = await self._resolve_fs_target_arg(str(raw_path or ""))
+        target_res = await self._resolve_fs_tool_target(str(raw_path or ""))
+        if target_res["status"] != "resolved":
+            return json.dumps(
+                {
+                    "outcome": target_res["status"],
+                    "status": target_res["status"],
+                    "error": target_res["error"],
+                    "candidates": target_res.get("candidates") or [],
+                    "ok": False,
+                },
+                ensure_ascii=False,
+            )
+        target = str(target_res["path"])
 
         op_map = {
             "fs_get_project_structure": "list_directory",
@@ -1154,7 +1214,19 @@ class Assistant:
         req_op = op_map.get(name, "read_file")
         chk = await fs_access.authorize(target, req_op, task_id=task_id)
         if chk.blocked:
-            return json.dumps({"error": chk.reason, "blocked": True, "code": chk.code, "path": chk.canonical_path}, ensure_ascii=False)
+            out_status = "invalid_path" if chk.code in ("invalid_path", "not_found", "empty_path") else "execution_failed"
+            return json.dumps(
+                {
+                    "outcome": out_status,
+                    "status": "blocked",
+                    "error": chk.reason,
+                    "blocked": True,
+                    "code": chk.code,
+                    "path": chk.canonical_path,
+                    "ok": False,
+                },
+                ensure_ascii=False,
+            )
         if not chk.allowed:
             if turn_ctx is not None and not turn_ctx.get("permission_request"):
                 if name == "fs_get_project_structure":
@@ -1186,12 +1258,14 @@ class Assistant:
                     )
                     turn_ctx["permission_request"] = req
                 except FilesystemSecurityError as exc:
-                    return json.dumps({"error": str(exc), "blocked": True, "code": exc.code}, ensure_ascii=False)
+                    return json.dumps({"outcome": "execution_failed", "error": str(exc), "blocked": True, "code": exc.code, "ok": False}, ensure_ascii=False)
             return json.dumps(
                 {
+                    "outcome": "permission_required",
                     "status": "permission_required",
                     "path": chk.canonical_path,
                     "message": "Owner permission required. Wait for owner decision via permission card.",
+                    "ok": False,
                 },
                 ensure_ascii=False,
             )
@@ -1209,6 +1283,8 @@ class Assistant:
                 wrapped = wrap_untrusted(res["tree"], source_type="local_file", source_id="project_tree", title=res["name"])
                 return json.dumps(
                     {
+                        "outcome": "success",
+                        "ok": True,
                         "policy": UNTRUSTED_DATA_POLICY,
                         "path": res["path"],
                         "top_dirs": res["top_dirs"],
@@ -1225,7 +1301,7 @@ class Assistant:
                 if turn_ctx is not None:
                     turn_ctx.setdefault("paths", []).extend(e["path"] for e in entries[:15])
                 graph_live.filesystem_activity(self, task_id=task_id, folder_path=target, files=entries, operation="list_directory")
-                return json.dumps({"path": target, "count": len(entries), "entries": entries[:40]}, ensure_ascii=False)
+                return json.dumps({"outcome": "success", "ok": True, "path": target, "count": len(entries), "entries": entries[:40]}, ensure_ascii=False)
 
             if name == "fs_search_files":
                 query = str(args.get("query") or "").strip()
@@ -1233,7 +1309,7 @@ class Assistant:
                 if turn_ctx is not None:
                     turn_ctx.setdefault("paths", []).extend(m["path"] for m in matches[:15])
                 graph_live.filesystem_activity(self, task_id=task_id, folder_path=target, files=matches, operation="search_files")
-                return json.dumps({"path": target, "query": query, "count": len(matches), "matches": matches[:25]}, ensure_ascii=False)
+                return json.dumps({"outcome": "success", "ok": True, "path": target, "query": query, "count": len(matches), "matches": matches[:25]}, ensure_ascii=False)
 
             if name == "fs_find_files_by_extension":
                 exts = list(args.get("extensions") or [])
@@ -1241,7 +1317,7 @@ class Assistant:
                 if turn_ctx is not None:
                     turn_ctx.setdefault("paths", []).extend(m["path"] for m in matches[:15])
                 graph_live.filesystem_activity(self, task_id=task_id, folder_path=target, files=matches, operation="search_files")
-                return json.dumps({"path": target, "extensions": exts, "count": len(matches), "matches": matches[:25]}, ensure_ascii=False)
+                return json.dumps({"outcome": "success", "ok": True, "path": target, "extensions": exts, "count": len(matches), "matches": matches[:25]}, ensure_ascii=False)
 
             if name in ("fs_read_file", "fs_read_document"):
                 if name == "fs_read_document":
@@ -1266,6 +1342,8 @@ class Assistant:
                 graph_live.filesystem_activity(self, task_id=task_id, folder_path=str(Path(doc["path"]).parent), files=[fitem], operation="read_file")
                 return json.dumps(
                     {
+                        "outcome": "success",
+                        "ok": True,
                         "policy": UNTRUSTED_DATA_POLICY,
                         "path": doc["path"],
                         "name": doc["name"],
@@ -1284,11 +1362,12 @@ class Assistant:
                 meta = await fs_access.execute_read_metadata(target, task_id=task_id)
                 if turn_ctx is not None:
                     turn_ctx.setdefault("paths", []).append(meta["path"])
-                return json.dumps(meta, ensure_ascii=False)
+                return json.dumps({"outcome": "success", "ok": True, **meta}, ensure_ascii=False)
         except FilesystemSecurityError as exc:
-            return json.dumps({"error": str(exc), "code": exc.code, "path": exc.path}, ensure_ascii=False)
+            out_status = "invalid_path" if exc.code in ("not_a_directory", "not_a_file", "not_found") else "execution_failed"
+            return json.dumps({"outcome": out_status, "error": str(exc), "code": exc.code, "path": exc.path, "ok": False}, ensure_ascii=False)
 
-        return json.dumps({"error": f"tool {name!r} is not permitted"})
+        return json.dumps({"outcome": "execution_failed", "error": f"tool {name!r} is not permitted", "ok": False})
 
     async def _execute_tool(
         self,
@@ -1480,8 +1559,10 @@ class Assistant:
                 cand_sub
                 and not target_file
                 and cand_sub.lower() not in {"all", "my", "the", "this", "that", "folder", "directory", "project", "projects", "workspace", "structure", "files", "documents", "pdf", "erp", "jarvis"}
-                and re.search(r"\b(?:inside|in|under|within)\b", low) is not None
-                or cand_sub.lower() in {"backend", "frontend", "src", "app", "apps", "packages", "database", "docs", "tests"}
+                and (
+                    re.search(r"\b(?:inside|in|under|within)\b", low) is not None
+                    or cand_sub.lower() in {"backend", "frontend", "src", "app", "apps", "packages", "database", "docs", "tests"}
+                )
             ):
                 sub_target = cand_sub
 
@@ -2163,6 +2244,568 @@ class Assistant:
             "paths": exec_res.get("paths") or [],
         }
 
+    @staticmethod
+    def _format_clarification_candidates(raw_cands: list[dict]) -> list[dict]:
+        """Normalize clarification candidates, stripping temp/generated discovery paths and adding 1-based indices."""
+        cleaned: list[dict] = []
+        seen_paths: set[str] = set()
+        for raw_c in raw_cands or []:
+            cpath = str(raw_c.get("path") or "").strip()
+            csource = str(raw_c.get("source") or "workspace_root")
+            if not cpath:
+                continue
+            if csource not in ("project_alias", "registered_project") and is_temporary_or_generated_path(cpath):
+                continue
+            key = os.path.normcase(os.path.realpath(cpath))
+            if key in seen_paths:
+                continue
+            seen_paths.add(key)
+            idx = len(cleaned) + 1
+            cleaned.append(
+                {
+                    "index": idx,
+                    "id": str(raw_c.get("id") or f"cand_{idx}"),
+                    "name": str(raw_c.get("name") or Path(cpath).name),
+                    "path": cpath,
+                    "source": csource,
+                    "score": int(raw_c.get("score") or 0),
+                }
+            )
+        return cleaned
+
+    def _build_pending_clarification(
+        self,
+        *,
+        mode: str,
+        original_request: str,
+        original_intent: str,
+        fs_info: dict,
+        project_name: str,
+        candidates: list[dict],
+        task_id: str | None,
+        ttl_seconds: float = 300.0,
+    ) -> dict:
+        now = time.time()
+        ops = list(fs_info.get("operations") or ["list_directory", "read_metadata"])
+        return {
+            "clarification_id": uuid.uuid4().hex[:12],
+            "mode": mode,
+            "original_request": original_request,
+            "original_intent": original_intent,
+            "requested_operation": ops[0] if ops else "list_directory",
+            "requested_operations": ops,
+            "project_name": project_name,
+            "target_file": str(fs_info.get("target_file") or ""),
+            "sub_target": str(fs_info.get("sub_target") or ""),
+            "query": str(fs_info.get("query") or ""),
+            "extensions": list(fs_info.get("extensions") or []),
+            "filename": str(fs_info.get("filename") or "jarvis_report.md"),
+            "wants_explorer": bool(fs_info.get("wants_explorer")),
+            "candidates": list(candidates),
+            "task_id": task_id,
+            "conversation_id": str(self.data_dir),
+            "created_at": now,
+            "expires_at": now + float(ttl_seconds),
+            "permission_approved": False,
+        }
+
+    @staticmethod
+    def _format_clarification_prompt(pending: dict) -> str:
+        mode = str(pending.get("mode") or "supply_parent_dir")
+        proj = str(pending.get("project_name") or "that project")
+        cands = list(pending.get("candidates") or [])
+        op_label = str(pending.get("requested_operation") or "list_directory")
+        if mode == "select_candidate" and cands:
+            lines = [f"{c['index']}. `{c['name']}` ({c['path']})" for c in cands[:8]]
+            return (
+                f"Multiple matching folders were found for `{proj}` ({op_label}):\n"
+                + "\n".join(lines)
+                + f"\nReply with a number (1-{min(len(cands), 8)}), a candidate name/path, or provide a parent folder path."
+            )
+        return (
+            f"I couldn't locate `{proj}` in your saved aliases, registered projects, or configured workspace roots. "
+            "Please provide the parent directory or full folder path (for example `D:\\projects`), or reply with a saved project name."
+        )
+
+    async def _set_pending_clarification(self, task_id: str | None, data: dict, reply: str) -> None:
+        self.pending_clarification = data
+        if task_id:
+            await self.orchestrator.tasks.update_task(
+                task_id,
+                status="awaiting_clarification",
+                result=reply,
+                current_step="Awaiting folder/project clarification",
+                meta_patch={"pending_clarification": data, "clarification_resolved": False},
+            )
+
+    async def _clear_pending_clarification(self, task_id: str | None = None, *, expired: bool = False) -> None:
+        eff_tid = task_id or (self.pending_clarification or {}).get("task_id")
+        self.pending_clarification = None
+        if eff_tid:
+            if expired:
+                await self.orchestrator.tasks.update_task(
+                    eff_tid,
+                    status="failed",
+                    error_info="Clarification request expired",
+                    current_step="Clarification expired",
+                    meta_patch={"pending_clarification": None, "clarification_expired": True},
+                )
+            else:
+                await self.orchestrator.tasks.update_task(
+                    eff_tid,
+                    meta_patch={"pending_clarification": None, "clarification_resolved": True},
+                )
+
+    async def _get_active_pending_clarification(self) -> dict | None:
+        if isinstance(self.pending_clarification, dict):
+            return self.pending_clarification
+        tasks = await self.orchestrator.tasks.list_tasks(status="awaiting_clarification", limit=5)
+        for t in tasks:
+            meta = t.get("meta") if isinstance(t.get("meta"), dict) else {}
+            pc = meta.get("pending_clarification")
+            if isinstance(pc, dict):
+                self.pending_clarification = pc
+                return pc
+        return None
+
+    @staticmethod
+    def _parse_clarification_ordinal(text: str) -> int | None:
+        raw = (text or "").strip().lower().strip(" .?!\"'")
+        word_map = {
+            "first": 1, "1st": 1, "one": 1, "first one": 1, "the first": 1, "the first one": 1, "option 1": 1, "choice 1": 1, "number 1": 1,
+            "second": 2, "2nd": 2, "two": 2, "second one": 2, "the second": 2, "the second one": 2, "option 2": 2, "choice 2": 2, "number 2": 2,
+            "third": 3, "3rd": 3, "three": 3, "third one": 3, "the third": 3, "the third one": 3, "option 3": 3, "choice 3": 3, "number 3": 3,
+            "fourth": 4, "4th": 4, "four": 4, "fourth one": 4, "the fourth": 4, "the fourth one": 4,
+            "fifth": 5, "5th": 5, "five": 5, "fifth one": 5,
+            "sixth": 6, "6th": 6, "six": 6, "sixth one": 6,
+        }
+        if raw in word_map:
+            return word_map[raw]
+        m = re.match(r"^(?:#|option\s+|choice\s+|number\s+)?(\d{1,2})$", raw)
+        if m:
+            return int(m.group(1))
+        return None
+
+    @staticmethod
+    def _match_clarification_candidate(text: str, candidates: list[dict]) -> tuple[dict | None, str]:
+        if not candidates:
+            return None, "no_match"
+        idx = Assistant._parse_clarification_ordinal(text)
+        if idx is not None:
+            if 1 <= idx <= len(candidates):
+                return candidates[idx - 1], "matched"
+            return None, "out_of_range"
+
+        raw = str(text or "").strip().strip("\"'")
+        low = raw.lower()
+        norm_raw = os.path.normcase(os.path.realpath(raw)) if (os.path.isabs(raw) or "\\" in raw or "/" in raw) else ""
+        for c in candidates:
+            if low == str(c.get("id") or "").lower():
+                return c, "matched"
+            if norm_raw and os.path.normcase(os.path.realpath(str(c.get("path") or ""))) == norm_raw:
+                return c, "matched"
+
+        exact_names = [c for c in candidates if str(c.get("name") or "").lower() == low]
+        if len(exact_names) == 1:
+            return exact_names[0], "matched"
+        if len(exact_names) > 1:
+            return None, "ambiguous_name"
+
+        def _slug(val: str) -> str:
+            cleaned = re.sub(r"\b(?:my|the|this|that|project|folder|directory|repo|repository)\b", " ", val.lower())
+            return re.sub(r"[^a-z0-9]+", "", cleaned)
+
+        q_slug = _slug(raw)
+        if q_slug:
+            slug_hits = [c for c in candidates if _slug(str(c.get("name") or "")) == q_slug]
+            if len(slug_hits) == 1:
+                return slug_hits[0], "matched"
+            if len(slug_hits) > 1:
+                return None, "ambiguous_name"
+        return None, "no_match"
+
+    async def _authorize_or_execute_fs_plan(
+        self,
+        text: str,
+        *,
+        fs_info: dict,
+        is_project: bool,
+        project_name: str,
+        project_root: str,
+        project_source: str,
+        task_id: str | None,
+        source: str,
+    ) -> dict:
+        """Shared permission validation / scoped prompt / execution path for resolved filesystem targets."""
+        if fs_info.get("wants_explorer"):
+            exp_target = str(fs_info.get("target") or project_root or "")
+            chk_exp = await self.orchestrator.fs_access.authorize(exp_target, "list_directory", task_id=task_id)
+            if chk_exp.blocked:
+                if task_id:
+                    await self.orchestrator.tasks.update_task(task_id, status="failed", error_info=chk_exp.reason, current_step="Blocked by filesystem security policy")
+                return {"command": "filesystem_blocked", "reply": f"Blocked by filesystem security policy: {chk_exp.reason}", "paths": [], "ok": False}
+            if not chk_exp.allowed:
+                req_exp = await self.orchestrator.fs_access.create_permission_request(
+                    chk_exp.canonical_path,
+                    ["list_directory", "read_metadata"],
+                    task_id=task_id,
+                    reason=f"Requested permission before opening `{chk_exp.canonical_path}` in Explorer",
+                    access_duration="once",
+                    deferred_action={
+                        "kind": "fs_search",
+                        "folder": chk_exp.canonical_path,
+                        "target": chk_exp.canonical_path,
+                        "operation": "list_directory",
+                        "query": "",
+                        "extensions": [],
+                        "filename": "",
+                        "original_text": text,
+                        "is_project": is_project,
+                        "project_name": project_name,
+                        "project_root": project_root,
+                        "project_source": project_source,
+                    },
+                )
+                if task_id:
+                    await self.orchestrator.tasks.update_task(
+                        task_id,
+                        status="awaiting_permission",
+                        append_permission=req_exp["request_id"],
+                        current_step=f"Waiting for permission before Explorer ({chk_exp.canonical_path})",
+                    )
+                self._set_os_state("Waiting for approval", source=source, detail=req_exp["canonical_path"])
+                self.bus.publish({"type": "permission_requested", "request": req_exp, "task_id": task_id})
+                return {
+                    "command": "permission_required",
+                    "reply": f"Permission required before accessing `{chk_exp.canonical_path}` in Explorer.",
+                    "paths": [],
+                    "permission_request": req_exp,
+                    "ok": False,
+                }
+            try:
+                out_exp = await asyncio.to_thread(self.actions.request_or_execute, "open_app", {"app": "explorer", "args": [chk_exp.canonical_path]})
+            except ActionPermissionError as exc:
+                if task_id:
+                    await self.orchestrator.tasks.update_task(task_id, status="failed", error_info=str(exc), current_step="Blocked Explorer launch")
+                return {"command": "open_app", "reply": f"Unable to open Explorer: {exc}", "paths": [], "ok": False}
+            if out_exp.get("confirmation_required"):
+                reply = f"Approval required ({out_exp['token']}) to open `{chk_exp.canonical_path}` in Explorer. Confirm the pending desktop action."
+                return {"command": "open_app", "reply": reply, "action_result": out_exp, "paths": [], "ui": {"open_drawer": "approvals"}, "ok": False}
+            return {"command": "open_app", "reply": f"Opened `{chk_exp.canonical_path}` in Explorer.", "action_result": out_exp, "paths": [chk_exp.canonical_path], "ok": True}
+
+        target_path = str(fs_info["target"])
+        req_operations = list(fs_info["operations"])
+        primary_op = req_operations[0]
+        folder_for_exec = target_path
+
+        if project_root:
+            target_file_name = str(fs_info.get("target_file") or "").strip()
+            sub_target_name = str(fs_info.get("sub_target") or "").strip()
+            if target_file_name:
+                cand_file = Path(project_root) / target_file_name
+                if cand_file.exists() and cand_file.is_file():
+                    target_path = str(cand_file)
+                    folder_for_exec = project_root
+                else:
+                    target_path = project_root
+                    folder_for_exec = project_root
+                    if primary_op == "read_file" and "search_files" not in req_operations:
+                        req_operations = ["read_file", "search_files", "list_directory", "read_metadata"]
+            elif sub_target_name:
+                cand_sub = Path(project_root) / sub_target_name
+                if cand_sub.exists() and cand_sub.is_dir() and primary_op == "list_directory":
+                    target_path = str(cand_sub)
+                    folder_for_exec = str(cand_sub)
+                else:
+                    target_path = project_root
+                    folder_for_exec = project_root
+            elif primary_op == "search_files" and not fs_info.get("query") and not fs_info.get("extensions"):
+                req_operations = ["list_directory", "read_metadata"]
+                primary_op = "list_directory"
+
+        if primary_op in WRITE_OPS:
+            deferred_kind = "fs_write_report"
+        elif primary_op == "read_file":
+            deferred_kind = "fs_read"
+        elif primary_op == "read_metadata":
+            deferred_kind = "fs_metadata"
+        elif primary_op == "delete_file":
+            deferred_kind = "fs_delete"
+        else:
+            deferred_kind = "fs_search"
+
+        chk = await self.orchestrator.fs_access.authorize(target_path, primary_op, task_id=task_id)
+        if chk.blocked:
+            if task_id:
+                await self.orchestrator.tasks.update_task(
+                    task_id,
+                    status="failed",
+                    error_info=chk.reason,
+                    current_step="Blocked by filesystem security policy",
+                )
+            return {
+                "command": "filesystem_blocked",
+                "reply": f"Blocked by filesystem security policy: {chk.reason}",
+                "paths": [],
+                "ok": False,
+            }
+
+        if fs_info.get("explicit_path") and primary_op not in ("create_file", "write_file"):
+            cp_target = Path(chk.canonical_path)
+            if not cp_target.exists():
+                reply = f"The path `{chk.canonical_path}` does not exist. Please check and clarify the exact path."
+                if task_id:
+                    await self.orchestrator.tasks.update_task(task_id, status="failed", error_info=reply, current_step="Invalid target path")
+                return {"command": "invalid_path", "reply": reply, "paths": [], "ok": False}
+
+        deferred_payload = {
+            "kind": deferred_kind,
+            "folder": folder_for_exec,
+            "target": target_path,
+            "target_file": str(fs_info.get("target_file") or ""),
+            "operation": primary_op,
+            "query": str(fs_info.get("query") or ""),
+            "extensions": list(fs_info.get("extensions") or []),
+            "filename": str(fs_info.get("filename") or "jarvis_report.md"),
+            "original_text": text,
+            "is_project": bool(is_project),
+            "project_name": project_name,
+            "project_root": project_root,
+            "project_source": project_source,
+        }
+
+        if not chk.allowed:
+            try:
+                req = await self.orchestrator.fs_access.create_permission_request(
+                    target_path,
+                    req_operations,
+                    task_id=task_id,
+                    reason=f"Requested `{primary_op}` access on `{target_path}` for: {text[:140]}",
+                    access_duration="once",
+                    deferred_action=deferred_payload,
+                )
+            except FilesystemSecurityError as exc:
+                if task_id:
+                    await self.orchestrator.tasks.update_task(task_id, status="failed", error_info=str(exc), current_step="Blocked by filesystem policy")
+                return {"command": "filesystem_blocked", "reply": f"Blocked by filesystem security policy: {exc}", "paths": [], "ok": False}
+
+            if task_id:
+                await self.orchestrator.tasks.update_task(
+                    task_id,
+                    status="awaiting_permission",
+                    plan=[f"Request scoped `{', '.join(req_operations)}` permission for `{req['canonical_path']}`", f"Execute `{primary_op}` on `{target_path}`"],
+                    append_permission=req["request_id"],
+                    current_step=f"Waiting for permission ({', '.join(req_operations)})",
+                )
+            self._set_os_state("Waiting for approval", source=source, detail=req["canonical_path"])
+            self.bus.publish({"type": "permission_requested", "request": req, "task_id": task_id})
+            return {
+                "command": "permission_required",
+                "reply": f"Permission required before `{primary_op}` on `{target_path}`. Choose Allow once, Allow for this session, Always allow (read-only), or Deny.",
+                "paths": [],
+                "permission_request": req,
+                "ok": False,
+            }
+
+        return await self.execute_deferred_action(
+            {"canonical_path": chk.canonical_path, "requested_operations": req_operations, "deferred_action": deferred_payload},
+            task_id=task_id,
+        )
+
+    async def _handle_pending_clarification_reply(
+        self,
+        text: str,
+        pending: dict,
+        *,
+        source: str,
+    ) -> dict | None:
+        """Intercept and resolve a reply to an active folder/project clarification before normal routing."""
+        raw = (text or "").strip()
+        tid = pending.get("task_id")
+        cands = list(pending.get("candidates") or [])
+
+        if HARD_STOP.match(raw) or re.match(r"^(?:never\s*mind|forget\s+it|no\s+thanks)\W*$", raw, re.I):
+            await self._clear_pending_clarification(tid, expired=False)
+            if tid:
+                await self.orchestrator.tasks.cancel_task(tid, reason="Clarification cancelled by owner")
+                await self.orchestrator.command_history.update_by_task(tid, status="cancelled", result_summary="Clarification cancelled by owner")
+            return {
+                "command": "clarification_cancelled",
+                "reply": "Cancelled the pending folder selection.",
+                "paths": [],
+                "task_id": tid,
+                "ok": False,
+            }
+
+        is_new_explicit_command = (
+            bool(re.match(r"^\s*(?:find|search|list|show|read|delete|create|check|open)\b", raw, re.I))
+            and (
+                bool(re.search(r"\b(?:my\s+)?(?:documents|downloads|desktop|pictures|workspace|system\s+status|tasks?)\b", raw, re.I))
+                or (len(raw.split()) >= 5 and bool(re.search(r"\b(?:files?|pdfs?|markdown|report|in\s+my)\b", raw, re.I)))
+            )
+        )
+        if is_new_explicit_command:
+            await self._clear_pending_clarification(tid, expired=False)
+            return None
+
+        if time.time() > float(pending.get("expires_at") or 0):
+            await self._clear_pending_clarification(tid, expired=True)
+            if tid:
+                await self.orchestrator.command_history.update_by_task(tid, status="failed", error_info="Clarification request expired")
+            words = raw.split()
+            parsed_ord = self._parse_clarification_ordinal(raw)
+            is_path_reply = bool(self._parse_host_fs_request(raw).get("explicit_path")) or bool(re.match(r"^[A-Za-z]:[\\/]|^/", raw))
+            has_new_cmd_verb = bool(re.match(r"^(?:what|check|show|list|open|find|read|explain|help|/)\b", raw, re.I)) and len(words) >= 3
+            if parsed_ord is not None or is_path_reply or (len(words) <= 4 and not has_new_cmd_verb):
+                return {
+                    "command": "clarification_expired",
+                    "reply": f"The pending folder selection for `{pending.get('project_name') or 'your request'}` has expired. Please ask again.",
+                    "paths": [],
+                    "task_id": tid,
+                    "ok": False,
+                }
+            return None
+
+        resolved_choice: dict | None = None
+        fs_probe = self._parse_host_fs_request(raw)
+        supplied_path = str(fs_probe.get("explicit_path") or "").strip()
+        if not supplied_path and re.match(r"^(?:[A-Za-z]:[\\/]|\\\\|/|~[\\/])", raw):
+            supplied_path = raw.strip().strip("\"'")
+
+        if supplied_path:
+            # First check if supplied_path matches an existing candidate directly
+            cand_hit, _ = self._match_clarification_candidate(supplied_path, cands)
+            if cand_hit:
+                resolved_choice = cand_hit
+            else:
+                sr = await self.orchestrator.fs_access.search_directory_for_project(
+                    supplied_path,
+                    str(pending.get("project_name") or ""),
+                )
+                if not sr.get("ok"):
+                    reply = f"{sr.get('error') or 'Invalid directory.'} Please provide a valid local parent directory path."
+                    await self._set_pending_clarification(tid, pending, reply)
+                    return {"command": "clarification_needed", "reply": reply, "candidates": cands, "clarification": pending, "paths": [], "task_id": tid, "ok": False}
+                matches = list(sr.get("matches") or [])
+                if len(matches) == 1:
+                    resolved_choice = {
+                        "name": matches[0]["name"],
+                        "path": matches[0]["path"],
+                        "source": "workspace_root",
+                    }
+                elif len(matches) > 1:
+                    new_cands = self._format_clarification_candidates(matches)
+                    updated_pending = {**pending, "mode": "select_candidate", "candidates": new_cands}
+                    reply = self._format_clarification_prompt(updated_pending)
+                    await self._set_pending_clarification(tid, updated_pending, reply)
+                    return {
+                        "command": "clarification_needed",
+                        "reply": reply,
+                        "candidates": new_cands,
+                        "clarification": updated_pending,
+                        "paths": [],
+                        "task_id": tid,
+                        "ok": False,
+                    }
+                else:
+                    reply = (
+                        f"I checked `{sr.get('parent_dir')}`, but no non-temporary folder matched "
+                        f"`{pending.get('project_name') or 'your project'}`. Please provide a more specific path."
+                    )
+                    await self._set_pending_clarification(tid, pending, reply)
+                    return {"command": "clarification_needed", "reply": reply, "candidates": cands, "clarification": pending, "paths": [], "task_id": tid, "ok": False}
+
+        if resolved_choice is None and pending.get("mode") == "select_candidate":
+            cand_hit, m_status = self._match_clarification_candidate(raw, cands)
+            if m_status == "matched" and cand_hit is not None:
+                resolved_choice = cand_hit
+            elif m_status == "ambiguous_name":
+                reply = self._format_clarification_prompt(pending) + " Your reply matches more than one option — please specify the number (e.g. `1` or `2`) or full path."
+                await self._set_pending_clarification(tid, pending, reply)
+                return {"command": "clarification_needed", "reply": reply, "candidates": cands, "clarification": pending, "paths": [], "task_id": tid, "ok": False}
+            elif m_status == "out_of_range":
+                reply = f"Option out of range. Please choose a number between 1 and {len(cands)}:\n" + "\n".join(
+                    f"{c['index']}. `{c['name']}` ({c['path']})" for c in cands[:8]
+                )
+                await self._set_pending_clarification(tid, pending, reply)
+                return {"command": "clarification_needed", "reply": reply, "candidates": cands, "clarification": pending, "paths": [], "task_id": tid, "ok": False}
+
+        if resolved_choice is None:
+            proj_try = await self.orchestrator.fs_access.resolve_project_target(raw)
+            if proj_try.get("matched"):
+                resolved_choice = {
+                    "name": str(proj_try["alias"]),
+                    "path": str(proj_try["root_path"]),
+                    "source": str(proj_try["source"]),
+                }
+            elif proj_try.get("ambiguous"):
+                new_cands = self._format_clarification_candidates(list(proj_try.get("candidates") or []))
+                if new_cands:
+                    updated_pending = {**pending, "mode": "select_candidate", "candidates": new_cands}
+                    reply = self._format_clarification_prompt(updated_pending)
+                    await self._set_pending_clarification(tid, updated_pending, reply)
+                    return {"command": "clarification_needed", "reply": reply, "candidates": new_cands, "clarification": updated_pending, "paths": [], "task_id": tid, "ok": False}
+
+        if resolved_choice is None:
+            if raw.startswith("/"):
+                return None
+            words = raw.split()
+            if len(words) >= 7 and any(w in raw.lower() for w in ("what", "explain", "weather", "status", "docker", "backup", "memory")):
+                return None
+            reply = self._format_clarification_prompt(pending)
+            await self._set_pending_clarification(tid, pending, reply)
+            return {
+                "command": "clarification_needed",
+                "reply": reply,
+                "candidates": cands,
+                "clarification": pending,
+                "paths": [],
+                "task_id": tid,
+                "ok": False,
+            }
+
+        chosen_path = str(resolved_choice["path"])
+        chosen_name = str(resolved_choice["name"])
+        chosen_source = str(resolved_choice.get("source") or "workspace_root")
+        await self._clear_pending_clarification(tid, expired=False)
+        if tid:
+            await self.orchestrator.tasks.update_task(
+                tid,
+                status="running",
+                current_step=f"Resumed {pending.get('requested_operation') or 'filesystem_ops'} on {chosen_name}",
+                meta_patch={"selected_path": chosen_path, "selected_name": chosen_name, "clarification_resolved": True, "pending_clarification": None},
+            )
+            await self.orchestrator.command_history.update_by_task(tid, status="running", paths_touched=[chosen_path])
+
+        restored_fs_info = {
+            "explicit_path": "",
+            "target": chosen_path,
+            "is_workspace_only": False,
+            "unspecified_folder": False,
+            "wants_explorer": bool(pending.get("wants_explorer")),
+            "operations": list(pending.get("requested_operations") or ["list_directory", "read_metadata"]),
+            "primary_op": str(pending.get("requested_operation") or "list_directory"),
+            "extensions": list(pending.get("extensions") or []),
+            "query": str(pending.get("query") or ""),
+            "target_file": str(pending.get("target_file") or ""),
+            "sub_target": str(pending.get("sub_target") or ""),
+            "filename": str(pending.get("filename") or "jarvis_report.md"),
+        }
+        res = await self._authorize_or_execute_fs_plan(
+            str(pending.get("original_request") or raw),
+            fs_info=restored_fs_info,
+            is_project=True,
+            project_name=chosen_name,
+            project_root=chosen_path,
+            project_source=chosen_source,
+            task_id=tid,
+            source=source,
+        )
+        res["task_id"] = tid
+        res["resumed_from_clarification"] = True
+        res["project_alias"] = chosen_name
+        return res
+
     async def _execute_planned_workflow(
         self,
         text: str,
@@ -2350,7 +2993,7 @@ class Assistant:
             active = [
                 t
                 for t in all_tasks
-                if t["status"] in ("queued", "planning", "awaiting_permission", "awaiting_approval", "running", "paused")
+                if t["status"] in ("queued", "planning", "awaiting_clarification", "awaiting_permission", "awaiting_approval", "running", "paused")
                 and t.get("task_id") != task_id
             ]
             summary_lines = [f"- [{t['status']}] {t['user_request'][:80]} ({t['current_step']})" for t in active[:6]]
@@ -2377,25 +3020,58 @@ class Assistant:
             t_start = time.perf_counter()
             fs_info = self._parse_host_fs_request(text)
             active_root = str((self.active_project or {}).get("root_path") or "") or None
+            active_source = str((self.active_project or {}).get("source") or "") or None
             resolved_proj: dict = (
                 await self.orchestrator.fs_access.resolve_project_target(
                     text,
                     active_root=active_root,
+                    active_source=active_source,
                     requested_filename=fs_info.get("target_file"),
                 )
                 if not fs_info["explicit_path"] and not fs_info["is_workspace_only"] and not fs_info["target"]
                 else {"matched": False, "ambiguous": False, "candidates": []}
             )
 
-            # Ambiguous project mention (e.g. multiple matching dirs) -> ask user to choose cleanly
             if resolved_proj.get("ambiguous"):
-                raw_cands = resolved_proj.get("candidates")
-                cands: list[dict] = list(raw_cands) if isinstance(raw_cands, list) else []
-                opts = "; ".join(f"`{c['name']}` ({c['path']})" for c in cands[:6])
-                reply = f"Multiple matching project folders were found for `{resolved_proj.get('query_name')}`: {opts}. Which folder would you like me to use?"
-                if task_id:
-                    await self.orchestrator.tasks.update_task(task_id, status="completed", result=reply, current_step="Clarification needed (multiple matches)")
-                return {"command": "clarification_needed", "reply": reply, "candidates": cands, "paths": [], "ok": False}
+                cands = self._format_clarification_candidates(list(resolved_proj.get("candidates") or []))
+                if len(cands) == 1:
+                    resolved_proj = {
+                        "matched": True,
+                        "ambiguous": False,
+                        "source": cands[0]["source"],
+                        "alias": cands[0]["name"],
+                        "root_path": cands[0]["path"],
+                        "resolved_path": cands[0]["path"],
+                    }
+                elif not cands:
+                    resolved_proj = {
+                        "matched": False,
+                        "ambiguous": False,
+                        "needs_parent_dir": True,
+                        "candidates": [],
+                        "query_name": resolved_proj.get("query_name") or "",
+                    }
+                else:
+                    q_name = str(resolved_proj.get("query_name") or "project")
+                    pending_data = self._build_pending_clarification(
+                        mode="select_candidate",
+                        original_request=text,
+                        original_intent=intent,
+                        fs_info=fs_info,
+                        project_name=q_name,
+                        candidates=cands,
+                        task_id=task_id,
+                    )
+                    reply = self._format_clarification_prompt(pending_data)
+                    await self._set_pending_clarification(task_id, pending_data, reply)
+                    return {
+                        "command": "clarification_needed",
+                        "reply": reply,
+                        "candidates": cands,
+                        "clarification": pending_data,
+                        "paths": [],
+                        "ok": False,
+                    }
 
             alias_hit = resolved_proj if resolved_proj.get("matched") else None
             project_root = ""
@@ -2408,17 +3084,30 @@ class Assistant:
                 fs_info["target"] = str(alias_hit["resolved_path"])
                 fs_info["is_workspace_only"] = False
                 fs_info["unspecified_folder"] = False
-                if project_source in ("project_alias", "registered_project", "approved_folder", "workspace_root"):
-                    self.active_project = {"name": project_name, "root_path": project_root, "source": project_source}
 
             # Explicit request to open folder in Windows Explorer routes strictly through ActionRegistry confirmation policy
             if fs_info.get("wants_explorer"):
                 exp_target = fs_info.get("target") or ""
                 if not exp_target:
-                    reply = "Please specify which folder or saved project alias to open in Explorer."
-                    if task_id:
-                        await self.orchestrator.tasks.update_task(task_id, status="failed", error_info=reply, current_step="Clarification needed")
-                    return {"command": "clarification_needed", "reply": reply, "paths": [], "ok": False}
+                    pending_data = self._build_pending_clarification(
+                        mode="supply_parent_dir",
+                        original_request=text,
+                        original_intent=intent,
+                        fs_info=fs_info,
+                        project_name=str(resolved_proj.get("query_name") or ""),
+                        candidates=[],
+                        task_id=task_id,
+                    )
+                    reply = "Please specify which folder, saved project alias, or parent directory path you want me to open in Explorer."
+                    await self._set_pending_clarification(task_id, pending_data, reply)
+                    return {
+                        "command": "clarification_needed",
+                        "reply": reply,
+                        "candidates": [],
+                        "clarification": pending_data,
+                        "paths": [],
+                        "ok": False,
+                    }
                 chk_exp = await self.orchestrator.fs_access.authorize(exp_target, "list_directory", task_id=task_id)
                 if chk_exp.blocked:
                     return {"command": "filesystem_blocked", "reply": f"Blocked by filesystem security policy: {chk_exp.reason}", "paths": [], "ok": False}
@@ -2520,137 +3209,41 @@ class Assistant:
                     graph_live.tool_used(self, "filesystem_search", query=text[:80], ok=False, duration_ms=dur_ms)
                     return {"command": "filesystem_ops", "reply": str(exc), "paths": [], "ok": False}
 
-            # Unknown project / unspecified folder without explicit path or resolved match -> ask user instead of assuming Documents
+            # Unknown project / unspecified folder without explicit path or resolved match -> ask user and persist pending state
             if fs_info["unspecified_folder"] and not fs_info["target"]:
-                reply = (
-                    f"I couldn't locate `{resolved_proj.get('query_name') or 'that folder'}` in your saved aliases, "
-                    "registered projects, or configured workspace roots. Please specify which folder or full path you want me to open."
+                q_name = str(resolved_proj.get("query_name") or "that project")
+                pending_data = self._build_pending_clarification(
+                    mode="supply_parent_dir",
+                    original_request=text,
+                    original_intent=intent,
+                    fs_info=fs_info,
+                    project_name=q_name,
+                    candidates=[],
+                    task_id=task_id,
                 )
-                if task_id:
-                    await self.orchestrator.tasks.update_task(task_id, status="completed", result=reply, current_step="Clarification needed")
-                return {"command": "clarification_needed", "reply": reply, "paths": [], "ok": False}
-
-            # Scoped Host Filesystem Flow (P10.20)
-            target_path = fs_info["target"]
-            req_operations = list(fs_info["operations"])
-            primary_op = req_operations[0]
-            folder_for_exec = target_path
-
-            # Refine target inside resolved project root when targeting a specific file or subfolder
-            if alias_hit and project_root:
-                target_file_name = str(fs_info.get("target_file") or "").strip()
-                sub_target_name = str(fs_info.get("sub_target") or "").strip()
-                if target_file_name:
-                    cand_file = Path(project_root) / target_file_name
-                    if cand_file.exists() and cand_file.is_file():
-                        target_path = str(cand_file)
-                        folder_for_exec = project_root
-                    else:
-                        target_path = project_root
-                        folder_for_exec = project_root
-                        if primary_op == "read_file" and "search_files" not in req_operations:
-                            req_operations = ["read_file", "search_files", "list_directory", "read_metadata"]
-                elif sub_target_name:
-                    cand_sub = Path(project_root) / sub_target_name
-                    if cand_sub.exists() and cand_sub.is_dir() and primary_op == "list_directory":
-                        target_path = str(cand_sub)
-                        folder_for_exec = str(cand_sub)
-                    else:
-                        target_path = project_root
-                        folder_for_exec = project_root
-                elif primary_op == "search_files" and not fs_info["query"] and not fs_info["extensions"]:
-                    # Project-level lookup ("Find my ERP project") -> open/list resolved project folder rather than searching for its own name
-                    req_operations = ["list_directory", "read_metadata"]
-                    primary_op = "list_directory"
-
-            if primary_op in WRITE_OPS:
-                deferred_kind = "fs_write_report"
-            elif primary_op == "read_file":
-                deferred_kind = "fs_read"
-            elif primary_op == "read_metadata":
-                deferred_kind = "fs_metadata"
-            elif primary_op == "delete_file":
-                deferred_kind = "fs_delete"
-            else:
-                deferred_kind = "fs_search"
-
-            chk = await self.orchestrator.fs_access.authorize(target_path, primary_op, task_id=task_id)
-            if chk.blocked:
-                if task_id:
-                    await self.orchestrator.tasks.update_task(
-                        task_id,
-                        status="failed",
-                        error_info=chk.reason,
-                        current_step="Blocked by filesystem security policy",
-                    )
+                reply = self._format_clarification_prompt(pending_data)
+                await self._set_pending_clarification(task_id, pending_data, reply)
                 return {
-                    "command": "filesystem_blocked",
-                    "reply": f"Blocked by filesystem security policy: {chk.reason}",
+                    "command": "clarification_needed",
+                    "reply": reply,
+                    "candidates": [],
+                    "clarification": pending_data,
                     "paths": [],
                     "ok": False,
                 }
 
-            # Verify explicit path actually exists for non-create operations before creating misleading permission cards
-            if fs_info["explicit_path"] and primary_op not in ("create_file", "write_file"):
-                cp_target = Path(chk.canonical_path)
-                if not cp_target.exists():
-                    reply = f"The path `{chk.canonical_path}` does not exist. Please check and clarify the exact path."
-                    if task_id:
-                        await self.orchestrator.tasks.update_task(task_id, status="failed", error_info=reply, current_step="Invalid target path")
-                    return {"command": "invalid_path", "reply": reply, "paths": [], "ok": False}
-
-            deferred_payload = {
-                "kind": deferred_kind,
-                "folder": folder_for_exec,
-                "target": target_path,
-                "target_file": fs_info.get("target_file") or "",
-                "operation": primary_op,
-                "query": fs_info["query"],
-                "extensions": fs_info["extensions"],
-                "filename": fs_info["filename"],
-                "original_text": text,
-                "is_project": bool(alias_hit and project_source in ("project_alias", "registered_project", "approved_folder", "workspace_root")),
-                "project_name": project_name,
-                "project_root": project_root,
-                "project_source": project_source,
-            }
-
-            if not chk.allowed:
-                try:
-                    req = await self.orchestrator.fs_access.create_permission_request(
-                        target_path,
-                        req_operations,
-                        task_id=task_id,
-                        reason=f"Requested `{primary_op}` access on `{target_path}` for: {text[:140]}",
-                        access_duration="once",
-                        deferred_action=deferred_payload,
-                    )
-                except FilesystemSecurityError as exc:
-                    if task_id:
-                        await self.orchestrator.tasks.update_task(task_id, status="failed", error_info=str(exc), current_step="Blocked by filesystem policy")
-                    return {"command": "filesystem_blocked", "reply": f"Blocked by filesystem security policy: {exc}", "paths": [], "ok": False}
-
-                if task_id:
-                    await self.orchestrator.tasks.update_task(
-                        task_id,
-                        status="awaiting_permission",
-                        plan=[f"Request scoped `{', '.join(req_operations)}` permission for `{req['canonical_path']}`", f"Execute `{primary_op}` on `{target_path}`"],
-                        append_permission=req["request_id"],
-                        current_step=f"Waiting for permission ({', '.join(req_operations)})",
-                    )
-                self._set_os_state("Waiting for approval", source=source, detail=req["canonical_path"])
-                self.bus.publish({"type": "permission_requested", "request": req, "task_id": task_id})
-                return {
-                    "command": "permission_required",
-                    "reply": f"Permission required before `{primary_op}` on `{target_path}`. Choose Allow once, Allow for this session, Always allow (read-only), or Deny.",
-                    "paths": [],
-                    "permission_request": req,
-                    "ok": False,
-                }
-
-            return await self.execute_deferred_action(
-                {"canonical_path": chk.canonical_path, "requested_operations": req_operations, "deferred_action": deferred_payload},
+            return await self._authorize_or_execute_fs_plan(
+                text,
+                fs_info=fs_info,
+                is_project=bool(
+                    alias_hit
+                    and project_source in ("project_alias", "registered_project", "approved_folder", "workspace_root", "active_project")
+                ),
+                project_name=project_name,
+                project_root=project_root,
+                project_source=project_source,
                 task_id=task_id,
+                source=source,
             )
 
         if intent == "memory_manage":
@@ -2891,6 +3484,69 @@ class Assistant:
                 if eff_cancel.is_set():
                     yield {"type": "interrupted"}
                     return
+                active_clar = await self._get_active_pending_clarification()
+                if active_clar is not None and not _in_replay:
+                    clar_res = await self._handle_pending_clarification_reply(text, active_clar, source=source)
+                    if clar_res is not None:
+                        clar_tid = clar_res.get("task_id") or active_clar.get("task_id")
+                        clar_cmd = str(clar_res.get("command") or "clarification_needed")
+                        clar_reply = str(clar_res.get("reply") or "")
+                        if clar_tid:
+                            if clar_cmd == "permission_required":
+                                clar_hist_status = "awaiting_permission"
+                            elif clar_cmd == "clarification_needed":
+                                clar_hist_status = "awaiting_clarification"
+                            elif clar_cmd == "clarification_cancelled":
+                                clar_hist_status = "cancelled"
+                            elif clar_cmd in ("filesystem_blocked", "invalid_path", "filesystem_failed", "clarification_expired"):
+                                clar_hist_status = "failed"
+                            else:
+                                clar_hist_status = "completed" if clar_res.get("ok", True) else "failed"
+                            await self.orchestrator.command_history.update_by_task(
+                                clar_tid,
+                                status=clar_hist_status,
+                                tools_used=clar_res.get("tools_used"),
+                                paths_touched=clar_res.get("paths") or [],
+                                result_summary=clar_reply,
+                                error_info=(clar_res.get("error") if clar_hist_status == "failed" else None),
+                            )
+                        latest_task = await self.orchestrator.tasks.get_task(clar_tid) if clar_tid else None
+                        yield {
+                            "type": "meta",
+                            "command": clar_cmd,
+                            "nodes": [],
+                            "model": None,
+                            "web_sources": [],
+                            "permission_request": clar_res.get("permission_request"),
+                            "clarification": clar_res.get("clarification"),
+                            "candidates": clar_res.get("candidates") or [],
+                            "task": latest_task,
+                            "task_id": clar_tid,
+                        }
+                        yield {"type": "token", "text": clar_reply}
+                        self.history.add("user", text)
+                        self.history.add("assistant", clar_reply)
+                        if speak and clar_reply:
+                            self.speaker.say(clar_reply)
+                        if self.os_state != "Waiting for approval":
+                            self._set_os_state("Completed" if clar_res.get("ok", True) else "Idle", source=source, detail=clar_cmd)
+                        yield {
+                            "type": "done",
+                            "answer": clar_reply,
+                            "nodes": [],
+                            "paths": clar_res.get("paths") or [],
+                            "web_sources": [],
+                            "command": clar_cmd,
+                            "permission_request": clar_res.get("permission_request"),
+                            "clarification": clar_res.get("clarification"),
+                            "candidates": clar_res.get("candidates") or [],
+                            "task": latest_task,
+                            "task_id": clar_tid,
+                            "ui": clar_res.get("ui"),
+                            "ok": bool(clar_res.get("ok", True)),
+                            "seconds": round(time.time() - t0, 2),
+                        }
+                        return
                 ui_cmd = self._match_ui_command(text)
                 if ui_cmd:
                     self._set_os_state("Executing", source=source, detail=ui_cmd["command"])
@@ -3153,14 +3809,24 @@ class Assistant:
                         return
                     reply = planned["reply"]
                     cmd_name = planned["command"]
-                    eff_cmd_status = "awaiting_permission" if cmd_name == "permission_required" else ("awaiting_approval" if (cmd_name == "approval_required" or planned.get("approval_token")) else "completed")
+                    eff_cmd_status = (
+                        "awaiting_permission"
+                        if cmd_name == "permission_required"
+                        else (
+                            "awaiting_clarification"
+                            if cmd_name == "clarification_needed"
+                            else ("awaiting_approval" if (cmd_name == "approval_required" or planned.get("approval_token")) else "completed")
+                        )
+                    )
                     err_detail = None
-                    if cmd_name not in ("permission_required", "approval_required") and not (
+                    if cmd_name not in ("permission_required", "approval_required", "clarification_needed") and not (
                         cmd_name == "dev_autonomous" and planned.get("approval_token")
                     ):
                         planned_outcome = planned.get("outcome") if isinstance(planned.get("outcome"), dict) else None
                         planned_out_status = str((planned_outcome or {}).get("status") or "")
-                        if cmd_name == "filesystem_blocked" or (not planned.get("ok", True) and cmd_name in ("document_export", "dev_autonomous")):
+                        if cmd_name in ("filesystem_blocked", "invalid_path", "filesystem_failed", "clarification_expired") or (
+                            not planned.get("ok", True) and cmd_name in ("document_export", "dev_autonomous")
+                        ):
                             eff_status = "failed"
                         elif cmd_name != "deep_research" and planned_out_status in ("failed", "unverified", "started", "cancelled"):
                             eff_status = planned_out_status
@@ -3212,6 +3878,8 @@ class Assistant:
                         "web_sources": [],
                         "decision": decision_summary,
                         "permission_request": planned.get("permission_request"),
+                        "clarification": planned.get("clarification"),
+                        "candidates": planned.get("candidates") or [],
                         "task": latest_task,
                         "task_id": current_task_id,
                     }
@@ -3234,6 +3902,8 @@ class Assistant:
                         "run_id": planned.get("run_id"),
                         "approval_token": planned.get("approval_token"),
                         "permission_request": planned.get("permission_request"),
+                        "clarification": planned.get("clarification"),
+                        "candidates": planned.get("candidates") or [],
                         "task": latest_task,
                         "task_id": current_task_id,
                         "plan": planned.get("plan"),

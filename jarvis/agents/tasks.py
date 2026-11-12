@@ -16,6 +16,7 @@ from ..security.outcomes import ToolOutcome, ToolStatus, VerificationCheck
 TASK_STATUSES: tuple[str, ...] = (
     "queued",
     "planning",
+    "awaiting_clarification",
     "awaiting_permission",
     "awaiting_approval",
     "running",
@@ -31,6 +32,7 @@ TERMINAL_TASK_STATUSES: frozenset[str] = frozenset({"completed", "unverified", "
 ACTIVE_TASK_STATUSES: tuple[str, ...] = (
     "queued",
     "planning",
+    "awaiting_clarification",
     "awaiting_permission",
     "awaiting_approval",
     "running",

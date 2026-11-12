@@ -19,6 +19,7 @@ from pathlib import Path
 import re
 import stat
 import sys
+import tempfile
 import time
 from typing import Any, Iterable
 
@@ -174,9 +175,101 @@ def _norm(p: str | Path) -> str:
 def _is_within(child_norm: str, parent_norm: str) -> bool:
     if child_norm == parent_norm:
         return True
-    sep = os.sep
-    prefix = parent_norm if parent_norm.endswith(sep) else parent_norm + sep
-    return child_norm.startswith(prefix)
+    return child_norm.startswith(parent_norm.rstrip("\\/") + os.sep)
+
+
+_TEMP_AND_GENERATED_SEGMENTS: frozenset[str] = frozenset(
+    {
+        ".git",
+        ".venv",
+        "venv",
+        "env",
+        "node_modules",
+        "__pycache__",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+        ".cache",
+        "dist",
+        "build",
+        "target",
+        ".next",
+        ".turbo",
+        ".trash",
+    }
+)
+
+
+def is_temporary_or_generated_path(path: Path | str) -> bool:
+    """Return True if path resides inside OS/user temp dirs, pytest temp roots, or cache/venv/build dirs."""
+    raw = str(path or "").strip()
+    if not raw:
+        return False
+    norm_target = _norm(raw)
+    low_slashes = norm_target.replace("\\", "/")
+
+    # Check explicit system temp roots (TEMP, TMP, TMPDIR, tempfile.gettempdir(), /tmp, /var/tmp)
+    temp_roots: list[str] = []
+    for env_k in ("TEMP", "TMP", "TMPDIR"):
+        v = str(os.environ.get(env_k) or "").strip()
+        if v:
+            temp_roots.append(v)
+    try:
+        temp_roots.append(tempfile.gettempdir())
+    except Exception:
+        pass
+    for tr in temp_roots:
+        try:
+            if _is_within(norm_target, _norm(tr)):
+                return True
+        except Exception:
+            continue
+
+    if "/appdata/local/temp" in low_slashes or low_slashes.startswith(("/tmp/", "/var/tmp/")) or low_slashes in ("/tmp", "/var/tmp"):
+        return True
+
+    parts = [seg.lower() for seg in Path(norm_target).parts if seg]
+    for seg in parts:
+        if seg.startswith("pytest-of-") or seg.startswith("jarvis_live_docs_"):
+            return True
+        if re.fullmatch(r"pytest-\d+", seg):
+            return True
+        if seg in _TEMP_AND_GENERATED_SEGMENTS:
+            return True
+    return False
+
+
+def validate_workspace_roots(roots: Iterable[str]) -> list[str]:
+    """Canonicalize and validate explicitly configured workspace roots; reject temp/generated/blocked dirs."""
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for raw in roots or ():
+        s = str(raw or "").strip()
+        if not s:
+            continue
+        if s.startswith("\\\\") or s.startswith("//"):
+            raise ValueError(f"Workspace root cannot be a UNC path: {s}")
+        try:
+            p_raw = Path(s).expanduser()
+        except Exception as exc:
+            raise ValueError(f"Invalid workspace root path '{s}': {exc}") from exc
+        if ".." in p_raw.parts:
+            raise ValueError(f"Workspace root cannot contain '..' segments: {s}")
+        resolved = p_raw.resolve(strict=False)
+        if not resolved.exists() or not resolved.is_dir():
+            raise ValueError(f"Workspace root does not exist or is not a directory: {resolved}")
+        if is_temporary_or_generated_path(resolved):
+            raise ValueError(
+                f"Workspace root '{resolved}' cannot be a temporary, pytest, cache, virtual environment, or generated directory."
+            )
+        low_parts = {pt.lower() for pt in resolved.parts}
+        if any(d in low_parts for d in _PROTECTED_SYSTEM_DIRS):
+            raise ValueError(f"Workspace root '{resolved}' points to a protected OS directory.")
+        key = _norm(resolved)
+        if key not in seen:
+            seen.add(key)
+            cleaned.append(str(resolved))
+    return cleaned
 
 
 def _has_reparse_or_symlink(path: Path) -> bool:
@@ -1576,6 +1669,17 @@ class FilesystemAccessManager:
             sub_cand = sub_m.group(1).strip(" .?!\"'")
             if sub_cand.lower() not in {"folder", "structure", "project", "that", "this", "the", "files", "documents"}:
                 sub_item = sub_cand
+        elif not mention:
+            # Bare follow-up like "Find the backend." / "Read package.json." / "Inspect backend"
+            bare_m = re.match(
+                r"^\s*(?:find|open|locate|read|show|check|inspect)\s+(?:the\s+|its\s+)?([A-Za-z0-9_.\-]+)\s*[?.!]*$",
+                raw,
+                re.I,
+            )
+            if bare_m:
+                sub_cand = bare_m.group(1).strip(" .?!\"'")
+                if sub_cand.lower() not in {"folder", "structure", "project", "that", "this", "the", "it", "files", "documents"}:
+                    sub_item = sub_cand
         return {
             "mention": mention,
             "sub_item": sub_item,
@@ -1611,14 +1715,15 @@ class FilesystemAccessManager:
         target_or_query: str,
         *,
         active_root: str | None = None,
+        active_source: str | None = None,
         requested_filename: str | None = None,
     ) -> dict[str, Any]:
         """Resolve project mentions strictly in priority order without unrestricted disk scanning:
-        1. Exact saved project alias.
-        2. Registered workspace/project paths.
-        3. Previously approved (session/persistent) project roots.
-        4. Shallow search within explicitly configured workspace roots.
-        5. Return ambiguous candidates list for user choice, or contextual active_root fallback.
+        1. Exact saved project alias (and normalized variations).
+        2. Registered workspace/project record and canonical root path.
+        3. Active, valid, explicitly approved project context.
+        4. Shallow search within trusted configured workspace roots only (excluding temp/generated paths).
+        5. Return structured ambiguous candidates list for user selection, or needs_parent_dir when absent.
         """
         raw = str(target_or_query or "").strip().strip("\"'")
         if not raw:
@@ -1632,13 +1737,14 @@ class FilesystemAccessManager:
         info = self._extract_project_mention(raw)
         has_verb = bool(re.match(r"^(?:open|find|search|show|list|inspect|read|locate)\b", raw, re.I))
         mention = info["mention"] or (head_raw if (subpath or (not has_verb and len(raw.split()) <= 3)) else "")
-        # Avoid treating generic words ("that", "that project", "package.json") as project names
-        if mention.lower() in {"that", "this", "the", "my", "project", "folder", "directory", "workspace", "package.json", "that project", "backend", "frontend"}:
+        if mention.lower() in {
+            "that", "this", "the", "my", "project", "folder", "directory", "workspace",
+            "package.json", "that project", "backend", "frontend",
+        }:
             mention = ""
 
         norm_full = self._project_norm_space(raw)
         full_tokens = set(re.findall(r"[a-z0-9_.-]+", norm_full))
-        # Add adjacent word bigrams normalized into slug form (e.g. "erp v2" -> "erpv2")
         word_list = re.findall(r"[a-z0-9]+", raw.lower())
         for idx in range(len(word_list) - 1):
             full_tokens.add(word_list[idx] + word_list[idx + 1])
@@ -1649,12 +1755,14 @@ class FilesystemAccessManager:
             projects = (await s.execute(select(ProjectRow))).scalars().all()
             perms = (await s.execute(select(FilesystemPermissionRow).where(FilesystemPermissionRow.status == "active"))).scalars().all()
 
-        def _make_hit(base_path: str, source: str, name: str, score: int) -> dict[str, Any] | None:
+        def _make_hit(base_path: str, source: str, name: str, score: int, *, allow_temp: bool = False) -> dict[str, Any] | None:
             try:
                 resolved, _ = self._screen_target_security(base_path, "list_directory")
             except FilesystemSecurityError:
                 return None
             if not resolved.exists() or not resolved.is_dir():
+                return None
+            if not allow_temp and is_temporary_or_generated_path(resolved):
                 return None
             cand_path = resolved / subpath if subpath else resolved
             return {
@@ -1671,50 +1779,69 @@ class FilesystemAccessManager:
         def _pick_from_hits(hits: list[dict[str, Any]]) -> dict[str, Any] | None:
             if not hits:
                 return None
-            # Deduplicate by resolved root_path keeping highest score
             by_root: dict[str, dict[str, Any]] = {}
             for h in hits:
-                rk = h["root_path"].lower()
+                rk = _norm(h["root_path"])
                 if rk not in by_root or h["score"] > by_root[rk]["score"]:
                     by_root[rk] = h
             unique = list(by_root.values())
             max_score = max(h["score"] for h in unique)
-            # Prefer exact (90+) hits over weaker variation hits if exact hits exist
             top = [h for h in unique if (h["score"] >= 90 if max_score >= 90 else h["score"] == max_score)]
             if len(top) == 1:
                 return top[0]
+            sorted_top = sorted(top, key=lambda x: x["root_path"].lower())
+            cands = [
+                {
+                    "index": idx + 1,
+                    "id": f"cand_{idx + 1}",
+                    "name": h["alias"],
+                    "path": h["root_path"],
+                    "source": h["source"],
+                    "label": f"{idx + 1}. {h['alias']} ({h['root_path']})",
+                }
+                for idx, h in enumerate(sorted_top)
+            ]
             return {
                 "matched": False,
                 "ambiguous": True,
-                "candidates": [{"name": h["alias"], "path": h["root_path"], "source": h["source"]} for h in sorted(top, key=lambda x: x["root_path"].lower())],
+                "candidates": cands,
                 "query_name": mention or raw,
             }
 
-        # Step 1: Saved project aliases
+        # Step 1: Exact / normalized saved project aliases (never scans workspace_roots when matched)
         alias_hits: list[dict[str, Any]] = []
         for a in aliases:
             sc = self._score_project_match(a.display_name or a.alias, a.folder_path, mention, full_tokens)
             if sc > 0:
-                hit = _make_hit(a.folder_path, "project_alias", a.display_name or a.alias, sc)
+                hit = _make_hit(a.folder_path, "project_alias", a.display_name or a.alias, sc, allow_temp=True)
                 if hit:
                     alias_hits.append(hit)
         picked = _pick_from_hits(alias_hits)
         if picked:
             return picked
 
-        # Step 2: Registered workspace/project paths
+        # Step 2: Registered workspace/project records
         proj_hits: list[dict[str, Any]] = []
         for p in projects:
             sc = self._score_project_match(p.name, p.root_path, mention, full_tokens)
             if sc > 0:
-                hit = _make_hit(p.root_path, "registered_project", p.name, sc)
+                hit = _make_hit(p.root_path, "registered_project", p.name, sc, allow_temp=True)
                 if hit:
                     proj_hits.append(hit)
         picked = _pick_from_hits(proj_hits)
         if picked:
             return picked
 
-        # Step 3: Previously approved & accessible project roots (session/persistent only; never 'once')
+        # Step 3: Active, valid, explicitly approved project context
+        allow_active_temp = bool(active_source in ("project_alias", "registered_project", "user_supplied_root"))
+        if active_root:
+            active_name = Path(active_root).name
+            sc_active = self._score_project_match(active_name, active_root, mention, full_tokens) if (mention or full_tokens) else 0
+            if sc_active >= 75 or info["contextual"] or (not mention and (info["sub_item"] or requested_filename)):
+                hit = _make_hit(active_root, "active_context", active_name, max(80, sc_active), allow_temp=allow_active_temp)
+                if hit:
+                    return hit
+
         std_home_names = {"documents", "downloads", "desktop", "pictures"}
         perm_hits: list[dict[str, Any]] = []
         for perm in perms:
@@ -1725,14 +1852,14 @@ class FilesystemAccessManager:
                 continue
             sc = self._score_project_match(bname, perm.canonical_folder_path, mention, full_tokens)
             if sc > 0:
-                hit = _make_hit(perm.canonical_folder_path, "approved_folder", bname, sc)
+                hit = _make_hit(perm.canonical_folder_path, "approved_folder", bname, sc, allow_temp=False)
                 if hit:
                     perm_hits.append(hit)
         picked = _pick_from_hits(perm_hits)
         if picked:
             return picked
 
-        # Step 4: Search within explicitly configured workspace roots (shallow, bounded, safe)
+        # Step 4: Search strictly within trusted configured workspace roots (excluding temp/generated dirs BEFORE ambiguity)
         ws_roots: list[Path] = []
         notes_root = str(self.settings.notes_path)
         raw_low = raw.lower()
@@ -1745,25 +1872,26 @@ class FilesystemAccessManager:
                 continue
             if str(ws_res).lower() == notes_root.lower() and "note" not in raw_low:
                 continue
+            if is_temporary_or_generated_path(ws_res):
+                continue
             if ws_res.exists() and ws_res.is_dir() and ws_res not in ws_roots:
                 ws_roots.append(ws_res)
 
         ws_hits: list[dict[str, Any]] = []
         if ws_roots and (mention or full_tokens):
-            skip_names = set(getattr(self.settings.filesystem, "excluded_dirs", []) or []) | {".git", "node_modules", "__pycache__", ".venv", "venv"}
+            skip_names = set(getattr(self.settings.filesystem, "excluded_dirs", []) or []) | _TEMP_AND_GENERATED_SEGMENTS
             for ws_root in ws_roots:
-                # Check direct children and depth-2 children cleanly
                 lvl1: list[Path] = []
                 try:
                     for child in ws_root.iterdir():
                         if not child.is_dir() or child.name in skip_names or child.name.startswith("."):
                             continue
-                        if _has_reparse_or_symlink(child) or _detect_sensitive_path(child):
+                        if _has_reparse_or_symlink(child) or _detect_sensitive_path(child) or is_temporary_or_generated_path(child):
                             continue
                         lvl1.append(child)
                         sc = self._score_project_match(child.name, str(child), mention, full_tokens)
                         if sc > 0:
-                            hit = _make_hit(str(child), "workspace_root", child.name, sc)
+                            hit = _make_hit(str(child), "workspace_root", child.name, sc, allow_temp=False)
                             if hit:
                                 ws_hits.append(hit)
                 except OSError:
@@ -1773,11 +1901,11 @@ class FilesystemAccessManager:
                         for grand in sub_parent.iterdir():
                             if not grand.is_dir() or grand.name in skip_names or grand.name.startswith("."):
                                 continue
-                            if _has_reparse_or_symlink(grand) or _detect_sensitive_path(grand):
+                            if _has_reparse_or_symlink(grand) or _detect_sensitive_path(grand) or is_temporary_or_generated_path(grand):
                                 continue
                             sc = self._score_project_match(grand.name, str(grand), mention, full_tokens)
                             if sc > 0:
-                                hit = _make_hit(str(grand), "workspace_root", grand.name, max(1, sc - 5))
+                                hit = _make_hit(str(grand), "workspace_root", grand.name, max(1, sc - 5), allow_temp=False)
                                 if hit:
                                     ws_hits.append(hit)
                     except OSError:
@@ -1786,13 +1914,14 @@ class FilesystemAccessManager:
         if picked:
             return picked
 
-        # Step 5: Contextual follow-up reuse of active_root ONLY when query references prior project or lacks an unknown named project
-        if active_root and (info["contextual"] or (not mention and (info["sub_item"] or requested_filename))):
-            hit = _make_hit(active_root, "active_context", Path(active_root).name, 80)
-            if hit:
-                return hit
-
-        return {"matched": False, "ambiguous": False, "candidates": [], "query_name": mention or raw}
+        # Step 5: Ambiguity or ask for parent directory (do not guess)
+        return {
+            "matched": False,
+            "ambiguous": False,
+            "needs_parent_dir": True,
+            "candidates": [],
+            "query_name": mention or info["sub_item"] or raw,
+        }
 
     async def resolve_alias(self, target_or_query: str) -> dict[str, Any] | None:
         """Resolve an alias name, registered project name, approved folder, or configured workspace project (with optional subpath)."""
@@ -1805,6 +1934,90 @@ class FilesystemAccessManager:
                 "resolved_path": res["resolved_path"],
             }
         return None
+
+    async def search_directory_for_project(
+        self,
+        parent_dir: str | Path,
+        query_name: str = "",
+        *,
+        limit: int = 12,
+    ) -> dict[str, Any]:
+        """Search a user-supplied parent directory safely (depth <= 2) for matching non-temp project folders."""
+        try:
+            validated = validate_workspace_roots([str(parent_dir)])
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc), "parent_dir": str(parent_dir), "matches": []}
+        if not validated:
+            return {"ok": False, "error": "Please provide an existing directory path.", "parent_dir": str(parent_dir), "matches": []}
+
+        root = Path(validated[0])
+        try:
+            root_screened, _ = self._screen_target_security(root, "list_directory")
+        except FilesystemSecurityError as exc:
+            return {"ok": False, "error": exc.reason, "parent_dir": str(root), "matches": []}
+
+        q_clean = str(query_name or "").strip()
+        q_tokens = set(re.findall(r"[A-Za-z0-9_.-]{2,}", q_clean.lower()))
+        skip_names = set(getattr(self.settings.filesystem, "excluded_dirs", []) or []) | _TEMP_AND_GENERATED_SEGMENTS
+        hits: list[dict[str, Any]] = []
+        seen: set[str] = set()
+
+        def _add_hit(path_obj: Path, score: int) -> None:
+            norm_p = _norm(path_obj)
+            if norm_p in seen or is_temporary_or_generated_path(path_obj):
+                return
+            seen.add(norm_p)
+            hits.append(
+                {
+                    "name": path_obj.name,
+                    "path": str(path_obj),
+                    "source": "user_supplied_parent",
+                    "score": score,
+                }
+            )
+
+        if q_clean:
+            sc_self = self._score_project_match(root_screened.name, str(root_screened), q_clean, q_tokens)
+            if sc_self >= 75:
+                _add_hit(root_screened, sc_self)
+                return {"ok": True, "parent_dir": str(root_screened), "matches": hits[:limit]}
+
+        lvl1: list[Path] = []
+        try:
+            for child in sorted(root_screened.iterdir(), key=lambda p: p.name.lower()):
+                if not child.is_dir() or child.name in skip_names or child.name.startswith("."):
+                    continue
+                if _has_reparse_or_symlink(child) or _detect_sensitive_path(child) or is_temporary_or_generated_path(child):
+                    continue
+                lvl1.append(child)
+                if q_clean:
+                    sc = self._score_project_match(child.name, str(child), q_clean, q_tokens)
+                    if sc > 0:
+                        _add_hit(child, sc)
+                else:
+                    _add_hit(child, 80)
+        except OSError as exc:
+            return {"ok": False, "error": f"Unable to inspect directory `{root_screened}`: {exc}", "parent_dir": str(root_screened), "matches": []}
+
+        if q_clean:
+            for sub_parent in lvl1[:40]:
+                try:
+                    for grand in sorted(sub_parent.iterdir(), key=lambda p: p.name.lower()):
+                        if not grand.is_dir() or grand.name in skip_names or grand.name.startswith("."):
+                            continue
+                        if _has_reparse_or_symlink(grand) or _detect_sensitive_path(grand) or is_temporary_or_generated_path(grand):
+                            continue
+                        sc = self._score_project_match(grand.name, str(grand), q_clean, q_tokens)
+                        if sc > 0:
+                            _add_hit(grand, max(1, sc - 5))
+                except OSError:
+                    continue
+
+        hits.sort(key=lambda h: (-int(h["score"]), str(h["name"]).lower(), str(h["path"]).lower()))
+        if hits:
+            top_sc = int(hits[0]["score"])
+            hits = [h for h in hits if int(h["score"]) >= top_sc - 5]
+        return {"ok": True, "parent_dir": str(root_screened), "matches": hits[:limit]}
 
     # ---------------- Serializers ----------------
 

@@ -587,9 +587,14 @@ def _apply_laya_env_overrides(raw: dict) -> dict:
     return raw
 
 
+def _default_overrides_path() -> Path:
+    env_ov = os.environ.get("JARVIS_OVERRIDES_FILE", "").strip()
+    return Path(env_ov) if env_ov else (DATA / "settings.json")
+
+
 def load_settings(config_path: Path | None = None, overrides_path: Path | None = None) -> Settings:
     config_path = config_path or ROOT / "config.json"
-    overrides_path = overrides_path or DATA / "settings.json"
+    overrides_path = overrides_path or _default_overrides_path()
     raw = json.loads(config_path.read_text(encoding="utf-8"))
     if overrides_path.exists():
         raw = _deep_merge(raw, json.loads(overrides_path.read_text(encoding="utf-8")))
@@ -598,7 +603,7 @@ def load_settings(config_path: Path | None = None, overrides_path: Path | None =
 
 
 def save_overrides(patch: dict, overrides_path: Path | None = None) -> None:
-    p = overrides_path or DATA / "settings.json"
+    p = overrides_path or _default_overrides_path()
     p.parent.mkdir(parents=True, exist_ok=True)
     cur = json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
     tmp = p.with_suffix(".tmp")

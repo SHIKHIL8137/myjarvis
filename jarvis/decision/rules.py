@@ -32,6 +32,7 @@ FILESYSTEM_OPS_RE = re.compile(
     r"(?:files?|folders?|directories|projects?|workspace\s+files?|pdf\s+documents?|documents?|downloads?|desktop|reports?\b)|"
     r"(?:list|show|find|search|inspect|read|open|create|write|edit|save|delete)\b[^\n]{0,70}"
     r"(?:my\s+|the\s+|that\s+|this\s+)?(?:documents|downloads|desktop|pictures|folder|directory|project)\b|"
+    r"(?:list|show|find|search|inspect|read|open)\s+(?:its\s+|the\s+)?(?:backend|frontend|src|app|apps|packages|client|server|database|docs|tests|config)\b|"
     r"\b(?:read|open|show|inspect|check)\s+(?:its\s+|the\s+)?[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,8}\b[^\n]{0,40}\b(?:in|inside|from)?|"
     r"\b(?:folder|directory)\s+structure\b|"
     r"what\s+files\s+are\s+in\b|[A-Za-z]:\\|\\\\[A-Za-z0-9_.-]+\\)",

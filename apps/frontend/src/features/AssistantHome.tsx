@@ -61,6 +61,24 @@ export interface AssistantTaskItem {
   completed_at?: number | null;
 }
 
+export interface ClarificationCandidate {
+  index: number;
+  id: string;
+  name: string;
+  path: string;
+  source: string;
+}
+
+export interface ClarificationPromptData {
+  clarification_id?: string;
+  mode: "select_candidate" | "supply_parent_dir" | string;
+  project_name?: string;
+  requested_operation?: string;
+  task_id?: string | null;
+  candidates?: ClarificationCandidate[];
+  expires_at?: number;
+}
+
 export interface ChatFeedItem {
   id: string;
   role: "user" | "assistant";
@@ -78,6 +96,7 @@ export interface ChatFeedItem {
   paths?: string[];
   permissionRequest?: FsPermissionRequest;
   approvalRequest?: OwnerApprovalRequest;
+  clarification?: ClarificationPromptData;
   task?: AssistantTaskItem | null;
   stats?: string;
   resolvedForRequestId?: string;
@@ -127,6 +146,7 @@ function taskTone(status: string): "ok" | "warn" | "danger" | "info" | "" {
   if (
     status === "unverified" ||
     status === "started" ||
+    status === "awaiting_clarification" ||
     status === "awaiting_permission" ||
     status === "awaiting_approval" ||
     status === "paused" ||
@@ -174,6 +194,7 @@ export const AssistantHome: React.FC<AssistantHomeProps> = ({
   const [explorerOpen, setExplorerOpen] = useState(false);
   const [allowAlwaysReadOnly, setAllowAlwaysReadOnly] = useState(true);
   const [decidingId, setDecidingId] = useState<string | null>(null);
+  const [resolvedClarifications, setResolvedClarifications] = useState<Record<string, boolean>>({});
   const feedEndRef = useRef<HTMLDivElement | null>(null);
   const gVer = useGraphVersion();
   const graphEntityCount = useMemo(() => graph.nodes.size, [gVer]);
@@ -463,6 +484,44 @@ export const AssistantHome: React.FC<AssistantHomeProps> = ({
     }
   };
 
+  const sendClarificationChoice = async (replyText: string, clarificationId?: string) => {
+    const clean = replyText.trim();
+    if (!clean) return;
+    setDecidingId(clarificationId || clean);
+    try {
+      setFeed((prev) => [
+        ...prev,
+        { id: `clar-u-${Date.now()}`, role: "user", text: clean },
+      ]);
+      const res = await apiFetch<Record<string, any>>("/chat", {
+        method: "POST",
+        body: { message: clean, speak: false },
+      });
+      if (clarificationId && res.command !== "clarification_needed") {
+        setResolvedClarifications((prev) => ({ ...prev, [clarificationId]: true }));
+      }
+      setFeed((prev) => [
+        ...prev,
+        {
+          id: `clar-a-${Date.now()}`,
+          role: "assistant",
+          text: String(res.answer || ""),
+          command: (res.command as string) || null,
+          paths: Array.isArray(res.paths) ? res.paths : [],
+          permissionRequest: res.permission_request,
+          approvalRequest: res.approval,
+          clarification: res.clarification,
+          task: res.task || null,
+        },
+      ]);
+    } catch (e) {
+      onNotify((e as Error).message);
+    } finally {
+      setDecidingId(null);
+      loadTasksAndPolicy();
+    }
+  };
+
   const cancelTask = async (taskId: string) => {
     try {
       const r = await apiFetch<{ task: AssistantTaskItem }>(`/v2/tasks/${taskId}/cancel`, { method: "POST" });
@@ -486,7 +545,7 @@ export const AssistantHome: React.FC<AssistantHomeProps> = ({
   };
 
   const activeTasks = tasks.filter((t) =>
-    ["queued", "planning", "awaiting_permission", "awaiting_approval", "running", "paused", "waiting_quota"].includes(t.status)
+    ["queued", "planning", "awaiting_clarification", "awaiting_permission", "awaiting_approval", "running", "paused", "waiting_quota"].includes(t.status)
   );
   const currentModel = status?.brain?.model || "local";
   const currentProvider = status?.brain?.provider || "ollama";
@@ -832,6 +891,8 @@ export const AssistantHome: React.FC<AssistantHomeProps> = ({
           )}
 
           {feed.map((m) => {
+            const clar = m.clarification;
+            const clarResolved = Boolean(clar?.clarification_id && resolvedClarifications[clar.clarification_id]);
             const pr = m.permissionRequest;
             const ap = m.approvalRequest;
             const canAlwaysReadOnly =
@@ -867,6 +928,52 @@ export const AssistantHome: React.FC<AssistantHomeProps> = ({
                         <Markdown text={m.text} />
                       ) : (
                         <span className="typing" aria-label="Generating"><i /><i /><i /></span>
+                      )}
+
+                      {/* Inline Project / Folder Clarification Card */}
+                      {clar && (
+                        <div className="inline-perm-card" data-clarification-id={clar.clarification_id || "pending"}>
+                          <div className="row between wrap">
+                            <span className={`pill ${clarResolved ? "ok" : "warn"}`}>
+                              {clar.mode === "select_candidate"
+                                ? "Clarification · Select Project Folder"
+                                : "Clarification · Folder Location"}
+                            </span>
+                            {clar.task_id && <span className="mono dim">task: {clar.task_id.slice(0, 8)}</span>}
+                          </div>
+                          <div className="dim" style={{ fontSize: 12, marginTop: 4 }}>
+                            {clar.project_name && (
+                              <>
+                                Project: <span className="mono">{clar.project_name}</span> ·{" "}
+                              </>
+                            )}
+                            Pending operation: <span className="mono">{clar.requested_operation || "list_directory"}</span>
+                          </div>
+                          {clar.mode === "select_candidate" && (clar.candidates || []).length > 0 ? (
+                            <div className="col" style={{ gap: 6, marginTop: 8 }}>
+                              {(clar.candidates || []).map((c) => (
+                                <button
+                                  key={`${c.index}-${c.path}`}
+                                  className="ghost"
+                                  style={{ textAlign: "left", justifyContent: "space-between", display: "flex", gap: 8, width: "100%" }}
+                                  disabled={clarResolved || decidingId === (clar.clarification_id || String(c.index))}
+                                  onClick={() => sendClarificationChoice(String(c.index), clar.clarification_id)}
+                                >
+                                  <span>
+                                    <strong>{c.index}. {c.name}</strong>{" "}
+                                    <span className="mono dim">{c.path}</span>
+                                  </span>
+                                  <span className="pill">{c.source}</span>
+                                </button>
+                              ))}
+                            </div>
+                          ) : (
+                            <div className="dim" style={{ fontSize: 12, marginTop: 6 }}>
+                              Reply in chat with the full folder or parent directory path (for example{" "}
+                              <span className="mono">D:\projects</span>) or a saved project name.
+                            </div>
+                          )}
+                        </div>
                       )}
 
                       {/* Inline Scoped Filesystem Permission Card */}

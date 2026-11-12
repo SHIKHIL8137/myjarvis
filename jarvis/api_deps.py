@@ -123,6 +123,14 @@ def apply_settings_patch(a, patch: dict, *, allow_gateway_and_prefs: bool = True
         if local_models and patch_copy["stt"]["model"] not in local_models:
             raise ValueError(f"STT model {patch_copy['stt']['model']!r} is not downloaded locally ({', '.join(local_models)})")
 
+    if "workspace_roots" in patch_copy.get("filesystem", {}):
+        from .filesystem_access import validate_workspace_roots
+
+        patch_copy["filesystem"] = dict(patch_copy["filesystem"])
+        patch_copy["filesystem"]["workspace_roots"] = validate_workspace_roots(
+            patch_copy["filesystem"].get("workspace_roots") or []
+        )
+
     raw = a.settings.model_dump()
     raw.pop("mode", None)
     if "mode" in patch_copy:
