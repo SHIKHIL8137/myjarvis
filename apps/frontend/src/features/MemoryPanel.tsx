@@ -1,5 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { apiFetch } from "../api/client";
+import { onEvent } from "../live";
+import type { ShellProps } from "../shell";
 
 interface PersonalItem {
   id: string;
@@ -14,8 +16,10 @@ interface PersonalItem {
   score?: number;
 }
 
-export const MemoryPanel: React.FC<{ onNotify: (msg: string) => void }> = ({ onNotify }) => {
-  const [sub, setSub] = useState<"personal" | "experience" | "documents">("personal");
+export const MemoryPanel: React.FC<ShellProps> = ({ onNotify, onInspect, onNavigate }) => {
+  const [sub, setSub] = useState<"personal" | "experience" | "knowledge" | "documents">("personal");
+  const [kq, setKq] = useState("");
+  const [kHits, setKHits] = useState<Array<{ title: string; content: string; source_id: string; trust?: string; score?: number }> | null>(null);
   const [personal, setPersonal] = useState<PersonalItem[]>([]);
   const [experience, setExperience] = useState<Array<{ id: string; scope: string; trigger_context: string; lesson_after: string }>>([]);
   const [summary, setSummary] = useState<Record<string, unknown>>({});
@@ -47,6 +51,8 @@ export const MemoryPanel: React.FC<{ onNotify: (msg: string) => void }> = ({ onN
 
   useEffect(() => {
     refresh();
+    // live: memory created/updated/deleted anywhere (chat "remember…", agents, another tab) refreshes this list
+    return onEvent((ev) => { if (ev.type === "graph_event" && /^(memory|knowledge)\./.test(ev.event)) refresh(); });
   }, []);
 
   return (
@@ -54,6 +60,7 @@ export const MemoryPanel: React.FC<{ onNotify: (msg: string) => void }> = ({ onN
       <div className="row" style={{ flexWrap: "wrap" }}>
         <button className={sub === "personal" ? "" : "ghost"} onClick={() => setSub("personal")}>Personal & Project</button>
         <button className={sub === "experience" ? "" : "ghost"} onClick={() => setSub("experience")}>Experience Lessons</button>
+        <button className={sub === "knowledge" ? "" : "ghost"} onClick={() => setSub("knowledge")}>Knowledge Retrieval</button>
         <button className={sub === "documents" ? "" : "ghost"} onClick={() => setSub("documents")}>5-Way Backend Info</button>
         <button className="ghost" onClick={async () => { const r = await apiFetch<{ sql_purged: number; vectors_purged: number }>("/v2/memory/purge-expired", { method: "POST" }); onNotify(`Purged ${r.sql_purged} SQL / ${r.vectors_purged} vectors`); refresh(); }}>
           Purge Expired
@@ -91,6 +98,8 @@ export const MemoryPanel: React.FC<{ onNotify: (msg: string) => void }> = ({ onN
                   {m.score !== undefined && <span className="dim">score:{m.score}</span>}
                 </div>
                 <div className="row">
+                  <button className="ghost" title="Show this memory and its relationships in the knowledge graph" onClick={() => onNavigate?.("graph", `memory:${m.id}`)}>Graph</button>
+                  <button className="ghost" title="Show metadata in the inspector" onClick={() => onInspect?.({ kind: "detail", title: m.content.slice(0, 60), subtitle: "Personal memory", fields: { ...m, content: undefined, expires_at: m.expires_at ? new Date(m.expires_at * 1000).toLocaleString() : "never" }, text: m.content })}>Details</button>
                   <button className="ghost" onClick={() => { setEditingId(m.id); setEditText(m.content); }}>Correct</button>
                   <button className="ghost" onClick={async () => { await apiFetch(`/v2/memory/personal/${m.id}/archive`, { method: "POST" }); refresh(); }}>Archive</button>
                   <button className="danger" onClick={async () => { await apiFetch(`/v2/memory/personal/${m.id}`, { method: "DELETE" }); refresh(); }}>Delete</button>
@@ -121,6 +130,37 @@ export const MemoryPanel: React.FC<{ onNotify: (msg: string) => void }> = ({ onN
             </div>
           ))}
           {!experience.length && <p className="dim">No experience lessons recorded yet.</p>}
+        </div>
+      )}
+
+      {sub === "knowledge" && (
+        <div className="card">
+          <h3>KNOWLEDGE RETRIEVAL (INDEXED SOURCES)</h3>
+          <form className="row" onSubmit={async (e) => {
+            e.preventDefault();
+            if (!kq.trim()) return;
+            try {
+              setKHits((await apiFetch<{ results: NonNullable<typeof kHits> }>(`/learning/knowledge/search?q=${encodeURIComponent(kq)}&k=8`)).results);
+            } catch (err) {
+              onNotify((err as Error).message);
+            }
+          }}>
+            <input value={kq} onChange={(e) => setKq(e.target.value)} placeholder="Search the indexed knowledge base…" aria-label="Knowledge query" />
+            <button type="submit">Retrieve</button>
+          </form>
+          {kHits === null && <p className="dim">Runs the same retrieval the assistant uses for answers. Sources are managed under Learning.</p>}
+          {kHits && !kHits.length && <p className="dim">No indexed knowledge matches that query.</p>}
+          {kHits?.map((k, i) => (
+            <div key={i} style={{ padding: "6px 0", borderBottom: "1px solid rgba(255,255,255,0.06)" }}>
+              <div className="row" style={{ flexWrap: "wrap" }}>
+                <strong>{k.title}</strong>
+                <span className="pill">src:{k.source_id}</span>
+                {k.trust && <span className="pill warn">{k.trust}</span>}
+                {k.score !== undefined && <span className="dim">score:{Number(k.score).toFixed(2)}</span>}
+              </div>
+              <div className="dim">{k.content.slice(0, 320)}</div>
+            </div>
+          ))}
         </div>
       )}
 

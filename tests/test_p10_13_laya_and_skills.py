@@ -289,4 +289,4 @@ def test_p10_13_phase6_to_9_dataset_calibration_rollback_and_dashboard_api(tmp_p
 
     # Built frontend bundle contains Decision Engine tab
     dist_assets = list((ROOT / "apps" / "frontend" / "dist" / "assets").glob("*.js"))
-    assert dist_assets and "DECISION ENGINE STATUS" in dist_assets[0].read_text(encoding="utf-8", errors="ignore")
+    assert dist_assets and any("DECISION ENGINE STATUS" in p.read_text(encoding="utf-8", errors="ignore") for p in dist_assets)

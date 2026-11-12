@@ -4,10 +4,11 @@ import asyncio
 from pathlib import Path
 import time
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
+from . import graph_live
 from .api_deps import make_assistant_dep
 from .api_decision import create_decision_subrouter
 from .api_skills import create_skills_subrouter
@@ -171,6 +172,17 @@ def create_v2_router(fallback=None) -> APIRouter:
             "skills": {"installed": len(o.skills.list_skills()), "enabled": len(o.skills.list_skills(enabled_only=True))},
         }
 
+    # ---- Unified live knowledge graph (deltas arrive as `graph_event` on /api/events) ----------------
+    @router.get("/graph")
+    async def unified_graph(types: str = "", limit: int = Query(300, ge=1, le=2000), a=Depends(get_a)):
+        wanted = {t.strip() for t in types.split(",") if t.strip()} or None
+        return await asyncio.to_thread(graph_live.build_graph, a, wanted, limit)
+
+    @router.get("/graph/events")
+    async def replay_graph_events(since_seq: int = Query(0, ge=0), a=Depends(get_a)):
+        events, gap = a.bus.events_since(since_seq)
+        return {"schema_version": 1, "latest_seq": a.bus.latest_seq, "gap": gap, "events": events}
+
     # ---- Decision & Gateway --------------------------------------------------------------------------
     @router.post("/decision/route")
     async def decision_route(body: DecisionIn, a=Depends(get_a)):
@@ -218,27 +230,39 @@ def create_v2_router(fallback=None) -> APIRouter:
 
     @router.post("/memory/personal")
     async def add_personal(body: PersonalMemIn, a=Depends(get_a)):
-        return {"record": a.orchestrator.memory.add_personal_memory(**body.model_dump())}
+        rec = a.orchestrator.memory.add_personal_memory(**body.model_dump())
+        graph_live.emit(a.bus, "memory.created", nodes=[graph_live.memory_node(rec)], links=graph_live.memory_links(rec))
+        return {"record": rec}
 
     @router.put("/memory/personal/{memory_id}")
     async def update_personal(memory_id: str, body: MemoryUpdateIn, a=Depends(get_a)):
-        return {"record": a.orchestrator.memory.update_personal_memory(memory_id, **body.model_dump(exclude_none=True))}
+        rec = a.orchestrator.memory.update_personal_memory(memory_id, **body.model_dump(exclude_none=True))
+        graph_live.emit(a.bus, "memory.updated", nodes=[graph_live.memory_node(rec)], links=graph_live.memory_links(rec))
+        return {"record": rec}
 
     @router.post("/memory/personal/{memory_id}/supersede")
     async def supersede_personal(memory_id: str, body: MemorySupersedeIn, a=Depends(get_a)):
-        return {"record": a.orchestrator.memory.supersede_personal_memory(memory_id, **body.model_dump())}
+        rec = a.orchestrator.memory.supersede_personal_memory(memory_id, **body.model_dump())
+        graph_live.emit(a.bus, "memory.updated", resync=True)
+        return {"record": rec}
 
     @router.post("/memory/personal/{memory_id}/archive")
     async def archive_personal(memory_id: str, a=Depends(get_a)):
-        return {"record": a.orchestrator.memory.archive_personal_memory(memory_id)}
+        rec = a.orchestrator.memory.archive_personal_memory(memory_id)
+        graph_live.emit(a.bus, "memory.deleted", removed=[f"memory:{memory_id}"])
+        return {"record": rec}
 
     @router.post("/memory/personal/{memory_id}/restore")
     async def restore_personal(memory_id: str, a=Depends(get_a)):
-        return {"record": a.orchestrator.memory.restore_personal_memory(memory_id)}
+        rec = a.orchestrator.memory.restore_personal_memory(memory_id)
+        graph_live.emit(a.bus, "memory.created", nodes=[graph_live.memory_node(rec)], links=graph_live.memory_links(rec))
+        return {"record": rec}
 
     @router.delete("/memory/personal/{memory_id}")
     async def delete_personal(memory_id: str, hard: bool = False, a=Depends(get_a)):
-        return a.orchestrator.memory.delete_personal_memory(memory_id, hard=hard)
+        res = a.orchestrator.memory.delete_personal_memory(memory_id, hard=hard)
+        graph_live.emit(a.bus, "memory.deleted", removed=[f"memory:{memory_id}"])
+        return res
 
     @router.post("/memory/purge-expired")
     async def purge_expired_memories(a=Depends(get_a)):

@@ -9,7 +9,7 @@ import threading
 import time
 from typing import AsyncIterator
 
-from . import audit, commands, sysinfo
+from . import audit, commands, graph_live, sysinfo
 from .actions import ActionExecutor
 from .aec import EchoReferenceBuffer, NLMSEchoCanceller
 from .agents.orchestrator import AgentOrchestrator
@@ -116,6 +116,9 @@ class Assistant:
         self.actions = ActionExecutor(settings.actions, self.filesystem)
         self.brain = brain or Brain(settings)
         self.history = History(self.data_dir / "history.jsonl", settings.history_turns)
+        self.conversation_refs: set[str] = set()  # graph ids the current conversation retrieved (live graph links)
+        self.used_tools: set[str] = set()  # real capability/web tools invoked during this session
+        self.os_state = "Idle"
 
         online_fn = lambda: bool(self.settings.internet.enabled and audit.is_online_enabled())  # noqa: E731
         self.knowledge = KnowledgePipeline(settings.learning, data_dir=self.data_dir / "learning" / "knowledge", is_online_fn=online_fn)
@@ -245,6 +248,7 @@ class Assistant:
 
     def _on_speaker_state(self, speaking: bool):
         self.bus.publish({"type": "speaking", "on": speaking})
+        self._set_os_state("Speaking" if speaking else "Idle", source="tts")
         self.voice.on_speaker_state(speaking)
 
     def _spawn(self, coro):
@@ -386,6 +390,15 @@ class Assistant:
         if not prompt_text or self._cancel_event.is_set():
             return self._cancel_event.is_set()
 
+        graph_live.publish_os_event(
+            self.bus,
+            "assistant.transcript.final",
+            legacy_type="transcript_final",
+            source_department="assistant",
+            payload={"transcript_id": rec.id, "text": prompt_text, "language": rec.detected_language},
+            text=prompt_text,
+            transcript_id=rec.id,
+        )
         self.bus.publish({"type": "user", "text": prompt_text, "transcript_id": rec.id})
         self.speaker.last_error = None
         self.voice.mark_generating(utt_id)
@@ -625,6 +638,7 @@ class Assistant:
         async with self._turn_lock:
             self.speaker.stop()  # new input interrupts any ongoing speech
             self._set_activity("thinking")
+            self._set_os_state("Understanding", source=source)
             t0 = time.time()
             try:
                 if cancel_event and cancel_event.is_set():
@@ -632,6 +646,7 @@ class Assistant:
                     return
                 cmd = await commands.route(self, text)
                 if cmd:
+                    self._set_os_state("Executing", source=source, detail=cmd["name"])
                     reply = cmd["reply"]
                     yield {"type": "meta", "command": cmd["name"], "nodes": cmd["nodes"], "model": None, "web_sources": []}
                     yield {"type": "token", "text": reply}
@@ -639,6 +654,7 @@ class Assistant:
                     self.history.add("assistant", reply)
                     if speak and cmd.get("speak", True):
                         self.speaker.say(reply)
+                    self._set_os_state("Completed", source=source, detail=cmd["name"])
                     yield {
                         "type": "done",
                         "answer": reply,
@@ -652,8 +668,117 @@ class Assistant:
                     }
                     return
 
+                self._set_os_state("Planning", source=source)
+                plan = await self.orchestrator.decision.decide(text)
+                decision_summary = {
+                    "department": plan.decision.department,
+                    "intent": plan.decision.intent,
+                    "complexity": plan.decision.complexity,
+                    "workflow": plan.workflow,
+                    "agent_role": plan.agent_role,
+                    "requires_owner_approval": plan.decision.requires_owner_approval,
+                }
+                graph_live.publish_os_event(
+                    self.bus,
+                    "decision.routed",
+                    legacy_type="decision",
+                    source_department=plan.decision.department,
+                    payload=decision_summary,
+                    **decision_summary,
+                )
+
+                # Enforce owner approval gate for explicitly privileged/destructive intents before any execution.
+                if plan.decision.requires_owner_approval:
+                    flags = ", ".join(plan.decision.sensitive_flags) or "privileged operation"
+                    req = await asyncio.to_thread(
+                        self.orchestrator.approvals.create_request,
+                        action_type="privileged_command",
+                        target_resource=text[:140],
+                        preview_diff=f"Blocked by Layer 3 policy gate ({flags}):\n{text[:400]}",
+                        args={"source": source, "sensitive_flags": list(plan.decision.sensitive_flags)},
+                    )
+                    self._set_os_state("Waiting for approval", source=source, detail=flags, approval_token=req["token"])
+                    graph_live.emit(
+                        self.bus,
+                        "agent.progress",
+                        source_department=plan.decision.department,
+                        state="awaiting_approval",
+                        highlight=[f"agent:{plan.agent_role}"],
+                        resync=True,
+                    )
+                    reply = f"Owner approval required before executing ({flags}). Review and approve request `{req['token']}` in Workforce / Approvals."
+                    yield {"type": "meta", "command": "approval_required", "nodes": [], "model": None, "web_sources": [], "decision": decision_summary}
+                    yield {"type": "token", "text": reply}
+                    self.history.add("user", text)
+                    self.history.add("assistant", reply)
+                    if speak:
+                        self.speaker.say(reply)
+                    yield {
+                        "type": "done",
+                        "answer": reply,
+                        "nodes": [],
+                        "paths": [],
+                        "web_sources": [],
+                        "command": "approval_required",
+                        "approval_token": req["token"],
+                        "ok": False,
+                        "seconds": round(time.time() - t0, 2),
+                    }
+                    return
+
+                # Explicit document generation or reminder commands route through Assistant LangGraph workflow.
+                explicit_doc = (
+                    plan.decision.intent == "document_export"
+                    and re.match(r"^\s*(?:generate|create|export|build|make)\s+(?:a\s+|an\s+)?(?:formatted\s+)?(pdf|docx|word|pptx|powerpoint|xlsx|excel|spreadsheet)\b", text, re.I)
+                )
+                explicit_rem = (
+                    plan.decision.intent == "reminder_manage"
+                    and re.match(r"^\s*(?:remind\s+me|set\s+(?:a\s+)?reminder|schedule\s+(?:a\s+)?reminder)\b", text, re.I)
+                )
+                if explicit_doc or explicit_rem:
+                    kind = "document_export" if explicit_doc else "reminder"
+                    self._set_os_state("Delegating", source=source, detail=plan.agent_role)
+                    self._set_os_state("Executing", source=source, detail=kind)
+                    fmt_raw = str((plan.decision.command_payload or {}).get("format") or "pdf").lower()
+                    fmt_map = {"word": "docx", "powerpoint": "pptx", "excel": "xlsx", "spreadsheet": "xlsx"}
+                    fmt = fmt_map.get(fmt_raw, fmt_raw if fmt_raw in {"pdf", "docx", "pptx", "xlsx"} else "pdf")
+                    wf_payload = (
+                        {"format": fmt, "title": text[:80], "sections": [{"heading": "Summary", "body": text}]}
+                        if kind == "document_export"
+                        else {"title": text[:120]}
+                    )
+                    res = await asyncio.to_thread(
+                        self.orchestrator.start_assistant_workflow,
+                        goal=text,
+                        task_kind=kind,
+                        payload=wf_payload,
+                    )
+                    reply = str(res.get("summary") or f"Workflow {res.get('run_id')} finished with state {res.get('state')}.")
+                    graph_live.tool_used(self, "doc_export" if explicit_doc else "reminders", query=text[:80])
+                    yield {"type": "meta", "command": kind, "nodes": [], "model": None, "web_sources": [], "decision": decision_summary}
+                    yield {"type": "token", "text": reply}
+                    self.history.add("user", text)
+                    self.history.add("assistant", reply)
+                    if speak:
+                        self.speaker.say(reply)
+                    self._set_os_state("Completed", source=source, detail=kind)
+                    yield {
+                        "type": "done",
+                        "answer": reply,
+                        "nodes": [],
+                        "paths": [res["artifact"]["path"]] if isinstance(res.get("artifact"), dict) and res["artifact"].get("path") else [],
+                        "web_sources": [],
+                        "command": kind,
+                        "run_id": res.get("run_id"),
+                        "ok": res.get("state") == "completed",
+                        "seconds": round(time.time() - t0, 2),
+                    }
+                    return
+
+                self._set_os_state("Thinking", source=source, detail=plan.decision.intent)
                 ctx_bundle = self._gather_context(text)
                 hits = ctx_bundle["hits"]
+                graph_live.conversation_used(self, hits, ctx_bundle)
                 nodes = ctx_bundle["nodes"]
                 notes_ctx = ctx_bundle["notes_ctx"]
                 today = datetime.datetime.now().strftime("%A %d %B %Y, %H:%M")
@@ -668,6 +793,7 @@ class Assistant:
                     "sources": [n.title for n, _ in hits],
                     "memory_ids": ctx_bundle["memory_ids"],
                     "knowledge_sources": ctx_bundle["knowledge_sources"],
+                    "decision": decision_summary,
                     "online": online,
                     "web_sources": [],
                 }
@@ -741,7 +867,10 @@ class Assistant:
                                 yield {"type": "interrupted"}
                                 return
                             yield {"type": "tool", "status": "searching", "name": c["name"], "query": c["arguments"].get("query") or c["arguments"].get("url") or ""}
+                            self._set_os_state("Executing", source=source, detail=c["name"])
+                            graph_live.tool_used(self, c["name"], query=str(c["arguments"].get("query") or c["arguments"].get("url") or ""))
                             tool_out, srcs = await self._execute_tool(c)
+                            self._set_os_state("Thinking", source=source)
                             web_sources.extend(srcs)
                             msgs.append({"role": "tool", "content": tool_out})
                         out_buf = []
@@ -758,8 +887,11 @@ class Assistant:
                             answer = ""
                             chunker.reset()
                             yield {"type": "tool", "status": "searching", "name": "web_search", "query": q}
+                            self._set_os_state("Executing", source=source, detail="web_search")
+                            graph_live.tool_used(self, "web_search", query=q)
                             try:
                                 res = await self.search.search(q)
+                                self._set_os_state("Thinking", source=source)
                                 web_sources = res["results"]
                                 msgs = build_messages(
                                     self.history.window(),
@@ -830,11 +962,15 @@ class Assistant:
                     "truncated": st.get("truncated", False),
                 }
             except BrainError as e:
+                self._set_os_state("Error", source=source, detail=str(e))
                 if speak:
                     self.speaker.say("I'm afraid I can't reach my language model, sir.")
                 yield {"type": "error", "message": str(e)}
             finally:
-                self._set_activity("speaking" if self.speaker.speaking else "idle")
+                next_act = "speaking" if self.speaker.speaking else "idle"
+                self._set_activity(next_act)
+                if self.os_state not in ("Error", "Waiting for approval"):
+                    self._set_os_state("Speaking" if self.speaker.speaking else "Idle", source=source)
 
     async def chat(self, text: str, speak: bool = False) -> dict:
         last = {}
@@ -848,6 +984,11 @@ class Assistant:
         if a != self.activity:
             self.activity = a
             self.bus.publish({"type": "activity", "state": a})
+
+    def _set_os_state(self, state: str, *, source: str = "text", detail: str = "", **extra):
+        if state != self.os_state or detail:
+            self.os_state = state
+            graph_live.emit_assistant_state(self.bus, state, source=source, detail=detail, **extra)
 
     # ---- status --------------------------------------------------------------------------------------
     async def status(self) -> dict:

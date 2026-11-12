@@ -49,7 +49,7 @@ export const LearningPanel: React.FC<{ onNotify: (msg: string) => void }> = ({ o
           <div key={j.job_id} className="row" style={{ justifyContent: "space-between", padding: "5px 0" }}>
             <span><strong>{j.job_id}</strong> <span className="pill">{j.state}</span></span>
             {!j.approved && (
-              <button className="ok" onClick={async () => { await apiFetch(`/learning/jobs/${j.job_id}/approve`, { method: "POST", body: {} }); refresh(); }}>Approve Job</button>
+              <button className="ok" onClick={async () => { await apiFetch(`/learning/training/jobs/${j.job_id}/approve`, { method: "POST", body: {} }); refresh(); }}>Approve Job</button>
             )}
           </div>
         ))}
@@ -59,7 +59,7 @@ export const LearningPanel: React.FC<{ onNotify: (msg: string) => void }> = ({ o
       <div className="card">
         <div className="row" style={{ justifyContent: "space-between" }}>
           <h3>MODEL VERSION REGISTRY & ROLLBACK</h3>
-          <button className="danger" onClick={async () => { try { await apiFetch("/learning/models/rollback", { method: "POST", body: {} }); onNotify("Rolled back model version"); refresh(); } catch (e) { onNotify((e as Error).message); } }}>Rollback Active</button>
+          <button className="danger" onClick={async () => { try { await apiFetch("/learning/registry/rollback", { method: "POST", body: {} }); onNotify("Rolled back model version"); refresh(); } catch (e) { onNotify((e as Error).message); } }}>Rollback Active</button>
         </div>
         {versions.map((v) => (
           <div key={v.version_id} className="row" style={{ justifyContent: "space-between", padding: "5px 0" }}>
@@ -70,7 +70,7 @@ export const LearningPanel: React.FC<{ onNotify: (msg: string) => void }> = ({ o
             <div className="row">
               <span className={`pill ${v.evaluation_passed ? "ok" : "danger"}`}>eval:{v.evaluation_passed ? "PASS" : "FAIL"}</span>
               {v.evaluation_passed && v.status === "candidate" && (
-                <button className="ok" onClick={async () => { await apiFetch(`/learning/models/${v.version_id}/promote`, { method: "POST", body: {} }); refresh(); }}>Promote</button>
+                <button className="ok" onClick={async () => { await apiFetch(`/learning/registry/${v.version_id}/promote`, { method: "POST", body: {} }); refresh(); }}>Promote</button>
               )}
             </div>
           </div>

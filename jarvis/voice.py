@@ -52,6 +52,20 @@ _LEGACY_STATE = {
     VoiceState.ERROR: "off",
 }
 
+_ASSISTANT_OS_STATE = {
+    VoiceState.IDLE: "Idle",
+    VoiceState.WAKE_WORD: "Listening",
+    VoiceState.LISTENING: "Listening",
+    VoiceState.SPEECH_DETECTED: "Speech detected",
+    VoiceState.PROCESSING: "Transcribing",
+    VoiceState.GENERATING: "Thinking",
+    VoiceState.SPEAKING: "Speaking",
+    VoiceState.INTERRUPTED: "Speech detected",
+    VoiceState.RESUMING: "Listening",
+    VoiceState.PAUSED: "Idle",
+    VoiceState.ERROR: "Error",
+}
+
 
 class _StreamingSileroVAD:
     """Lightweight streaming wrapper around faster-whisper's bundled Silero VAD ONNX model."""
@@ -205,6 +219,7 @@ class VoiceLoop:
                     "type": "voice_state",
                     "state": self.state,
                     "audio_state": self.audio_state.value,
+                    "assistant_state": _ASSISTANT_OS_STATE.get(self.audio_state, "Idle"),
                     "mode": self.mode,
                     "paused": self.paused,
                     "mic_suspended": self.mic_suspended,

@@ -467,4 +467,4 @@ def test_p10_12_3_4_5_skills_lifecycle_security_compat_routing_metrics_and_api(t
 
     # React dist contains SKILLS control panel cleanly
     dist_assets = list((ROOT / "apps" / "frontend" / "dist" / "assets").glob("*.js"))
-    assert dist_assets and "INSTALLED SKILLS" in dist_assets[0].read_text(encoding="utf-8", errors="ignore")
+    assert dist_assets and any("INSTALLED SKILLS" in p.read_text(encoding="utf-8", errors="ignore") for p in dist_assets)

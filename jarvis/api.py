@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import audit
+from . import audit, graph_live
 from .actions import ActionPermissionError
 from .api_learning import create_learning_router
 from .api_v2 import create_v2_router
@@ -37,6 +37,22 @@ from .stt import SUPPORTED_LANGUAGES, list_local_models
 
 log = logging.getLogger("jarvis.api")
 MAX_WAV = 10 * 1024 * 1024
+# Successful mutations under these prefixes change the knowledge graph: tell live clients to diff a fresh snapshot.
+GRAPH_MUTATION_PREFIXES = {
+    "/api/v2/skills": "skill.updated",
+    "/api/v2/projects": "project.updated",
+    "/api/v2/documents/generate": "document.processed",
+    "/api/v2/memory/experience": "knowledge.extracted",
+    "/api/v2/memory/purge-expired": "memory.deleted",
+    "/api/v2/memory/migrate-legacy": "memory.updated",
+    "/api/v2/workforce": "agent.progress",
+    "/api/v2/assistant": "agent.progress",
+    "/api/v2/approvals": "agent.progress",
+    "/api/v2/reminders": "task.updated",
+    "/api/learning/knowledge": "knowledge.updated",
+    "/api/memory/items": "memory.updated",
+    "/api/memory/restore": "memory.updated",
+}
 
 
 class ChatIn(BaseModel):
@@ -100,7 +116,8 @@ class SearchIn(BaseModel):
 
 
 def sse(ev: dict) -> str:
-    return f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
+    prefix = f"id: {ev['seq']}\n" if ev.get("seq") is not None else ""
+    return f"{prefix}data: {json.dumps(ev, ensure_ascii=False)}\n\n"
 
 
 def _api_keys_status() -> dict[str, bool]:
@@ -142,6 +159,11 @@ def create_app(settings: Settings | None = None, assistant: Assistant | None = N
         if not is_sandbox_gw and request.method in ("POST", "PUT", "DELETE", "PATCH") and request.headers.get("x-jarvis") != "1":
             return JSONResponse({"error": "missing X-Jarvis header"}, status_code=403)
         resp = await call_next(request)
+        if request.method != "GET" and resp.status_code < 400:
+            for prefix, event in GRAPH_MUTATION_PREFIXES.items():
+                if request.url.path.startswith(prefix):
+                    graph_live.emit(A().bus, event, resync=True)
+                    break
         resp.headers["Content-Security-Policy"] = (
             "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; "
             "script-src 'self' 'unsafe-eval'; connect-src 'self'; media-src 'self' blob:; frame-ancestors 'none'"
@@ -226,6 +248,7 @@ def create_app(settings: Settings | None = None, assistant: Assistant | None = N
     @app.delete("/api/history")
     async def clear_history():
         A().history.clear()
+        graph_live.conversation_cleared(A())
         return {"ok": True}
 
     # ---- models --------------------------------------------------------------------------------------
@@ -259,6 +282,51 @@ def create_app(settings: Settings | None = None, assistant: Assistant | None = N
         payload = rec.to_dict()
         a.bus.publish({"type": "transcript_record", **payload})
         return payload
+
+    @app.post("/api/voice/command")
+    async def voice_command(
+        request: Request,
+        speak: bool = Query(True),
+        language: str | None = Query(None),
+        quality: str | None = Query(None),
+        translate_to: str | None = Query(None),
+    ):
+        """Accept WAV audio from UI mic/PTT, transcribe, translate/correct, and route through unified Assistant turn."""
+        data = await request.body()
+        if not data or len(data) > MAX_WAV:
+            raise ValueError("body must be a WAV file of at most 10 MB")
+        from .stt import wav_to_float
+        audio = wav_to_float(data)
+        a = A()
+        a._set_os_state("Transcribing", source="voice", detail="whisper")
+        stt_res = await asyncio.to_thread(a.stt.transcribe, audio, language=language, quality=quality)
+        rec = await a.translator.process_stt(stt_res, a.settings.translation, audio=audio, target_override=translate_to)
+        t_payload = rec.to_dict()
+        a.bus.publish({"type": "transcript_record", **t_payload})
+        prompt_text = (rec.translated_text if (rec.translated_text and rec.target_language == "en" and rec.detected_language != "en") else rec.corrected_transcript or "").strip()
+        if not prompt_text:
+            a._set_os_state("Idle", source="voice")
+            return {"transcript": t_payload, "prompt": "", "ok": False, "answer": ""}
+        graph_live.publish_os_event(
+            a.bus,
+            "assistant.transcript.final",
+            legacy_type="transcript_final",
+            source_department="assistant",
+            payload={"transcript_id": rec.id, "text": prompt_text, "language": rec.detected_language},
+            text=prompt_text,
+            transcript_id=rec.id,
+        )
+        a.bus.publish({"type": "user", "text": prompt_text, "transcript_id": rec.id, "source": "voice"})
+        turn_events: list[dict] = []
+        done_ev: dict = {}
+        async for ev in a.stream_turn(prompt_text, speak=speak, source="voice"):
+            a.bus.publish(ev)
+            turn_events.append(ev)
+            if ev.get("type") in ("done", "error"):
+                done_ev = ev
+        if done_ev.get("type") == "error":
+            raise BrainError(done_ev.get("message") or "Turn failed")
+        return {"transcript": t_payload, "prompt": prompt_text, "ok": done_ev.get("ok", True), **done_ev}
 
     @app.post("/api/voice/correct")
     async def correct_transcript(body: CorrectIn):
@@ -549,30 +617,44 @@ def create_app(settings: Settings | None = None, assistant: Assistant | None = N
         }
 
     @app.get("/api/events")
-    async def events(request: Request):
-        q = A().bus.subscribe()
+    async def events(request: Request, since_seq: int = Query(0, ge=0)):
+        a = A()
+        header_id = request.headers.get("last-event-id")
+        if since_seq == 0 and header_id and header_id.isdigit():
+            since_seq = int(header_id)
+        q = a.bus.subscribe()
 
         async def gen():
             try:
+                missed, gap = ([], False)
+                if since_seq > 0:
+                    missed, gap = a.bus.events_since(since_seq)
                 yield sse({
                     "type": "hello",
-                    "activity": A().activity,
-                    "voice": A().voice.state,
-                    "audio_state": A().voice.audio_state.value,
-                    "voice_mode": A().voice.mode,
-                    "paused": A().voice.paused,
-                    "mic_suspended": A().voice.mic_suspended,
-                    "duplex": A().voice.duplex_info(),
-                    "tts_status": A().speaker.status(),
-                    "internet": A().search.status(),
+                    "schema_version": 1,
+                    "seq": a.bus.latest_seq,
+                    "resync_required": gap,
+                    "activity": a.activity,
+                    "assistant_state": getattr(a, "os_state", "Idle"),
+                    "voice": a.voice.state,
+                    "audio_state": a.voice.audio_state.value,
+                    "voice_mode": a.voice.mode,
+                    "paused": a.voice.paused,
+                    "mic_suspended": a.voice.mic_suspended,
+                    "duplex": a.voice.duplex_info(),
+                    "tts_status": a.speaker.status(),
+                    "internet": a.search.status(),
                 })
+                if not gap:
+                    for ev in missed:
+                        yield sse(ev)
                 while not await request.is_disconnected():
                     try:
                         yield sse(await asyncio.wait_for(q.get(), 15))
                     except asyncio.TimeoutError:
                         yield ": keepalive\n\n"
             finally:
-                A().bus.unsubscribe(q)
+                a.bus.unsubscribe(q)
         return StreamingResponse(gen(), media_type="text/event-stream")
 
     app.include_router(create_workspace_router())

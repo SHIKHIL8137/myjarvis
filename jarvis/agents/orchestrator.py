@@ -6,10 +6,11 @@ import uuid
 
 from langgraph.types import Command
 
+from .. import graph_live
 from ..config import DATA, SECRETS_PATH, Settings
 from ..core.event_bus import EventBus
 from ..db.engine import DatabaseManager
-from ..db.models import AgentRunRow, AgentStepRow, WorktreeRow
+from ..db.models import AgentRunRow, AgentStepRow, LLMUsageLogRow, WorktreeRow
 from ..decision.calibration import DecisionCalibrationService
 from ..decision.router import DecisionEngine
 from ..departments.assistant.documents import DocumentService
@@ -88,6 +89,7 @@ class AgentOrchestrator:
         self._active_runs: set[str] = set()
         self._cancel_events: dict[str, threading.Event] = {}
         self._cancelled_reasons: dict[str, str] = {}
+        self._run_progress: dict[str, tuple[str, float]] = {}  # run_id -> (last finished LangGraph node, time); this process only
         self._assistant_graph = build_assistant_graph(
             memory=self.memory,
             docs=self.documents,
@@ -144,6 +146,7 @@ class AgentOrchestrator:
                 )
             )
             s.commit()
+        self._emit_run(run_id, "agent.started")
         return run_id, thread_id
 
     def _update_run(self, run_id: str, state: str, output_summary: str) -> None:
@@ -156,6 +159,33 @@ class AgentOrchestrator:
                     row.ended_at = round(time.time(), 3)
                 s.commit()
 
+    def _emit_run(self, run_id: str, event: str, step: str | None = None) -> None:
+        """Publish the run's real state to the live graph (task node, executing agent, project) and highlight them."""
+        if step:
+            self._run_progress[run_id] = (step, round(time.time(), 3))
+        run = next(iter(self.list_runs(run_id=run_id)), None)
+        if run is None:
+            return
+        nodes, links = graph_live.run_delta(run)
+        active = run["state"] in ("running", "awaiting_approval", "cancelling")
+        ids = [n["id"] for n in nodes] + ([f"project:{run['project_id']}"] if run.get("project_id") else [])
+        graph_live.emit(self.bus, event, nodes=nodes, links=links, highlight=ids if active else [], run_id=run_id, state=run["state"], step=step)
+
+    def _invoke(self, graph, inp, cfg: dict, run_id: str) -> dict:
+        """graph.invoke() that also publishes one `agent.progress` event per finished LangGraph node (real progress only)."""
+        res: dict = {}
+        interrupts: list = []
+        for mode, chunk in graph.stream(inp, cfg, stream_mode=["updates", "values"]):
+            if mode == "values":
+                res = chunk
+                continue
+            for node, payload in (chunk or {}).items():
+                if node == "__interrupt__":
+                    interrupts.extend(payload)
+                else:
+                    self._emit_run(run_id, "agent.progress", step=node)
+        return {**res, "__interrupt__": interrupts} if interrupts else res
+
     def _log_step(self, run_id: str, idx: int, node: str, status: str, payload: dict | None = None) -> None:
         with self.db.sync_session() as s:
             s.add(AgentStepRow(run_id=run_id, step_index=idx, node_name=node, status=status, output_payload=payload or {}))
@@ -164,9 +194,11 @@ class AgentOrchestrator:
     def start_assistant_workflow(self, *, goal: str, task_kind: str = "research", payload: dict | None = None) -> dict:
         run_id, thread_id = self._create_run("assistant", task_kind, goal)
         cfg = {"configurable": {"thread_id": thread_id}}
-        res = self._assistant_graph.invoke(
+        res = self._invoke(
+            self._assistant_graph,
             {"run_id": run_id, "goal": goal, "task_kind": task_kind, "payload": payload or {}},
             cfg,
+            run_id,
         )
         self.checkpointer.persist_thread(thread_id)
         interrupted = "__interrupt__" in res
@@ -189,6 +221,7 @@ class AgentOrchestrator:
                 token_overhead=max(1, len(res.get("skill_prompt_block") or "") // 4),
             )
         self.bus.publish({"type": "agent_run_update", "run_id": run_id, "workflow": "assistant", "state": state})
+        self._emit_run(run_id, "agent.completed" if state == "completed" else "agent.failed" if state in ("failed", "blocked", "blocked_security", "rejected") else "agent.progress")
         return {"run_id": run_id, "thread_id": thread_id, "state": state, "interrupted": interrupted, "result": self._safe_res(res)}
 
     def start_workforce_workflow(
@@ -217,7 +250,7 @@ class AgentOrchestrator:
         if model:
             init_state["model"] = model
         try:
-            res = self._workforce_graph.invoke(init_state, cfg)
+            res = self._invoke(self._workforce_graph, init_state, cfg, run_id)
         finally:
             with self._orch_lock:
                 self._active_runs.discard(run_id)
@@ -251,6 +284,7 @@ class AgentOrchestrator:
                 token_overhead=max(1, len(res.get("skill_prompt_block") or "") // 4),
             )
         self.bus.publish({"type": "agent_run_update", "run_id": run_id, "workflow": "workforce", "state": state})
+        self._emit_run(run_id, "agent.completed" if state == "completed" else "agent.failed" if state in ("failed", "blocked", "blocked_security", "rejected") else "agent.progress")
         return {"run_id": run_id, "thread_id": thread_id, "state": state, "interrupted": interrupted, "cancelled": cancelled, "result": self._safe_res(res)}
 
     def cancel_workforce_run(
@@ -331,6 +365,7 @@ class AgentOrchestrator:
         if not still_active:
             self._update_run(run_id, "cancelled", f"Cancelled: {reason}")
         self.bus.publish({"type": "agent_run_update", "run_id": run_id, "workflow": "workforce", "state": final_state})
+        self._emit_run(run_id, "agent.completed" if final_state == "completed" else "agent.failed" if final_state in ("failed", "blocked", "blocked_security", "rejected") else "agent.progress")
         return {
             "ok": True,
             "run_id": run_id,
@@ -365,7 +400,7 @@ class AgentOrchestrator:
         cfg = {"configurable": {"thread_id": tid}}
         graph = self._workforce_graph if wf == "workforce" else self._assistant_graph
         try:
-            res = graph.invoke(Command(resume={"approved": approved}), cfg)
+            res = self._invoke(graph, Command(resume={"approved": approved}), cfg, run_id)
         finally:
             with self._orch_lock:
                 self._active_runs.discard(run_id)
@@ -374,11 +409,16 @@ class AgentOrchestrator:
         self._update_run(run_id, final_state, res.get("summary") or final_state)
         self._log_step(run_id, 2, "human_resume", final_state, {"approved": approved})
         self.bus.publish({"type": "agent_run_update", "run_id": run_id, "workflow": wf, "state": final_state})
+        self._emit_run(run_id, "agent.completed" if final_state == "completed" else "agent.failed" if final_state in ("failed", "blocked", "blocked_security", "rejected") else "agent.progress")
         return {"approval": dec, "resumed": True, "run_id": run_id, "state": final_state, "result": self._safe_res(res)}
 
-    def list_runs(self, limit: int = 25) -> list[dict]:
+    def list_runs(self, limit: int = 25, run_id: str | None = None) -> list[dict]:
         with self.db.sync_session() as s:
-            rows = s.query(AgentRunRow).order_by(AgentRunRow.started_at.desc()).limit(limit).all()
+            q = s.query(AgentRunRow)
+            if run_id:
+                q = q.filter(AgentRunRow.id == run_id)
+            rows = q.order_by(AgentRunRow.started_at.desc()).limit(limit).all()
+            models = {u.run_id: u.model for u in s.query(LLMUsageLogRow).filter(LLMUsageLogRow.run_id.in_([r.id for r in rows])).all()}
             return [
                 {
                     "id": r.id,
@@ -391,6 +431,9 @@ class AgentOrchestrator:
                     "output_summary": r.output_summary,
                     "started_at": r.started_at,
                     "ended_at": r.ended_at,
+                    "model": models.get(r.id),
+                    "current_step": self._run_progress.get(r.id, (None, None))[0] if r.ended_at is None else None,
+                    "last_activity": self._run_progress.get(r.id, (None, None))[1] or r.ended_at or r.started_at,
                 }
                 for r in rows
             ]

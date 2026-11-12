@@ -1,5 +1,21 @@
 /* Typed Jarvis REST + SSE Client enforcing X-Jarvis CSRF protection header cleanly. */
 
+let confirmFn: (message: string) => Promise<boolean> = async () => true;
+/** The shell installs its confirmation dialog here; every destructive request passes through it. */
+export const setConfirmHandler = (fn: (message: string) => Promise<boolean>) => {
+  confirmFn = fn;
+};
+
+const DESTRUCTIVE_POST = /\/(rollback|purge-expired|restore\/execute|cancel|migrate-legacy)(?=$|[/?])|\/api\/memory\/restore$/;
+
+/** One place decides what needs "are you sure?": every DELETE, plus the POSTs that roll back, purge, cancel or overwrite. */
+function destructivePrompt(method: string, url: string): string | null {
+  const what = url.replace(/^\/api(\/v2)?\//, "").split("?")[0];
+  if (method === "DELETE") return `Delete ${what}? This cannot be undone from here.`;
+  if (method === "POST" && DESTRUCTIVE_POST.test(url)) return `Run "${what}"? This changes or removes existing data.`;
+  return null;
+}
+
 export async function apiFetch<T = unknown>(
   path: string,
   opts: { method?: string; body?: unknown; rawBody?: BodyInit } = {}
@@ -15,6 +31,8 @@ export async function apiFetch<T = unknown>(
     body = JSON.stringify(opts.body);
   }
   const url = path.startsWith("/api") ? path : `/api${path}`;
+  const prompt = destructivePrompt(method, url);
+  if (prompt && !(await confirmFn(prompt))) throw new Error("Cancelled.");
   const res = await fetch(url, { method, headers, body });
   const text = await res.text();
   let data: Record<string, unknown> = {};
@@ -36,12 +54,14 @@ export async function apiFetch<T = unknown>(
 export async function streamChat(
   message: string,
   speak: boolean,
-  onEvent: (ev: Record<string, unknown>) => void
+  onEvent: (ev: Record<string, unknown>) => void,
+  signal?: AbortSignal
 ): Promise<void> {
   const res = await fetch("/api/chat/stream", {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-Jarvis": "1" },
     body: JSON.stringify({ message, speak }),
+    signal,
   });
   if (!res.ok || !res.body) {
     throw new Error(`Stream error HTTP ${res.status}`);
@@ -69,4 +89,3 @@ export async function streamChat(
     }
   }
 }
-
