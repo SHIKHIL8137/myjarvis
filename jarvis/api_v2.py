@@ -8,7 +8,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
-from . import graph_live
+from . import graph_live, sysinfo
+from .actions import ActionPermissionError
 from .api_deps import (
     apply_settings_patch,
     build_consolidated_settings,
@@ -30,9 +31,18 @@ class DecisionIn(BaseModel):
     query: str = Field(..., min_length=1, max_length=2000)
 
 
+class ActionExecuteIn(BaseModel):
+    action: str = Field(..., min_length=1, max_length=80)
+    args: dict = Field(default_factory=dict)
+    confirmed_token: str | None = Field(default=None, max_length=64)
+
+
 class PersonalMemIn(BaseModel):
     content: str = Field(..., min_length=1, max_length=4000)
-    category: str = Field("explicit", pattern="^(explicit|preference|temporary)$")
+    category: str = Field(
+        "explicit",
+        pattern="^(explicit|preference|temporary|user_preferences|project_memory|command_memory|conversation_memory)$",
+    )
     topic: str = ""
     title: str = ""
     ttl_seconds: float | None = Field(None, ge=60, le=31_536_000)
@@ -189,11 +199,19 @@ class FsPermissionUpdateIn(BaseModel):
 
 
 class FsPolicyUpdateIn(BaseModel):
-    sensitive_file_policy: str | None = Field(None, pattern="^(block|warn|metadata_only)$")
-    cloud_data_policy: str | None = Field(None, pattern="^(never|redacted|approved_only)$")
+    sensitive_file_policy: str | None = Field(None, pattern="^(always_ask|block|warn|metadata_only)$")
+    cloud_data_policy: str | None = Field(None, pattern="^(local_only|redact_only|redact_and_confirm|never|redacted|approved_only)$")
     allow_always_read_only: bool | None = None
-    max_read_bytes: int | None = Field(None, ge=4096, le=50_000_000)
+    max_read_bytes: int | None = Field(None, ge=10_000, le=5_000_000)
+    max_file_bytes: int | None = Field(None, ge=10_000, le=5_000_000)
     allowed_extensions: list[str] | None = None
+
+
+class FsAliasCreateIn(BaseModel):
+    alias: str = Field(..., min_length=1, max_length=100)
+    folder_path: str = Field(..., min_length=1, max_length=800)
+    description: str = Field("", max_length=400)
+    actor: str = Field("owner", min_length=1, max_length=64)
 
 
 class ProviderKeyIn(BaseModel):
@@ -265,6 +283,10 @@ def create_v2_router(fallback=None) -> APIRouter:
     async def memory_summary(a=Depends(get_a)):
         return a.orchestrator.memory.summary()
 
+    @router.get("/memory/categories")
+    async def memory_categories(a=Depends(get_a)):
+        return a.orchestrator.memory.category_summary()
+
     @router.get("/memory/personal")
     async def list_personal(
         category: str | None = None,
@@ -275,7 +297,7 @@ def create_v2_router(fallback=None) -> APIRouter:
     ):
         m = a.orchestrator.memory
         if q:
-            return {"items": m.search_personal_memory(q, k=15, project_id=project_id)}
+            return {"items": m.search_personal_memory(q, k=15, project_id=project_id, category=category)}
         return {
             "items": m.list_personal_memories(
                 category=category,
@@ -286,13 +308,21 @@ def create_v2_router(fallback=None) -> APIRouter:
 
     @router.post("/memory/personal")
     async def add_personal(body: PersonalMemIn, a=Depends(get_a)):
-        rec = a.orchestrator.memory.add_personal_memory(**body.model_dump())
+        try:
+            rec = a.orchestrator.memory.add_personal_memory(**body.model_dump())
+        except ValueError as e:
+            raise HTTPException(422, str(e)) from e
         graph_live.emit(a.bus, "memory.created", nodes=[graph_live.memory_node(rec)], links=graph_live.memory_links(rec))
         return {"record": rec}
 
     @router.put("/memory/personal/{memory_id}")
     async def update_personal(memory_id: str, body: MemoryUpdateIn, a=Depends(get_a)):
-        rec = a.orchestrator.memory.update_personal_memory(memory_id, **body.model_dump(exclude_none=True))
+        try:
+            rec = a.orchestrator.memory.update_personal_memory(memory_id, **body.model_dump(exclude_none=True))
+        except KeyError as e:
+            raise HTTPException(404, f"Memory {memory_id} not found") from e
+        except ValueError as e:
+            raise HTTPException(422, str(e)) from e
         graph_live.emit(a.bus, "memory.updated", nodes=[graph_live.memory_node(rec)], links=graph_live.memory_links(rec))
         return {"record": rec}
 
@@ -323,6 +353,13 @@ def create_v2_router(fallback=None) -> APIRouter:
     @router.post("/memory/purge-expired")
     async def purge_expired_memories(a=Depends(get_a)):
         return a.orchestrator.memory.purge_expired()
+
+    @router.post("/memory/clear-conversation")
+    async def clear_conversation_memories(a=Depends(get_a)):
+        res = a.orchestrator.memory.clear_conversation_memory()
+        legacy_cleared = a.memory_store.clear_temporary() if hasattr(a, "memory_store") else 0
+        graph_live.emit(a.bus, "memory.deleted", resync=True)
+        return {"ok": True, "cleared_count": res["cleared_count"] + legacy_cleared, "db_cleared": res["cleared_count"], "legacy_cleared": legacy_cleared}
 
     @router.get("/memory/experience")
     async def list_experience(scope: str | None = None, project_id: str | None = None, q: str | None = None, a=Depends(get_a)):
@@ -722,11 +759,46 @@ def create_v2_router(fallback=None) -> APIRouter:
     @router.put("/filesystem/policy")
     async def fs_update_policy(body: FsPolicyUpdateIn, a=Depends(get_a)):
         patch = {k: v for k, v in body.model_dump().items() if v is not None}
+        if "max_read_bytes" in patch and "max_file_bytes" not in patch:
+            patch["max_file_bytes"] = patch.pop("max_read_bytes")
+        else:
+            patch.pop("max_read_bytes", None)
         try:
             snap = apply_settings_patch(a, {"filesystem": patch}, allow_gateway_and_prefs=True)
             return {"ok": True, "filesystem": snap["filesystem"]}
         except ValueError as e:
             raise HTTPException(422, str(e)) from e
+
+    @router.get("/filesystem/aliases")
+    async def fs_list_aliases(a=Depends(get_a)):
+        return {"aliases": await a.orchestrator.fs_access.list_aliases()}
+
+    @router.post("/filesystem/aliases")
+    async def fs_upsert_alias(body: FsAliasCreateIn, a=Depends(get_a)):
+        try:
+            rec = await a.orchestrator.fs_access.upsert_alias(
+                body.alias,
+                body.folder_path,
+                description=body.description,
+                actor=body.actor,
+            )
+            a.bus.publish({"type": "filesystem_permissions_changed"})
+            return {"ok": True, "alias": rec}
+        except FilesystemSecurityError as e:
+            raise HTTPException(403, str(e)) from e
+        except ValueError as e:
+            raise HTTPException(422, str(e)) from e
+
+    @router.delete("/filesystem/aliases/{alias_name}")
+    async def fs_delete_alias(alias_name: str, actor: str = "owner", a=Depends(get_a)):
+        try:
+            ok = await a.orchestrator.fs_access.delete_alias(alias_name, actor=actor)
+        except FilesystemSecurityError as e:
+            raise HTTPException(403, str(e)) from e
+        if not ok:
+            raise HTTPException(404, f"Alias '{alias_name}' not found")
+        a.bus.publish({"type": "filesystem_permissions_changed"})
+        return {"ok": True}
 
     # ---- P10.20 Centralized Assistant Tasks ----------------------------------------------------------
     @router.get("/tasks")
@@ -788,6 +860,72 @@ def create_v2_router(fallback=None) -> APIRouter:
         a.orchestrator.task_runner.wake()
         return {"ok": True, "task": updated}
 
+    @router.get("/commands/history")
+    async def list_command_history(
+        limit: int = 25,
+        status: str | None = None,
+        q: str | None = None,
+        a=Depends(get_a),
+    ):
+        items = await a.orchestrator.command_history.list_recent(limit=limit, status=status, query=q)
+        return {"commands": items, "count": len(items)}
+
+    @router.post("/commands/history/{cmd_id}/replay")
+    async def replay_command_history_item(cmd_id: str, a=Depends(get_a)):
+        cmd = await a.orchestrator.command_history.get_by_id(cmd_id)
+        if cmd is None:
+            raise HTTPException(404, f"Command history item {cmd_id} not found")
+        if not cmd.get("replayable"):
+            raise HTTPException(409, "This meta/continuity command is not marked replayable")
+        await a.orchestrator.command_history.increment_replay(cmd_id)
+        ev = await a.chat(cmd["raw_text"], speak=False, source="replay", _in_replay=True)
+        return {"ok": bool(ev.get("ok", True)), "replayed_from": cmd, "result": ev}
+
+    @router.get("/actions/registry")
+    async def get_action_registry(limit: int = 20, a=Depends(get_a)):
+        return {
+            "actions": a.actions.list_action_registry(),
+            "pending": a.actions.pending_approvals(),
+            "history": a.actions.history(limit=limit),
+        }
+
+    @router.post("/actions/execute")
+    async def execute_desktop_action(body: ActionExecuteIn, a=Depends(get_a)):
+        try:
+            return a.actions.request_or_execute(
+                body.action,
+                body.args,
+                confirmed_token=body.confirmed_token,
+            )
+        except ActionPermissionError as e:
+            raise HTTPException(403, str(e)) from e
+        except KeyError as e:
+            raise HTTPException(404, f"Unknown confirmation token: {e}") from e
+        except TimeoutError as e:
+            raise HTTPException(408, str(e)) from e
+        except ValueError as e:
+            raise HTTPException(409, str(e)) from e
+
+    @router.post("/actions/{token}/confirm")
+    async def confirm_desktop_action(token: str, a=Depends(get_a)):
+        try:
+            return a.actions.confirm(token)
+        except KeyError as e:
+            raise HTTPException(404, "Unknown confirmation token") from e
+        except TimeoutError as e:
+            raise HTTPException(408, str(e)) from e
+        except ValueError as e:
+            raise HTTPException(409, str(e)) from e
+        except ActionPermissionError as e:
+            raise HTTPException(403, str(e)) from e
+
+    @router.post("/actions/{token}/reject")
+    async def reject_desktop_action(token: str, a=Depends(get_a)):
+        try:
+            return a.actions.reject(token)
+        except KeyError as e:
+            raise HTTPException(404, "Unknown confirmation token") from e
+
     @router.post("/research")
     async def start_verified_deep_research(
         body: AssistantRunIn,
@@ -806,6 +944,39 @@ def create_v2_router(fallback=None) -> APIRouter:
             await a.orchestrator.task_runner.run_once()
             task = await a.orchestrator.tasks.get_task(task["task_id"]) or task
         return {"ok": True, "task": task}
+
+    # ---- Stage E System Monitoring & Proactive Suggestions ------------------------------------------
+    @router.get("/system/health")
+    async def get_system_health(processes: bool = True, history_limit: int = 20, a=Depends(get_a)):
+        snap = await asyncio.to_thread(sysinfo.snapshot, a.settings.monitoring, include_processes=processes)
+        recent_tasks = await a.orchestrator.tasks.list_tasks(limit=10)
+        recent_cmds = await a.orchestrator.command_history.list_recent(limit=25)
+        suggestions = a.proactive.collect(sys_snapshot=snap, recent_tasks=recent_tasks, recent_commands=recent_cmds)
+        return {
+            **snap,
+            "history": sysinfo.monitor_history(limit=history_limit),
+            "suggestions": suggestions,
+            "jarvis": {
+                "os_state": a.os_state,
+                "mode": a.settings.mode,
+                "active_brain": a.settings.boot_brain,
+                "active_provider": a.settings.providers.active_provider,
+                "queued_tasks": len([t for t in recent_tasks if t["status"] in ("queued", "running", "planning")]),
+                "failed_tasks": len([t for t in recent_tasks if t["status"] == "failed"]),
+            },
+        }
+
+    @router.get("/system/suggestions")
+    async def get_proactive_suggestions(a=Depends(get_a)):
+        snap = await asyncio.to_thread(sysinfo.snapshot, a.settings.monitoring, include_processes=False)
+        recent_tasks = await a.orchestrator.tasks.list_tasks(limit=10)
+        recent_cmds = await a.orchestrator.command_history.list_recent(limit=25)
+        items = a.proactive.collect(sys_snapshot=snap, recent_tasks=recent_tasks, recent_commands=recent_cmds)
+        return {"enabled": a.settings.proactive.enabled, "suggestions": items, "count": len(items)}
+
+    @router.post("/system/suggestions/{suggestion_id}/dismiss")
+    async def dismiss_proactive_suggestion(suggestion_id: str, a=Depends(get_a)):
+        return {"ok": True, **a.proactive.dismiss(suggestion_id)}
 
     # ---- P10.20 Consolidated Settings & Secure Provider Gateway --------------------------------------
     @router.get("/settings")

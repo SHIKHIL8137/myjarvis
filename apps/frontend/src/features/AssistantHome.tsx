@@ -5,6 +5,7 @@ import type { ForceConfig, GalaxyHandle } from "../components/GalaxyCanvas";
 import { HologramCore, type CoreMode } from "../components/HologramCore";
 import { Inspector } from "../components/Inspector";
 import { Markdown } from "../components/Markdown";
+import { OperationsDrawer, type OpsTab } from "../components/OperationsDrawer";
 import { SpeechInspectorPanel, type VoiceTranscriptItem } from "../components/SpeechInspectorPanel";
 import { graph, useGraphVersion } from "../graphStore";
 import { onEvent, type ConnState, type LiveEvent } from "../live";
@@ -100,6 +101,19 @@ interface AssistantHomeProps extends ShellProps {
   searchInput: string;
   searchQuery: string;
   onSearchInput: (v: string) => void;
+  requestedDrawer?: string | null;
+  onClearRequestedDrawer?: () => void;
+}
+
+interface ProactiveSuggestionItem {
+  id: string;
+  kind: string;
+  severity: string;
+  title: string;
+  reason: string;
+  suggested_action_label: string;
+  suggested_prompt: string;
+  auto_execute: boolean;
 }
 
 const READ_OP_SET = new Set(["list_directory", "read_file", "search_files", "read_metadata"]);
@@ -144,12 +158,16 @@ export const AssistantHome: React.FC<AssistantHomeProps> = ({
   searchInput,
   searchQuery,
   onSearchInput,
+  requestedDrawer,
+  onClearRequestedDrawer,
 }) => {
   const [coreMode, setCoreMode] = useState<CoreMode>("ring");
   const [tasks, setTasks] = useState<AssistantTaskItem[]>([]);
   const [tasksOpen, setTasksOpen] = useState(false);
   const [transcripts, setTranscripts] = useState<VoiceTranscriptItem[]>([]);
   const [voiceOpen, setVoiceOpen] = useState(false);
+  const [opsTab, setOpsTab] = useState<OpsTab | null>(null);
+  const [suggestions, setSuggestions] = useState<ProactiveSuggestionItem[]>([]);
   const [explorerOpen, setExplorerOpen] = useState(false);
   const [allowAlwaysReadOnly, setAllowAlwaysReadOnly] = useState(true);
   const [decidingId, setDecidingId] = useState<string | null>(null);
@@ -159,11 +177,13 @@ export const AssistantHome: React.FC<AssistantHomeProps> = ({
 
   const loadTasksAndPolicy = useCallback(async () => {
     try {
-      const [tRes, sRes] = await Promise.all([
+      const [tRes, sRes, sugRes] = await Promise.all([
         apiFetch<{ tasks: AssistantTaskItem[] }>("/v2/tasks?limit=15"),
         apiFetch<{ filesystem?: { allow_always_read_only?: boolean } }>("/v2/settings"),
+        apiFetch<{ suggestions?: ProactiveSuggestionItem[] }>("/v2/system/suggestions").catch(() => ({ suggestions: [] })),
       ]);
       setTasks(tRes.tasks || []);
+      setSuggestions(sugRes.suggestions || []);
       if (sRes.filesystem && typeof sRes.filesystem.allow_always_read_only === "boolean") {
         setAllowAlwaysReadOnly(sRes.filesystem.allow_always_read_only);
       }
@@ -171,6 +191,20 @@ export const AssistantHome: React.FC<AssistantHomeProps> = ({
       // background polling handles recovery smoothly
     }
   }, []);
+
+  useEffect(() => {
+    if (!requestedDrawer) return;
+    if (requestedDrawer === "tasks") {
+      setTasksOpen(true);
+    } else if (requestedDrawer === "voice") {
+      setVoiceOpen(true);
+    } else if (["history", "aliases", "memory", "desktop", "system"].includes(requestedDrawer)) {
+      setOpsTab(requestedDrawer as OpsTab);
+    } else if (requestedDrawer === "approvals") {
+      setOpsTab("desktop");
+    }
+    onClearRequestedDrawer?.();
+  }, [requestedDrawer, onClearRequestedDrawer]);
 
   useEffect(() => {
     loadTasksAndPolicy();
@@ -596,6 +630,19 @@ export const AssistantHome: React.FC<AssistantHomeProps> = ({
             >
               Voice ({transcripts.length})
             </button>
+            {(["history", "aliases", "memory", "desktop", "system"] as OpsTab[]).map((t) => (
+              <button
+                key={t}
+                className={opsTab === t ? "active" : "ghost"}
+                onClick={() => setOpsTab((cur) => (cur === t ? null : t))}
+              >
+                {t === "history" && "History"}
+                {t === "aliases" && "Aliases"}
+                {t === "memory" && "Memory"}
+                {t === "desktop" && "Desktop"}
+                {t === "system" && "Sysinfo"}
+              </button>
+            ))}
           </div>
           <div className="row">
             <button className="ghost" onClick={() => onNavigate?.("settings")}>Settings</button>
@@ -604,6 +651,71 @@ export const AssistantHome: React.FC<AssistantHomeProps> = ({
             )}
           </div>
         </div>
+
+        {opsTab && (
+          <OperationsDrawer
+            tab={opsTab}
+            onChangeTab={setOpsTab}
+            onClose={() => setOpsTab(null)}
+            onNotify={onNotify}
+            onInspect={onInspect}
+            onNavigate={onNavigate}
+            onRunPrompt={async (prompt) => {
+              const res = await apiFetch<{ answer?: string; command?: string }>("/chat", {
+                method: "POST",
+                body: { message: prompt, speak: false },
+              });
+              setFeed((f) => [
+                ...f,
+                { id: `u_${Date.now()}`, role: "user", text: prompt },
+                { id: `a_${Date.now()}`, role: "assistant", text: res.answer || "", command: res.command || null },
+              ]);
+              loadTasksAndPolicy();
+            }}
+          />
+        )}
+
+        {suggestions.length > 0 && (
+          <div className="contextual-tasks-panel" aria-label="Proactive Suggestions">
+            <div className="eyebrow" style={{ marginBottom: 4 }}>Proactive Suggestions (Requires Your Action)</div>
+            {suggestions.slice(0, 2).map((s) => (
+              <div key={s.id} className="row between wrap" style={{ padding: "4px 0", borderTop: "1px solid rgba(255,255,255,0.06)" }}>
+                <div>
+                  <span className={`pill ${s.severity === "warning" ? "warn" : "info"}`} style={{ marginRight: 6 }}>{s.title}</span>
+                  <span className="dim" style={{ fontSize: 12 }}>{s.reason}</span>
+                </div>
+                <div className="row" style={{ gap: 6 }}>
+                  <button
+                    className="ghost"
+                    onClick={async () => {
+                      const res = await apiFetch<{ answer?: string; command?: string }>("/chat", {
+                        method: "POST",
+                        body: { message: s.suggested_prompt, speak: false },
+                      });
+                      setFeed((f) => [
+                        ...f,
+                        { id: `u_${Date.now()}`, role: "user", text: s.suggested_prompt },
+                        { id: `a_${Date.now()}`, role: "assistant", text: res.answer || "", command: res.command || null },
+                      ]);
+                    }}
+                  >
+                    {s.suggested_action_label}
+                  </button>
+                  <button
+                    className="ghost icon"
+                    aria-label={`Dismiss ${s.title}`}
+                    onClick={async () => {
+                      await apiFetch(`/v2/system/suggestions/${encodeURIComponent(s.id)}/dismiss`, { method: "POST" });
+                      setSuggestions((all) => all.filter((x) => x.id !== s.id));
+                    }}
+                  >
+                    ✕
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
 
         {voiceOpen && (
           <SpeechInspectorPanel

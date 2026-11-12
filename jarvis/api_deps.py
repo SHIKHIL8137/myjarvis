@@ -55,6 +55,8 @@ def build_consolidated_settings(a) -> dict:
         "memory": s.memory.model_dump(),
         "filesystem": s.filesystem.model_dump(),
         "actions": s.actions.model_dump(),
+        "monitoring": s.monitoring.model_dump(),
+        "proactive": s.proactive.model_dump(),
         "providers": s.providers.model_dump(),
         "provider_keys": provider_keys,
         "gateway": s.gateway.model_dump(),
@@ -87,6 +89,8 @@ def apply_settings_patch(a, patch: dict, *, allow_gateway_and_prefs: bool = True
         "memory",
         "filesystem",
         "actions",
+        "monitoring",
+        "proactive",
         "providers",
         "learning",
     }

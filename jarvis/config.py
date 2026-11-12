@@ -234,6 +234,10 @@ class InternetSpec(BaseModel):
 
 class MemorySpec(BaseModel):
     enabled: bool = True
+    enable_user_preferences: bool = True
+    enable_project_memory: bool = True
+    enable_command_memory: bool = True
+    enable_conversation_memory: bool = True
     duplicate_threshold: float = Field(0.85, ge=0.5, le=1.0)
     confirm_inferred: bool = True
     max_temporary_items: int = Field(30, ge=5, le=200)
@@ -243,6 +247,7 @@ class MemorySpec(BaseModel):
     ranking_confidence_weight: float = Field(0.15, ge=0.0, le=2.0)
     ranking_relevance_weight: float = Field(0.10, ge=0.0, le=2.0)
     ranking_project_boost: float = Field(0.10, ge=0.0, le=2.0)
+    ranking_frequency_weight: float = Field(0.12, ge=0.0, le=2.0)
 
 
 class FilesystemSpec(BaseModel):
@@ -251,8 +256,8 @@ class FilesystemSpec(BaseModel):
     max_file_bytes: int = Field(512_000, ge=10_000, le=5_000_000)
     max_results: int = Field(40, ge=5, le=200)
     allow_write: bool = True
-    sensitive_file_policy: str = Field("always_ask", pattern="^(always_ask|block)$")
-    cloud_data_policy: str = Field("redact_and_confirm", pattern="^(local_only|redact_only|redact_and_confirm)$")
+    sensitive_file_policy: str = Field("block", pattern="^(always_ask|block|warn|metadata_only)$")
+    cloud_data_policy: str = Field("redacted", pattern="^(local_only|redact_only|redact_and_confirm|never|redacted|approved_only)$")
     allowed_extensions: list[str] = Field(default_factory=list)
     allow_always_read_only: bool = True
 
@@ -269,6 +274,18 @@ class ActionsSpec(BaseModel):
     })
     allowed_commands: list[str] = Field(default_factory=lambda: ["pytest", "python", "git status", "ollama list", "ollama ps"])
     confirm_levels: list[str] = Field(default_factory=lambda: ["MODIFY", "DESTRUCTIVE", "SYSTEM"])
+    allowed_url_domains: list[str] = Field(default_factory=lambda: [
+        "docs.python.org",
+        "developer.mozilla.org",
+        "github.com",
+        "wikipedia.org",
+        "arxiv.org",
+        "pypi.org",
+    ])
+    allow_screenshots: bool = True
+    allow_media_controls: bool = True
+    allow_window_controls: bool = True
+    allow_input_automation: bool = False
 
 
 class ProvidersSpec(BaseModel):
@@ -462,6 +479,27 @@ class PreferencesSpec(BaseModel):
     graph_detail: str = Field("standard", pattern="^(minimal|compact|standard|detailed|full)$")
     stt_provider: str = "faster_whisper"
     tts_provider: str = "piper"
+    personality_preset: str = Field("professional", pattern="^(professional|friendly|concise|technical|detailed|custom)$")
+    custom_instructions: str = Field("", max_length=600)
+
+
+class MonitoringSpec(BaseModel):
+    enabled: bool = True
+    poll_interval_s: float = Field(5.0, ge=1.0, le=300.0)
+    cpu_alert_pct: float = Field(90.0, ge=50.0, le=100.0)
+    ram_alert_pct: float = Field(90.0, ge=50.0, le=100.0)
+    gpu_vram_alert_pct: float = Field(90.0, ge=50.0, le=100.0)
+    disk_free_alert_gb: float = Field(5.0, ge=0.5, le=500.0)
+    battery_low_pct: float = Field(20.0, ge=5.0, le=80.0)
+    history_size: int = Field(60, ge=5, le=360)
+
+
+class ProactiveSpec(BaseModel):
+    enabled: bool = True
+    cooldown_s: float = Field(120.0, ge=5.0, le=3600.0)
+    suggest_on_system_alerts: bool = True
+    suggest_on_failed_tasks: bool = True
+    suggest_on_repeated_commands: bool = True
 
 
 class Settings(BaseModel):
@@ -493,6 +531,8 @@ class Settings(BaseModel):
     recovery: RecoverySpec = RecoverySpec()
     skills: SkillsSpec = SkillsSpec()
     preferences: PreferencesSpec = PreferencesSpec()
+    monitoring: MonitoringSpec = MonitoringSpec()
+    proactive: ProactiveSpec = ProactiveSpec()
 
     @property
     def notes_path(self) -> Path:

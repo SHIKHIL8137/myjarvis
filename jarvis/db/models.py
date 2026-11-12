@@ -541,3 +541,44 @@ class AssistantTaskRow(Base):
     updated_at: Mapped[float] = mapped_column(Float, default=_now)
     completed_at: Mapped[float | None] = mapped_column(Float, nullable=True)
 
+
+class ProjectAliasRow(Base):
+    """User-approved friendly alias mapped to a canonical local folder path."""
+
+    __tablename__ = "project_aliases"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    alias: Mapped[str] = mapped_column(String(120), unique=True, index=True)
+    display_name: Mapped[str] = mapped_column(String(160), default="")
+    folder_path: Mapped[str] = mapped_column(String(800), index=True)
+    description: Mapped[str] = mapped_column(String(400), default="")
+    usage_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_used_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    created_at: Mapped[float] = mapped_column(Float, default=_now)
+    updated_at: Mapped[float] = mapped_column(Float, default=_now)
+
+
+class CommandHistoryRow(Base):
+    """Unified persisted execution history for chat/voice commands, workflows, and replay continuity."""
+
+    __tablename__ = "command_history"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    raw_text: Mapped[str] = mapped_column(Text)
+    normalized_command: Mapped[str] = mapped_column(String(400), index=True)
+    task_category: Mapped[str] = mapped_column(String(48), default="informational", index=True)
+    intent: Mapped[str] = mapped_column(String(64), default="general_chat", index=True)
+    department: Mapped[str] = mapped_column(String(32), default="assistant")
+    task_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    project_alias: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    target_path: Mapped[str | None] = mapped_column(String(800), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), default="completed", index=True)
+    tools_used: Mapped[list] = mapped_column(JSON, default=list)
+    paths_touched: Mapped[list] = mapped_column(JSON, default=list)
+    result_summary: Mapped[str] = mapped_column(Text, default="")
+    error_info: Mapped[str] = mapped_column(Text, default="")
+    replayable: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    replay_count: Mapped[int] = mapped_column(Integer, default=0)
+    source: Mapped[str] = mapped_column(String(24), default="text")
+    created_at: Mapped[float] = mapped_column(Float, default=_now, index=True)
+    updated_at: Mapped[float] = mapped_column(Float, default=_now)
+    completed_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+

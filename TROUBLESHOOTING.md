@@ -47,3 +47,11 @@ To reset: stop Jarvis, then delete `data\history.jsonl` (conversation), `data\se
 - **Technical terms or project names misheard**: Add exact spellings to `config/vocab_hints.txt` or **Settings → Voice → Domain Vocabulary Hints**.
 - **Malayalam outputs Devanagari or mixed Malayalam+English loses English words**: Select **`ml`** for monolingual Malayalam (or install local `whisper-small-malayalam-v2-ct2`) and use **`mixed`** when speaking Manglish/Malayalam+English code-switched sentences, keeping **Preserve Mixed Code-Switching** enabled.
 - **Translation drops numbers, negations, or entities**: Keep **Verify Translations** (`translation.verify_translations: true`) enabled so semantic verification catches missing anchors, retries automatically once, and marks remaining anomalies as `Verify: ...` / `Uncertain`.
+
+
+## Filesystem, Automation, Monitoring & Voice Safety Troubleshooting
+
+- **Project alias denied or path blocked**: Named project aliases still enforce `FilesystemAccessManager` boundaries. Grant folder read/write access explicitly in Settings/approvals, and avoid UNC, drive-root, symlink/reparse, or sensitive credential folders (`.ssh`, `.aws`, etc.).
+- **Desktop URL or input action rejected**: `open_url` requires `https://` and blocks loopback/private SSRF hosts (plus respects `ActionsSpec.allowed_url_domains`). High-risk input automation (`allow_input_automation`) is `False` by default until explicitly enabled, and state-changing actions require owner token confirmation.
+- **CPU temperature unavailable on Windows**: Standard user-mode Windows (`psutil`) does not expose CPU package temperatures without kernel/WMI sensor drivers; `cpu_details()` honestly returns `temp_supported=False` with an explicit `unavailable_reason` instead of fabricating readings.
+- **Voice command paused for clarification instead of running**: If STT confidence is low, audio is noisy, or script mismatch is detected on a potentially mutating command, `transcript_requires_voice_clarification()` pauses execution and asks for confirmation. Repeat clearly or issue the command in text chat.

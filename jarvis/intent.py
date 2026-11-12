@@ -1,6 +1,7 @@
 """Centralized intent routing & deterministic command handling (Phases 1, 10, 11, 14):
 routes explicit voice/text commands, permission-checked actions, memory/history operations,
 voice/model switching, filesystem search/inspection, and learning/training lifecycle controls."""
+import asyncio
 import re
 
 from . import audit
@@ -34,7 +35,7 @@ VOICE_RATE = re.compile(
     re.I,
 )
 SWITCH_MODEL = re.compile(
-    r"^\W*(?:hey\s+)?(?:jarvis\W+)?(?:please\s+)?(?:switch|change|use)\s+(?:to\s+)?(?:the\s+)?(?!voice\b)(.+?)(?:\s+model)?\W*$",
+    r"^\W*(?:hey\s+)?(?:jarvis\W+)?(?:please\s+)?(?:switch|change|use)\s+(?:to\s+)?(?:the\s+)?(?!voice\b|personality\b|tone\b|style\b)(.+?)(?:\s+model)?\W*$",
     re.I,
 )
 WHICH_MODEL = re.compile(r"^\W*(?:what|which)\s+model(?:\s+(?:is\s+(?:this|active)|are\s+you\s+using))?\W*$", re.I)
@@ -86,7 +87,38 @@ SEARCH_FILES = re.compile(
 READ_DOC = re.compile(r"^\W*(?:hey\s+)?(?:jarvis\W+)?read\s+(?:file|document)\s+(.+)$", re.I)
 OPEN_FILE = re.compile(r"^\W*(?:hey\s+)?(?:jarvis\W+)?open\s+(?:file|document)\s+(.+)$", re.I)
 OPEN_APP = re.compile(r"^\W*(?:hey\s+)?(?:jarvis\W+)?(?:open|launch)\s+(?:app(?:lication)?\s+)?([a-z0-9_ .-]+?)\W*$", re.I)
+OPEN_EXPLICIT_APP = re.compile(r"^\W*(?:hey\s+)?(?:jarvis\W+)?(?:open|launch)\s+app(?:lication)?\s+([a-z0-9_ .-]+?)\W*$", re.I)
 INSPECT_PROJECT = re.compile(r"^\W*(?:hey\s+)?(?:jarvis\W+)?(?:inspect|analyze)\s+(?:my\s+|the\s+)?(?:project|codebase)(?:\s+at\s+(.+))?\W*$", re.I)
+LIST_WINDOWS = re.compile(r"^\W*(?:hey\s+)?(?:jarvis\W+)?(?:list|show)\s+(?:open\s+)?windows\W*$", re.I)
+ACTIVE_WINDOW = re.compile(
+    r"^\W*(?:hey\s+)?(?:jarvis\W+)?(?:what\s+is\s+(?:the\s+)?(?:active|current)\s+window|active\s+window|current\s+window)\W*$",
+    re.I,
+)
+FOCUS_WINDOW = re.compile(r"^\W*(?:hey\s+)?(?:jarvis\W+)?(?:focus|switch\s+to|activate)\s+window\s+(.+)$", re.I)
+MEDIA_CMD = re.compile(
+    r"^\W*(?:hey\s+)?(?:jarvis\W+)?(?:(play|pause|next|previous|prev|mute)\s+(?:media|music|audio|track|volume)|(volume\s+up|volume\s+down)|media\s+(play|pause|play_pause|next|previous|mute))\W*$",
+    re.I,
+)
+TAKE_SCREENSHOT = re.compile(
+    r"^\W*(?:hey\s+)?(?:jarvis\W+)?(?:take\s+(?:a\s+)?screenshot|capture\s+screen)(?:\s+as\s+([a-z0-9_.-]+))?\W*$",
+    re.I,
+)
+OPEN_URL_CMD = re.compile(
+    r"^\W*(?:hey\s+)?(?:jarvis\W+)?open\s+(?:url|website|link)\s+([a-z][a-z0-9+.-]*://\S+|\S+\.\S+)\W*$",
+    re.I,
+)
+SYSTEM_HEALTH_CMD = re.compile(
+    r"^\W*(?:hey\s+)?(?:jarvis\W+)?(?:show|check|get|what\s+is)?\s*(?:my\s+|the\s+)?(?:system\s+(?:status|health|resources|metrics)|cpu\s+and\s+ram|gpu\s+(?:status|usage)|disk\s+space)\W*$",
+    re.I,
+)
+PROACTIVE_CMD = re.compile(
+    r"^\W*(?:hey\s+)?(?:jarvis\W+)?(?:show|list|any)?\s*proactive\s+suggestions\W*$",
+    re.I,
+)
+PERSONALITY_CMD = re.compile(
+    r"^\W*(?:hey\s+)?(?:jarvis\W+)?(?:switch|change|set)\s+(?:your\s+)?(?:personality|tone|mode|style)(?:\s+preset)?\s+(?:to\s+)?(professional|friendly|concise|technical|detailed|custom)\W*$",
+    re.I,
+)
 
 # Phase 10 learning & training lifecycle commands
 KNOWLEDGE_SYNC = re.compile(
@@ -112,6 +144,32 @@ TRAINING_CONTROL = re.compile(
 EVAL_CMD = re.compile(r"^\W*(?:hey\s+)?(?:jarvis\W+)?(?:evaluate|run\s+evaluation\s+on)\s+(?:the\s+)?(?:candidate|active|baseline)?\s*model\W*$", re.I)
 PROMOTE_CMD = re.compile(r"^\W*(?:hey\s+)?(?:jarvis\W+)?promote\s+(?:the\s+)?(?:candidate\s+)?model(?:\s+([a-z0-9_-]+))?\W*$", re.I)
 ROLLBACK_CMD = re.compile(r"^\W*(?:hey\s+)?(?:jarvis\W+)?roll\s*back(?:\s+to(?:\s+the)?\s+previous)?\s+model(?:\s+([a-z0-9_-]+))?\W*$", re.I)
+
+# Stage B: Command history & continuity intents
+REPEAT_LAST_CMD = re.compile(
+    r"^\W*(?:hey\s+)?(?:jarvis\W+)?(?:please\s+)?(?:repeat|re-?run|run|execute|do)\s+(?:the\s+|my\s+)?(?:last|previous)\s+(?:command|request|instruction)(?:\s+again)?\W*$",
+    re.I,
+)
+SHOW_RECENT_TASKS = re.compile(
+    r"^\W*(?:hey\s+)?(?:jarvis\W+)?(?:please\s+)?(?:show|list|view)\s+(?:the\s+|my\s+)?recent\s+(?:tasks?|commands?|history|requests?)\W*$",
+    re.I,
+)
+SHOW_FAILED_TASKS = re.compile(
+    r"^\W*(?:hey\s+)?(?:jarvis\W+)?(?:please\s+)?(?:show|list|view)\s+(?:the\s+|my\s+)?failed\s+(?:tasks?|commands?|requests?)\W*$",
+    re.I,
+)
+LAST_REQUEST_STATUS = re.compile(
+    r"^\W*(?:hey\s+)?(?:jarvis\W+)?(?:what\s+happened\s+to\s+(?:my\s+|the\s+)?(?:last|previous)\s+(?:request|command|task)|(?:status|outcome)\s+of\s+(?:my\s+|the\s+)?(?:last|previous)\s+(?:request|command|task))\W*$",
+    re.I,
+)
+CONTINUE_TASK = re.compile(
+    r"^\W*(?:hey\s+)?(?:jarvis\W+)?(?:please\s+)?(?:continue|resume)\s+(?:the\s+|my\s+)?(?:previous|last|paused|current)\s+(?:task|command|work|request)\W*$",
+    re.I,
+)
+CANCEL_CURRENT_TASK = re.compile(
+    r"^\W*(?:hey\s+)?(?:jarvis\W+)?(?:please\s+)?cancel\s+(?:the\s+|my\s+)?(?:current|active|running|pending)\s+task\W*$",
+    re.I,
+)
 
 
 def _res(name: str, reply: str, *, nodes=None, note=None, paths=None, ui=None, ok=True, speak=True, **extra) -> dict:
@@ -160,6 +218,168 @@ async def route_intent(a, text: str) -> dict | None:
         a.voice.resume()
         return _res("resume_voice", "Resuming voice listening.", ui={"voice": "listening"})
 
+    # Stage B: Command Continuity & Task Lifecycle Controls
+    if CANCEL_CURRENT_TASK.match(text):
+        a.speaker.stop()
+        cancelled_ids: list[str] = []
+        if hasattr(a, "actions"):
+            a.actions.tasks.cancel_active()
+        if hasattr(a, "orchestrator"):
+            a.orchestrator.cancel_active_runs(reason="Cancelled by owner command")
+            all_tasks = await a.orchestrator.tasks.list_tasks(limit=25)
+            for t in all_tasks:
+                if t["status"] in ("queued", "planning", "running", "paused", "waiting_quota", "awaiting_permission", "awaiting_approval"):
+                    await a.orchestrator.tasks.cancel_task(t["task_id"], reason="Cancelled by owner command")
+                    await a.orchestrator.fs_access.consume_task_once_permissions(t["task_id"])
+                    if hasattr(a.orchestrator, "command_history"):
+                        await a.orchestrator.command_history.update_by_task(t["task_id"], status="cancelled", error_info="Cancelled by owner command")
+                    cancelled_ids.append(t["task_id"])
+        reply = (
+            f"Cancelled {len(cancelled_ids)} active/pending task(s): {', '.join(cancelled_ids[:4])}."
+            if cancelled_ids
+            else "There is no active or pending task running right now."
+        )
+        return _res("cancel_task", reply, cancelled_task_ids=cancelled_ids, replayable=False, ui={"open_drawer": "tasks"})
+
+    if REPEAT_LAST_CMD.match(text):
+        if getattr(a, "_in_replay", False):
+            return _res("repeat_last_command", "Refusing nested command replay loop.", ok=False, replayable=False)
+        last = await a.orchestrator.command_history.get_last_replayable() if hasattr(a, "orchestrator") and hasattr(a.orchestrator, "command_history") else None
+        if not last:
+            return _res("repeat_last_command", "No previous replayable command was found in history.", ok=False, replayable=False)
+        await a.orchestrator.command_history.increment_replay(last["id"])
+        return _res(
+            "repeat_last_command",
+            f"Replaying last command: {last['raw_text']}",
+            replay_command=last,
+            replay_text=last["raw_text"],
+            replayable=False,
+        )
+
+    if SHOW_RECENT_TASKS.match(text):
+        tasks = await a.orchestrator.tasks.list_tasks(limit=10) if hasattr(a, "orchestrator") else []
+        cmds = await a.orchestrator.command_history.list_recent(limit=10) if hasattr(a, "orchestrator") and hasattr(a.orchestrator, "command_history") else []
+        if not tasks and not cmds:
+            return _res("show_recent_tasks", "No recent tasks or commands have been recorded yet.", tasks=[], commands=[], replayable=False, ui={"open_drawer": "tasks"})
+        lines = [f"- [{c['status']}] `{c['raw_text'][:80]}` ({c['task_category']})" for c in cmds[:6]]
+        if not lines:
+            lines = [f"- [{t['status']}] `{t['user_request'][:80]}` ({t['current_step']})" for t in tasks[:6]]
+        return _res(
+            "show_recent_tasks",
+            f"Recent commands/tasks ({len(cmds) or len(tasks)}):\n" + "\n".join(lines),
+            tasks=tasks,
+            commands=cmds,
+            replayable=False,
+            ui={"open_drawer": "tasks"},
+        )
+
+    if SHOW_FAILED_TASKS.match(text):
+        tasks = await a.orchestrator.tasks.list_tasks(limit=30) if hasattr(a, "orchestrator") else []
+        failed_tasks = [t for t in tasks if t["status"] in ("failed", "cancelled", "unverified")]
+        cmds = await a.orchestrator.command_history.list_recent(limit=15, status="failed") if hasattr(a, "orchestrator") and hasattr(a.orchestrator, "command_history") else []
+        if not failed_tasks and not cmds:
+            return _res("show_failed_tasks", "There are no failed tasks or commands in recent history.", tasks=[], commands=[], replayable=False, ui={"open_drawer": "tasks"})
+        lines = [f"- [{t['status']}] `{t['user_request'][:70]}` — {t.get('error_info') or t.get('current_step') or 'no detail'}" for t in failed_tasks[:6]]
+        for c in cmds[:4]:
+            if c.get("task_id") and any(t["task_id"] == c["task_id"] for t in failed_tasks):
+                continue
+            lines.append(f"- [{c['status']}] `{c['raw_text'][:70]}` — {c.get('error_info') or 'failed'}")
+        return _res(
+            "show_failed_tasks",
+            f"Failed/interrupted tasks ({len(lines)}):\n" + "\n".join(lines),
+            tasks=failed_tasks,
+            commands=cmds,
+            replayable=False,
+            ui={"open_drawer": "tasks"},
+        )
+
+    if LAST_REQUEST_STATUS.match(text):
+        latest_cmd = await a.orchestrator.command_history.get_latest() if hasattr(a, "orchestrator") and hasattr(a.orchestrator, "command_history") else None
+        tasks = await a.orchestrator.tasks.list_tasks(limit=5) if hasattr(a, "orchestrator") else []
+        latest_task = tasks[0] if tasks else None
+        if not latest_cmd and not latest_task:
+            return _res("last_request_status", "No previous requests have been recorded yet.", replayable=False)
+        req_text = (latest_cmd or {}).get("raw_text") or (latest_task or {}).get("user_request") or ""
+        status = (latest_task or {}).get("status") or (latest_cmd or {}).get("status") or "unknown"
+        step = (latest_task or {}).get("current_step") or ""
+        err = (latest_task or {}).get("error_info") or (latest_cmd or {}).get("error_info") or ""
+        summary = (latest_task or {}).get("result") or (latest_cmd or {}).get("result_summary") or ""
+        detail = err or step or summary[:180]
+        reply = f"Last request (`{req_text[:90]}`) has status `{status}`" + (f": {detail}" if detail else ".")
+        return _res(
+            "last_request_status",
+            reply,
+            task=latest_task,
+            command_record=latest_cmd,
+            replayable=False,
+            ui={"open_drawer": "tasks"},
+        )
+
+    if CONTINUE_TASK.match(text):
+        tasks = await a.orchestrator.tasks.list_tasks(limit=15) if hasattr(a, "orchestrator") else []
+        pending_fs = await a.orchestrator.fs_access.list_requests(status="pending") if hasattr(a, "orchestrator") else []
+        pending_ap = await asyncio.to_thread(a.orchestrator.approvals.list_pending) if hasattr(a, "orchestrator") else []
+        target_task = next((t for t in tasks if t["status"] in ("awaiting_permission", "awaiting_approval", "paused", "waiting_quota", "queued", "failed", "cancelled")), None)
+        if target_task is None:
+            latest = tasks[0] if tasks else None
+            msg = (
+                f"Your latest task (`{latest['user_request'][:80]}`) is already `{latest['status']}`. Say 'repeat last command' to run it again."
+                if latest
+                else "There is no previous task to continue."
+            )
+            return _res("continue_task", msg, replayable=False, ok=False)
+        t_status = target_task["status"]
+        if t_status == "awaiting_permission":
+            req = next((r for r in pending_fs if r.get("task_id") == target_task["task_id"]), pending_fs[0] if pending_fs else None)
+            path_txt = req["canonical_path"] if req else target_task.get("current_step", "target folder")
+            return _res(
+                "continue_task",
+                f"Previous task (`{target_task['user_request'][:70]}`) is paused waiting for filesystem permission on `{path_txt}`. Approve or deny the inline permission card to continue.",
+                task=target_task,
+                permission_request=req,
+                replayable=False,
+                ok=False,
+                ui={"open_drawer": "tasks"},
+            )
+        if t_status == "awaiting_approval":
+            ap = pending_ap[0] if pending_ap else None
+            tok = ap["token"] if ap else "pending"
+            return _res(
+                "continue_task",
+                f"Previous task (`{target_task['user_request'][:70]}`) is waiting for explicit owner approval (`{tok}`).",
+                task=target_task,
+                approval=ap,
+                replayable=False,
+                ok=False,
+                ui={"open_drawer": "approvals"},
+            )
+        if target_task.get("worker_kind") == "deep_research" and t_status in ("paused", "waiting_quota", "queued"):
+            updated = await a.orchestrator.tasks.update_task(
+                target_task["task_id"],
+                status="queued",
+                current_step="Resumed by owner command",
+                clear_not_before=True,
+                clear_claim=True,
+            )
+            a.orchestrator.task_runner.wake()
+            return _res("continue_task", f"Resumed background task `{target_task['task_id']}`.", task=updated, replayable=False)
+        # Checkpointed multi-step or replayable incomplete task: let _stream_turn_unlocked execute cleanly with fresh permissions!
+        cp = target_task.get("checkpoint_json") or target_task.get("checkpoint") or {}
+        if cp.get("multistep_plan"):
+            return _res(
+                "continue_task",
+                f"Continuing checkpointed task `{target_task['user_request'][:80]}`.",
+                resume_task=target_task,
+                replay_text=target_task["user_request"],
+                replayable=False,
+            )
+        return _res(
+            "continue_task",
+            f"Re-running previous incomplete task `{target_task['user_request'][:80]}`.",
+            replay_text=target_task["user_request"],
+            replayable=False,
+        )
+
     # Voice listing / switching / speech rate (must precede SWITCH_MODEL)
     if VOICE_LIST.match(text):
         voices = a.tts.list_voices()
@@ -201,6 +421,16 @@ async def route_intent(a, text: str) -> dict | None:
         return _res(
             "which_model",
             f"Active model is {a.brain.spec.model} ({a.brain.current}, provider: {a.brain.provider}).",
+        )
+
+    if m := PERSONALITY_CMD.match(text):
+        preset = m.group(1).strip().lower()
+        a.settings.preferences.personality_preset = preset
+        return _res(
+            "set_personality",
+            f"Switched response personality preset to '{preset}'. Safety, honesty, and approval boundaries remain enforced.",
+            personality_preset=preset,
+            ui={"open_drawer": "settings"},
         )
 
     if m := SWITCH_MODEL.match(text):
@@ -432,15 +662,164 @@ async def route_intent(a, text: str) -> dict | None:
                 target = m.group(1).strip(" .?!\"'")
                 try:
                     out = a.actions.request_or_execute("open_file", {"path": target})
-                    return _res("open_file", f"Opened {out.get('opened', target)}.", action_result=out)
+                    if out.get("confirmation_required"):
+                        return _res(
+                            "open_file",
+                            f"Approval required ({out['token']}): {out.get('description', target)}. Say 'confirm action {out['token']}' to proceed.",
+                            action_result=out,
+                            ui={"open_drawer": "approvals"},
+                        )
+                    return _res("open_file", f"Opened {(out.get('result') or {}).get('opened', target)}.", action_result=out)
                 except Exception as e:
                     return _res("open_file", f"Could not open {target}: {e}", ok=False)
+
+    if hasattr(a, "actions"):
+        if LIST_WINDOWS.match(text):
+            try:
+                out = a.actions.request_or_execute("list_windows", {})
+                res_data = out.get("result") or {}
+                wins = res_data.get("windows", [])
+                titles = ", ".join(w.get("title", "") for w in wins[:6]) or "none"
+                return _res("list_windows", f"Found {len(wins)} open windows: {titles}.", action_result=out, ui={"open_drawer": "desktop"})
+            except Exception as e:
+                return _res("list_windows", f"Could not list windows: {e}", ok=False)
+
+        if ACTIVE_WINDOW.match(text):
+            try:
+                out = a.actions.request_or_execute("get_active_window", {})
+                res_data = out.get("result") or {}
+                title = res_data.get("title") or "unknown"
+                return _res("get_active_window", f"Active window: {title}.", action_result=out)
+            except Exception as e:
+                return _res("get_active_window", f"Could not read active window: {e}", ok=False)
+
+        if m := FOCUS_WINDOW.match(text):
+            title = m.group(1).strip(" .?!\"'")
+            try:
+                out = a.actions.request_or_execute("focus_window", {"title": title})
+                if out.get("confirmation_required"):
+                    return _res(
+                        "focus_window",
+                        f"Approval required ({out['token']}): focus window '{title}'.",
+                        action_result=out,
+                        ui={"open_drawer": "approvals"},
+                    )
+                res_data = out.get("result") or {}
+                focused_title = (res_data.get("focused") or {}).get("title", title)
+                return _res("focus_window", f"Focused window '{focused_title}'.", action_result=out)
+            except Exception as e:
+                return _res("focus_window", f"Could not focus window '{title}': {e}", ok=False)
+
+        if m := MEDIA_CMD.match(text):
+            raw_cmd = (m.group(1) or m.group(2) or m.group(3) or "").strip().lower().replace(" ", "_")
+            cmd_map = {"prev": "previous", "play": "play_pause", "pause": "play_pause"}
+            cmd = cmd_map.get(raw_cmd, raw_cmd)
+            try:
+                out = a.actions.request_or_execute("media_control", {"command": cmd})
+                if out.get("confirmation_required"):
+                    return _res(
+                        "media_control",
+                        f"Approval required ({out['token']}): media_control({cmd}).",
+                        action_result=out,
+                        ui={"open_drawer": "approvals"},
+                    )
+                return _res("media_control", f"Dispatched media control: {cmd}.", action_result=out)
+            except Exception as e:
+                return _res("media_control", f"Media control failed: {e}", ok=False)
+
+        if m := TAKE_SCREENSHOT.match(text):
+            fname = m.group(1).strip() if m.group(1) else None
+            args = {"filename": fname} if fname else {}
+            try:
+                out = a.actions.request_or_execute("take_screenshot", args)
+                if out.get("confirmation_required"):
+                    return _res(
+                        "take_screenshot",
+                        f"Approval required ({out['token']}): take_screenshot.",
+                        action_result=out,
+                        ui={"open_drawer": "approvals"},
+                    )
+                res_data = out.get("result") or {}
+                return _res("take_screenshot", f"Saved screenshot to {res_data.get('path', 'captures')}.", action_result=out)
+            except Exception as e:
+                return _res("take_screenshot", f"Screenshot failed: {e}", ok=False)
+
+        if m := OPEN_URL_CMD.match(text):
+            target_url = m.group(1).strip().rstrip(".,;?!\"'")
+            if "://" not in target_url:
+                target_url = "https://" + target_url
+            try:
+                out = a.actions.request_or_execute("open_url", {"url": target_url})
+                if out.get("confirmation_required"):
+                    return _res(
+                        "open_url",
+                        f"Approval required ({out['token']}): {out.get('description', target_url)}.",
+                        action_result=out,
+                        ui={"open_drawer": "approvals"},
+                    )
+                res_data = out.get("result") or {}
+                return _res("open_url", f"Opened {res_data.get('url', target_url)}.", action_result=out)
+            except Exception as e:
+                return _res("open_url", f"Could not open URL: {e}", ok=False)
+
+    if SYSTEM_HEALTH_CMD.match(text):
+        from . import sysinfo
+
+        snap = await asyncio.to_thread(sysinfo.snapshot, a.settings.monitoring, include_processes=False)
+        ram_i = snap.get("ram") or {}
+        gpu_i = snap.get("gpu")
+        cpu_s = f"{snap['cpu_pct']}%" if snap.get("cpu_pct") is not None else "measuring"
+        gpu_s = f"{gpu_i['name']} ({gpu_i['used_gb']}/{gpu_i['total_gb']} GB VRAM, {gpu_i['util_pct']}%)" if isinstance(gpu_i, dict) else "unavailable"
+        disks_s = ", ".join(f"{d['mount']} {d['free_gb']}GB free" for d in (snap.get("disks") or [])[:3]) or "unknown"
+        alerts = snap.get("alerts") or []
+        alert_s = f" Active alerts: {len(alerts)} ({'; '.join(al['message'] for al in alerts[:2])})." if alerts else " No active resource alerts."
+        return _res(
+            "system_health",
+            f"CPU: {cpu_s}. RAM: {ram_i.get('used_gb', 0)}/{ram_i.get('total_gb', 0)} GB ({ram_i.get('used_pct', 0)}%). GPU: {gpu_s}. Disks: {disks_s}.{alert_s}",
+            system=snap,
+            ui={"open_drawer": "system"},
+        )
+
+    if PROACTIVE_CMD.match(text) and hasattr(a, "proactive"):
+        from . import sysinfo
+
+        snap = await asyncio.to_thread(sysinfo.snapshot, a.settings.monitoring, include_processes=False)
+        recent_tasks = await a.orchestrator.tasks.list_tasks(limit=10) if hasattr(a, "orchestrator") else []
+        recent_cmds = await a.orchestrator.command_history.list_recent(limit=25) if hasattr(a, "orchestrator") and hasattr(a.orchestrator, "command_history") else []
+        sugs = a.proactive.collect(sys_snapshot=snap, recent_tasks=recent_tasks, recent_commands=recent_cmds)
+        if not sugs:
+            return _res("proactive_suggestions", "No proactive suggestions right now.", suggestions=[], ui={"open_drawer": "system"})
+        summary = " | ".join(f"{s['title']}: {s['reason']}" for s in sugs[:3])
+        return _res("proactive_suggestions", f"Found {len(sugs)} suggestion(s): {summary}", suggestions=sugs, ui={"open_drawer": "system"})
+
+    if m := OPEN_EXPLICIT_APP.match(text):
+        app_name = m.group(1).strip().lower()
+        if hasattr(a, "actions"):
+            try:
+                out = a.actions.request_or_execute("open_app", {"app": app_name})
+                if out.get("confirmation_required"):
+                    return _res(
+                        "open_app",
+                        f"Approval required ({out['token']}): launch {app_name}.",
+                        action_result=out,
+                        ui={"open_drawer": "approvals"},
+                    )
+                return _res("open_app", f"Launched {app_name}.", action_result=out)
+            except Exception as e:
+                return _res("open_app", f"Could not launch {app_name}: {e}", ok=False)
 
     if m := OPEN_APP.match(text):
         app_name = m.group(1).strip().lower()
         if hasattr(a, "actions") and app_name in a.settings.actions.allowed_apps:
             try:
                 out = a.actions.request_or_execute("open_app", {"app": app_name})
+                if out.get("confirmation_required"):
+                    return _res(
+                        "open_app",
+                        f"Approval required ({out['token']}): launch {app_name}.",
+                        action_result=out,
+                        ui={"open_drawer": "approvals"},
+                    )
                 return _res("open_app", f"Launched {app_name}.", action_result=out)
             except Exception as e:
                 return _res("open_app", f"Could not launch {app_name}: {e}", ok=False)

@@ -75,6 +75,26 @@ interface ConsolidatedSettings {
     graph_detail: string;
     stt_provider: string;
     tts_provider: string;
+    personality_preset?: string;
+    custom_instructions?: string;
+  };
+  actions?: {
+    enabled: boolean;
+    allow_screenshots: boolean;
+    allow_media_controls: boolean;
+    allow_window_controls: boolean;
+    allow_input_automation: boolean;
+  };
+  monitoring?: {
+    enabled: boolean;
+    cpu_alert_pct: number;
+    ram_alert_pct: number;
+    gpu_vram_alert_pct: number;
+    disk_free_alert_gb: number;
+  };
+  proactive?: {
+    enabled: boolean;
+    cooldown_s: number;
   };
   provider_keys: Record<string, boolean>;
   history_turns: number;
@@ -1057,6 +1077,39 @@ export const SettingsPanel: React.FC<ShellProps> = ({ onNotify }) => {
               >
                 Allow "Always allow (read-only)" prompt option: {cfg.filesystem.allow_always_read_only ? "Enabled" : "Disabled"}
               </button>
+              {cfg.actions && (
+                <>
+                  <button
+                    aria-pressed={cfg.actions.allow_window_controls}
+                    className="ghost"
+                    onClick={() => patchSettings("Window controls updated", { actions: { allow_window_controls: !cfg.actions?.allow_window_controls } })}
+                  >
+                    Window Controls: {cfg.actions.allow_window_controls ? "On" : "Off"}
+                  </button>
+                  <button
+                    aria-pressed={cfg.actions.allow_media_controls}
+                    className="ghost"
+                    onClick={() => patchSettings("Media controls updated", { actions: { allow_media_controls: !cfg.actions?.allow_media_controls } })}
+                  >
+                    Media Controls: {cfg.actions.allow_media_controls ? "On" : "Off"}
+                  </button>
+                  <button
+                    aria-pressed={cfg.actions.allow_screenshots}
+                    className="ghost"
+                    onClick={() => patchSettings("Screenshots setting updated", { actions: { allow_screenshots: !cfg.actions?.allow_screenshots } })}
+                  >
+                    Screenshots: {cfg.actions.allow_screenshots ? "On" : "Off"}
+                  </button>
+                  <button
+                    aria-pressed={cfg.actions.allow_input_automation}
+                    className="ghost"
+                    onClick={() => patchSettings("Input automation updated", { actions: { allow_input_automation: !cfg.actions?.allow_input_automation } })}
+                    title="High-risk opt-in: every keyboard/mouse action still requires explicit confirmation."
+                  >
+                    Keyboard/Mouse Opt-In: {cfg.actions.allow_input_automation ? "Enabled (Confirm Req)" : "Disabled"}
+                  </button>
+                </>
+              )}
             </div>
           </div>
 
@@ -1216,6 +1269,7 @@ export const SettingsPanel: React.FC<ShellProps> = ({ onNotify }) => {
 
               <label className="field">
                 History Turns in Prompt
+                <span className="field-hint">Recent chat turns kept in each prompt (lower uses less memory).</span>
                 <select
                   value={cfg.history_turns}
                   onChange={(e) => patchSettings("History turns updated", { history_turns: Number(e.target.value) })}
@@ -1225,8 +1279,53 @@ export const SettingsPanel: React.FC<ShellProps> = ({ onNotify }) => {
                   ))}
                 </select>
               </label>
+
+              <label className="field">
+                Personality Preset
+                <span className="field-hint">Response tone only (KV-cache friendly; never weakens security or approvals).</span>
+                <select
+                  value={cfg.preferences.personality_preset || "professional"}
+                  onChange={(e) => patchSettings("Personality preset updated", { preferences: { personality_preset: e.target.value } })}
+                >
+                  <option value="professional">Professional (Balanced Butler)</option>
+                  <option value="friendly">Friendly (Warm & Conversational)</option>
+                  <option value="concise">Concise (Short & Direct)</option>
+                  <option value="technical">Technical (Engineering Detail)</option>
+                  <option value="detailed">Detailed (Step-by-Step)</option>
+                  <option value="custom">Custom Instructions</option>
+                </select>
+              </label>
+            </div>
+            <div style={{ marginTop: 10 }}>
+              <label className="field">
+                Custom Style Instructions
+                <span className="field-hint">Optional formatting or tone guidance applied alongside safety rules.</span>
+                <div className="row" style={{ gap: 8 }}>
+                  <input
+                    defaultValue={cfg.preferences.custom_instructions || ""}
+                    placeholder="e.g. Prefer short bullet points and include verification commands"
+                    style={{ flex: 1 }}
+                    onBlur={(e) => {
+                      const val = e.target.value;
+                      if (val !== (cfg.preferences.custom_instructions || "")) {
+                        patchSettings("Custom instructions updated", { preferences: { custom_instructions: val } });
+                      }
+                    }}
+                  />
+                </div>
+              </label>
             </div>
             <div className="row wrap" style={{ marginTop: 12 }}>
+              {cfg.proactive && (
+                <button
+                  aria-pressed={cfg.proactive.enabled}
+                  className="ghost"
+                  onClick={() => patchSettings("Proactive suggestions updated", { proactive: { enabled: !cfg.proactive?.enabled } })}
+                  title="Show dismissible non-executing suggestions on alerts or failed tasks."
+                >
+                  Proactive HUD Suggestions: {cfg.proactive.enabled ? "On" : "Off"}
+                </button>
+              )}
               <button
                 aria-pressed={cfg.preferences.compact_mode}
                 className="ghost"

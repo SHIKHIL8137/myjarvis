@@ -29,6 +29,8 @@ from ..skills.router import AgentCapabilityRouter
 from .approvals import ApprovalService
 from .assistant_graph import build_assistant_graph
 from .checkpointer import DBBackedCheckpointSaver
+from .command_history import CommandHistoryService
+from .multistep import MultiStepExecutor
 from .research import DeepResearchEngine, run_deep_research_background_task
 from .task_runner import BackgroundTaskRunner
 from .tasks import AssistantTaskService
@@ -63,6 +65,8 @@ class AgentOrchestrator:
         )
         self.tasks = AssistantTaskService(self.db, event_publisher=self.bus.publish)
         self.task_runner = BackgroundTaskRunner(self.tasks)
+        self.command_history = CommandHistoryService(self.db)
+        self.multistep = MultiStepExecutor(fs_access=self.fs_access, tasks=self.tasks, bus=self.bus)
         self.projects = ProjectRegistryService(self.db)
         self.workforce = DevWorkforceService(self.db, self.projects)
         self.documents = DocumentService(self.data_dir / "outputs" / "documents")

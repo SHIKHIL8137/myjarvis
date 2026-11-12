@@ -69,6 +69,30 @@ _STOPWORDS = {
     "in", "on", "at", "for", "and", "or", "it", "its", "this", "that", "with",
     "from", "by", "as", "my", "your", "our", "me", "you", "please",
 }
+_RISKY_VOICE_CMD_RE = re.compile(
+    r"\b(?:delete|remove|erase|overwrite|modify|move|rename|create|write|run|execute|confirm|approve|click|type|open\s+(?:url|file|app)|focus\s+window|screenshot|shutdown|restart|cancel)\b",
+    re.I,
+)
+
+
+def transcript_requires_voice_clarification(rec: "TranscriptRecord", prompt_text: str) -> str | None:
+    """Return a user-facing clarification message if an uncertain/low-confidence voice transcript tries to run an action."""
+    text = (prompt_text or "").strip()
+    if not text or not _RISKY_VOICE_CMD_RE.search(text):
+        return None
+    low_conf = rec.confidence is not None and float(rec.confidence) < 0.45
+    uncertain_tr = bool(rec.translation_verification and rec.translation_verification.get("uncertain"))
+    unsure = (
+        rec.status == "uncertain"
+        or low_conf
+        or (rec.review_needed and (rec.recognition_quality == "low" or uncertain_tr))
+    )
+    if not unsure:
+        return None
+    return (
+        f"I heard '{text}', but voice confidence or translation verification is uncertain. "
+        "Please repeat clearly or confirm in text before I run that action."
+    )
 _CROSS_TIME_EQUIV: dict[str, set[str]] = {
     "today": {"today", "ഇന്ന്", "आज", "இன்று"},
     "tomorrow": {"tomorrow", "നാളെ", "कल", "நாளை"},
@@ -166,7 +190,7 @@ def _extract_tech_and_entities(text: str, *, include_initial_cap: bool = False) 
         if len(tok) < 2:
             continue
         is_tech = (
-            ("_" in tok or "." in tok or "/" in tok or "::" in tok)
+            ("_" in tok or "." in tok or "/" in tok or "\\" in tok or ":" in tok or "::" in tok)
             or (any(c.isdigit() for c in tok) and any(c.isalpha() for c in tok))
             or (sum(1 for c in tok if c.isupper()) >= 2)
             or (any(c.isupper() for c in tok[1:]) and any(c.islower() for c in tok))

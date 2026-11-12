@@ -30,6 +30,7 @@ const hashWantsGraph = (): boolean => {
 export const App: React.FC = () => {
   const [dest, setDest] = useState<PrimaryDest>(destFromHash);
   const [showGraphStage, setShowGraphStage] = useState<boolean>(hashWantsGraph);
+  const [requestedDrawer, setRequestedDrawer] = useState<string | null>(null);
 
   useEffect(() => {
     const seg = (location.hash.replace(/^#\/?/, "").split("/")[0] || "").toLowerCase();
@@ -104,17 +105,18 @@ export const App: React.FC = () => {
       setShowGraphStage(true);
       return;
     }
-    if ("open_drawer" in ui) {
+    if ("open_drawer" in ui && ui.open_drawer) {
       if (ui.open_drawer === "explorer") {
         setDest("assistant");
         location.hash = "/assistant";
         setShowGraphStage(true);
-      } else if (ui.open_drawer === "system") {
+      } else if (ui.open_drawer === "settings") {
         setDest("settings");
         location.hash = "/settings";
-      } else if (ui.open_drawer) {
+      } else {
         setDest("assistant");
         location.hash = "/assistant";
+        setRequestedDrawer(ui.open_drawer);
       }
     }
   }, []);
@@ -355,6 +357,8 @@ export const App: React.FC = () => {
             searchInput={searchInput}
             searchQuery={searchQuery}
             onSearchInput={setSearchInput}
+            requestedDrawer={requestedDrawer}
+            onClearRequestedDrawer={() => setRequestedDrawer(null)}
           />
         ) : (
           <SettingsPanel {...shell} />

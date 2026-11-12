@@ -13,8 +13,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import fnmatch
+import hashlib
 import os
 from pathlib import Path
+import re
 import stat
 import sys
 import time
@@ -24,7 +26,16 @@ from sqlalchemy import select
 
 from .config import Settings, load_settings
 from .db.engine import DatabaseManager
-from .db.models import AuditEventRow, FilesystemPermissionRow, FilesystemPermissionRequestRow
+from .db.models import (
+    AuditEventRow,
+    FilesystemPermissionRow,
+    FilesystemPermissionRequestRow,
+    ProjectAliasRow,
+    ProjectRow,
+)
+from .departments.assistant.documents import parse_document
+from .security.pii_firewall import redact_secrets
+from .security.untrusted import wrap_untrusted
 
 _fs_audit_ring: list[dict[str, Any]] = []
 
@@ -407,12 +418,13 @@ class FilesystemAccessManager:
 
         policy = getattr(self.settings.filesystem, "sensitive_file_policy", "block") or "block"
         if flags and policy != "allow_explicit":
-            raise FilesystemSecurityError(
-                f"Sensitive file blocked by policy ({', '.join(flags)}): {resolved.name}",
-                code="sensitive_file_blocked",
-                path=str(resolved),
-                flags=flags,
-            )
+            if not (policy == "metadata_only" and operation == "read_metadata"):
+                raise FilesystemSecurityError(
+                    f"Sensitive file blocked by policy ({', '.join(flags)}): {resolved.name}",
+                    code="sensitive_file_blocked",
+                    path=str(resolved),
+                    flags=flags,
+                )
 
         ext = resolved.suffix.lower()
         if operation in WRITE_OPS:
@@ -1085,6 +1097,16 @@ class FilesystemAccessManager:
                     return matches
         return matches
 
+    @staticmethod
+    def _decode_text_bytes(raw: bytes) -> tuple[str, str]:
+        """Decode text bytes cleanly across common Windows/Unix encodings before lossy fallback."""
+        for enc in ("utf-8-sig", "utf-8", "utf-16", "cp1252"):
+            try:
+                return raw.decode(enc), enc
+            except UnicodeDecodeError:
+                continue
+        return raw.decode("utf-8", errors="replace"), "utf-8-lossy"
+
     async def execute_read_file(
         self,
         file_path: str | Path,
@@ -1092,6 +1114,8 @@ class FilesystemAccessManager:
         task_id: str | None = None,
         session_id: str | None = None,
         max_bytes: int | None = None,
+        start_line: int = 1,
+        max_lines: int | None = None,
     ) -> dict[str, Any]:
         target = await self._require_auth(file_path, "read_file", task_id=task_id, session_id=session_id)
         if not target.exists() or not target.is_file():
@@ -1099,22 +1123,208 @@ class FilesystemAccessManager:
         # TOCTOU re-check right before reading
         if _has_reparse_or_symlink(target):
             raise FilesystemSecurityError("TOCTOU check: symlink rejected.", code="symlink_blocked", path=str(target))
-        limit = int(max_bytes or getattr(self.settings.filesystem, "max_read_bytes", 524_288) or 524_288)
+        cfg_limit = getattr(self.settings.filesystem, "max_read_bytes", None) or getattr(self.settings.filesystem, "max_file_bytes", 524_288)
+        limit = int(max_bytes or cfg_limit or 524_288)
         st = target.stat()
-        if st.st_size > limit * 4:
-            raise FilesystemSecurityError(f"File size ({st.st_size} bytes) exceeds safe read limit.", code="file_too_large", path=str(target))
+        max_doc_bytes = max(limit * 4, 8 * 1024 * 1024)
         ext = target.suffix.lower()
+        doc_exts = {".pdf", ".docx", ".pptx", ".xlsx", ".xlsm"}
+        if st.st_size > (max_doc_bytes if ext in doc_exts else limit * 4):
+            raise FilesystemSecurityError(f"File size ({st.st_size} bytes) exceeds safe read limit.", code="file_too_large", path=str(target))
         allowed_exts = list(getattr(self.settings.filesystem, "allowed_extensions", []) or [])
         if allowed_exts and ext and ext not in [e.lower() for e in allowed_exts]:
             raise FilesystemSecurityError(f"File extension '{ext}' not permitted by allowed_extensions policy.", code="extension_blocked", path=str(target))
-        content = target.read_text(encoding="utf-8", errors="replace")[:limit]
+
+        doc_meta: dict[str, Any] = {}
+        encoding = "structured"
+        raw_bytes = target.read_bytes()
+        file_sha256 = hashlib.sha256(raw_bytes).hexdigest()
+
+        if ext in doc_exts:
+            try:
+                parsed = parse_document(target, max_chars=max(24_000, min(limit, 120_000)))
+            except Exception as e:
+                raise FilesystemSecurityError(
+                    f"Could not extract structured text from {target.name}: {e}",
+                    code="document_parse_error",
+                    path=str(target),
+                ) from e
+            text_full = str(parsed.get("content") or "")
+            doc_meta = dict(parsed.get("meta") or {})
+            truncated_by_doc = bool(parsed.get("truncated", False))
+        else:
+            if b"\x00" in raw_bytes[:4096]:
+                raise FilesystemSecurityError(
+                    f"Binary file '{target.name}' cannot be safely read as text (use metadata inspection instead).",
+                    code="binary_file",
+                    path=str(target),
+                )
+            text_full, encoding = self._decode_text_bytes(raw_bytes[: limit * 2])
+            if ext in (".csv", ".tsv"):
+                encoding = f"structured-{ext.lstrip('.')}/{encoding}"
+            truncated_by_doc = len(raw_bytes) > limit * 2
+
+        lines = text_full.splitlines()
+        total_lines = len(lines)
+        start_idx = max(0, int(start_line or 1) - 1)
+        if max_lines is not None and max_lines > 0:
+            selected_lines = lines[start_idx : start_idx + int(max_lines)]
+            sliced_text = "\n".join(selected_lines)
+            truncated_lines = (start_idx + int(max_lines)) < total_lines
+        else:
+            sliced_text = "\n".join(lines[start_idx:]) if start_idx > 0 else text_full
+            truncated_lines = False
+
+        truncated = truncated_by_doc or truncated_lines or len(sliced_text) > limit
+        content_slice = sliced_text[:limit]
+        clean_content, secret_hits = redact_secrets(content_slice)
+        untrusted = wrap_untrusted(
+            clean_content,
+            source_type="local_file",
+            source_id=file_sha256[:12],
+            url="",
+            title=target.name,
+            sha256=file_sha256,
+        )
         return {
             "path": str(target),
             "name": target.name,
+            "ext": ext,
+            "encoding": encoding,
             "size_bytes": st.st_size,
-            "truncated": st.st_size > limit,
-            "content": content,
+            "total_lines": total_lines,
+            "start_line": start_idx + 1,
+            "truncated": truncated,
+            "redacted": bool(secret_hits),
+            "redacted_kinds": sorted(set(secret_hits)),
+            "sha256": file_sha256,
+            "doc_meta": doc_meta,
+            "content": clean_content,
+            "untrusted_content": untrusted,
         }
+
+    async def execute_read_document(
+        self,
+        file_path: str | Path,
+        *,
+        task_id: str | None = None,
+        session_id: str | None = None,
+        max_chars: int = 32_000,
+    ) -> dict[str, Any]:
+        """Read and extract structured content from PDF, DOCX, PPTX, XLSX, CSV, Markdown, or text documents."""
+        return await self.execute_read_file(
+            file_path,
+            task_id=task_id,
+            session_id=session_id,
+            max_bytes=max(8_192, min(int(max_chars), 200_000)),
+        )
+
+    async def execute_get_project_structure(
+        self,
+        folder_path: str | Path,
+        *,
+        task_id: str | None = None,
+        session_id: str | None = None,
+        max_depth: int = 3,
+        max_entries: int = 120,
+    ) -> dict[str, Any]:
+        """Return bounded, redacted project directory structure inside an authorized root."""
+        target = await self._require_auth(folder_path, "list_directory", task_id=task_id, session_id=session_id)
+        if not target.exists() or not target.is_dir():
+            raise FilesystemSecurityError(f"Directory not found: {target}", code="not_found", path=str(target))
+        excluded = set(getattr(self.settings.filesystem, "excluded_dirs", []) or [])
+        depth_cap = max(1, min(int(max_depth), 6))
+        entry_cap = max(10, min(int(max_entries), 250))
+        tree_lines: list[str] = []
+        top_dirs: list[str] = []
+        top_files: list[str] = []
+        stack_markers: list[str] = []
+        marker_names = {
+            "pyproject.toml", "requirements.txt", "package.json", "alembic.ini",
+            "manage.py", "docker-compose.yml", "docker-compose.yaml", "dockerfile",
+            "cargo.toml", "go.mod", "pom.xml", ".env.example",
+        }
+        truncated = False
+
+        def _walk(cur: Path, depth: int, prefix: str) -> None:
+            nonlocal truncated
+            if len(tree_lines) >= entry_cap:
+                truncated = True
+                return
+            try:
+                children = sorted(cur.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+            except OSError:
+                return
+            for child in children:
+                if len(tree_lines) >= entry_cap:
+                    truncated = True
+                    return
+                if _has_reparse_or_symlink(child):
+                    continue
+                if child.is_dir() and child.name in excluded:
+                    continue
+                if _detect_sensitive_path(child, raw=str(child)):
+                    continue
+                is_dir = child.is_dir()
+                rel = str(child.relative_to(target))
+                tree_lines.append(f"{prefix}{child.name}{'/' if is_dir else ''}")
+                if depth == 1:
+                    (top_dirs if is_dir else top_files).append(child.name)
+                if not is_dir and child.name.lower() in marker_names:
+                    stack_markers.append(rel)
+                if is_dir and depth < depth_cap:
+                    _walk(child, depth + 1, prefix + "  ")
+
+        _walk(target, 1, "")
+        return {
+            "path": str(target),
+            "name": target.name,
+            "top_dirs": top_dirs,
+            "top_files": top_files,
+            "stack_markers": stack_markers,
+            "entry_count": len(tree_lines),
+            "truncated": truncated,
+            "tree": "\n".join(tree_lines),
+        }
+
+    async def execute_find_files_by_extension(
+        self,
+        folder_path: str | Path,
+        extensions: Iterable[str],
+        *,
+        task_id: str | None = None,
+        session_id: str | None = None,
+        max_results: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Find non-sensitive files matching any given extension inside an authorized directory."""
+        target = await self._require_auth(folder_path, "search_files", task_id=task_id, session_id=session_id)
+        if not target.exists() or not target.is_dir():
+            raise FilesystemSecurityError(f"Directory not found: {target}", code="not_found", path=str(target))
+        norm_exts = {("." + str(e).strip().lower().lstrip(".")) for e in extensions if str(e).strip()}
+        if not norm_exts:
+            return []
+        excluded = set(getattr(self.settings.filesystem, "excluded_dirs", []) or [])
+        limit = int(max_results or getattr(self.settings.filesystem, "max_results", 40) or 40)
+        matches: list[dict[str, Any]] = []
+        for root, dirs, files in os.walk(target, topdown=True, followlinks=False):
+            dirs[:] = [
+                d for d in sorted(dirs)
+                if d not in excluded and not _has_reparse_or_symlink(Path(root) / d) and not _detect_sensitive_path(Path(root) / d)
+            ]
+            for fn in sorted(files):
+                fp = Path(root) / fn
+                if fp.suffix.lower() not in norm_exts:
+                    continue
+                if _has_reparse_or_symlink(fp) or _detect_sensitive_path(fp, raw=str(fp)):
+                    continue
+                try:
+                    st = fp.stat()
+                    matches.append({"name": fn, "path": str(fp), "ext": fp.suffix.lower(), "size": st.st_size, "mtime": st.st_mtime})
+                except OSError:
+                    continue
+                if len(matches) >= limit:
+                    return matches
+        return matches
 
     async def execute_read_metadata(
         self,
@@ -1200,6 +1410,160 @@ class FilesystemAccessManager:
             return {"ok": True, "cancelled": False, "path": os.path.realpath(selected)}
         except Exception as e:
             return {"ok": False, "cancelled": True, "path": None, "reason": str(e)}
+
+    # ---------------- Approved Project Aliases ----------------
+
+    @staticmethod
+    def _normalize_alias_key(alias: str) -> str:
+        return " ".join(str(alias or "").strip().lower().split())
+
+    @staticmethod
+    def _alias_to_dict(row: ProjectAliasRow) -> dict[str, Any]:
+        return {
+            "id": row.id,
+            "alias": row.alias,
+            "display_name": row.display_name or row.alias,
+            "folder_path": row.folder_path,
+            "description": row.description or "",
+            "usage_count": int(row.usage_count or 0),
+            "last_used_at": row.last_used_at,
+            "created_at": row.created_at,
+            "updated_at": row.updated_at,
+        }
+
+    async def list_aliases(self) -> list[dict[str, Any]]:
+        async with self.db.async_session() as s:
+            rows = (
+                await s.execute(select(ProjectAliasRow).order_by(ProjectAliasRow.usage_count.desc(), ProjectAliasRow.alias.asc()))
+            ).scalars().all()
+            return [self._alias_to_dict(r) for r in rows]
+
+    async def upsert_alias(
+        self,
+        alias: str,
+        folder_path: str | Path,
+        *,
+        description: str = "",
+        actor: str = "owner",
+    ) -> dict[str, Any]:
+        if str(actor or "").strip().lower() not in OWNER_ACTORS:
+            raise FilesystemSecurityError("Only owner may create or modify project aliases.", code="owner_only_approval")
+        raw_alias = str(alias or "").strip()
+        key = self._normalize_alias_key(raw_alias)
+        if not key or len(key) > 100:
+            raise ValueError("Alias name must be 1..100 characters.")
+        resolved, _ = self._screen_target_security(folder_path, "list_directory")
+        if not resolved.exists() or not resolved.is_dir():
+            raise FilesystemSecurityError(f"Alias path must be an existing directory: {resolved}", code="not_a_directory")
+        now = time.time()
+        async with self.db.async_session() as s:
+            existing = (await s.execute(select(ProjectAliasRow).where(ProjectAliasRow.alias == key))).scalar_one_or_none()
+            if existing is None:
+                row = ProjectAliasRow(
+                    alias=key,
+                    display_name=raw_alias[:160],
+                    folder_path=str(resolved),
+                    description=str(description or "")[:400],
+                    created_at=now,
+                    updated_at=now,
+                )
+                s.add(row)
+            else:
+                row = existing
+                row.display_name = raw_alias[:160]
+                row.folder_path = str(resolved)
+                row.description = str(description or "")[:400]
+                row.updated_at = now
+            await s.commit()
+            await s.refresh(row)
+        await self._log_audit(
+            actor=actor,
+            decision="alias_saved",
+            target=str(resolved),
+            details={"alias": key, "folder_path": str(resolved)},
+        )
+        return self._alias_to_dict(row)
+
+    async def delete_alias(self, alias: str, *, actor: str = "owner") -> bool:
+        if str(actor or "").strip().lower() not in OWNER_ACTORS:
+            raise FilesystemSecurityError("Only owner may delete project aliases.", code="owner_only_approval")
+        key = self._normalize_alias_key(alias)
+        async with self.db.async_session() as s:
+            row = (await s.execute(select(ProjectAliasRow).where(ProjectAliasRow.alias == key))).scalar_one_or_none()
+            if row is None:
+                row = await s.get(ProjectAliasRow, alias)
+            if row is None:
+                return False
+            target = row.folder_path
+            await s.delete(row)
+            await s.commit()
+        await self._log_audit(actor=actor, decision="alias_deleted", target=target, details={"alias": key})
+        return True
+
+    async def resolve_alias(self, target_or_query: str) -> dict[str, Any] | None:
+        """Resolve an alias name, registered project name, or active approved folder basename (with optional subpath)."""
+        raw = str(target_or_query or "").strip().strip("\"'")
+        if not raw or re.match(r"^(?:[A-Za-z]:[/\\]|\\\\|/)", raw):
+            return None
+        key = self._normalize_alias_key(raw)
+        # Support "ERP_V2/backend/config.py" by matching leading segment against alias/project
+        parts = raw.replace("\\", "/").split("/", 1)
+        head_key = self._normalize_alias_key(parts[0])
+        subpath = parts[1].strip("/") if len(parts) > 1 and parts[1].strip("/") else ""
+
+        async with self.db.async_session() as s:
+            aliases = (await s.execute(select(ProjectAliasRow))).scalars().all()
+            projects = (await s.execute(select(ProjectRow))).scalars().all()
+            perms = (await s.execute(select(FilesystemPermissionRow).where(FilesystemPermissionRow.status == "active"))).scalars().all()
+
+        def _combine(base_path: str, source: str, name: str) -> dict[str, Any] | None:
+            base = Path(base_path)
+            if subpath:
+                cand = base / subpath
+                return {"source": source, "alias": name, "root_path": str(base), "resolved_path": str(cand)}
+            return {"source": source, "alias": name, "root_path": str(base), "resolved_path": str(base)}
+
+        # 1. Exact alias match (full key or head segment)
+        for a in aliases:
+            if a.alias in (key, head_key):
+                return _combine(a.folder_path, "project_alias", a.display_name or a.alias)
+        # 2. Exact registered project match
+        for p in projects:
+            pk = self._normalize_alias_key(p.name)
+            if pk in (key, head_key):
+                return _combine(p.root_path, "registered_project", p.name)
+        # 3. Active approved folder basename match
+        for perm in perms:
+            if perm.scope not in ("persistent", "session"):
+                continue
+            bk = self._normalize_alias_key(Path(perm.canonical_folder_path).name)
+            if bk and bk in (key, head_key):
+                return _combine(perm.canonical_folder_path, "approved_folder", Path(perm.canonical_folder_path).name)
+        # 4. Natural-language token mention of alias or registered project
+        lowered = f" {key} "
+        tokens = set(re.findall(r"[a-z0-9_.-]+", key))
+        best: tuple[int, dict[str, Any]] | None = None
+        for a in aliases:
+            if len(a.alias) >= 2 and (f" {a.alias} " in lowered or a.alias in tokens):
+                cand = _combine(a.folder_path, "project_alias", a.display_name or a.alias)
+                if cand and (best is None or len(a.alias) > best[0]):
+                    best = (len(a.alias), cand)
+        for p in projects:
+            pk = self._normalize_alias_key(p.name)
+            if len(pk) >= 2 and (f" {pk} " in lowered or pk in tokens):
+                cand = _combine(p.root_path, "registered_project", p.name)
+                if cand and (best is None or len(pk) > best[0]):
+                    best = (len(pk), cand)
+        for perm in perms:
+            if perm.scope not in ("persistent", "session"):
+                continue
+            bname = Path(perm.canonical_folder_path).name
+            bk = self._normalize_alias_key(bname)
+            if len(bk) >= 3 and (f" {bk} " in lowered or bk in tokens):
+                cand = _combine(perm.canonical_folder_path, "approved_folder", bname)
+                if cand and (best is None or len(bk) > best[0]):
+                    best = (len(bk), cand)
+        return best[1] if best else None
 
     # ---------------- Serializers ----------------
 

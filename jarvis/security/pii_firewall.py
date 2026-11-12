@@ -11,6 +11,10 @@ _SECRET_PATTERNS = [
     (re.compile(r"-----BEGIN (?:RSA |OPENSSH |EC |PGP )?PRIVATE KEY-----[\s\S]*?(?:-----END [^\n]+-----|$)"), "Private key block"),
     (re.compile(r"\bBearer\s+[A-Za-z0-9\-._~+/]+=*\b", re.I), "Bearer token"),
     (
+        re.compile(r"(?i)\b[a-z][a-z0-9+.-]*://[^:\s/@'\"]+:([^\s/@'\"]{4,})@"),
+        "URI/Database credential",
+    ),
+    (
         re.compile(r"(?i)\b(?:password|passwd|pwd|api[_-]?key|secret[_-]?key|access[_-]?token|auth[_-]?token)\s*[:=]\s*['\"]?([^\s'\"]{6,})"),
         "Credential/password assignment",
     ),
@@ -35,7 +39,7 @@ def redact_secrets(text: str, *, mask_email: bool = False) -> tuple[str, list[st
     for pat, label in _SECRET_PATTERNS:
         if pat.search(out):
             hits.append(label)
-            if "Credential/password" in label:
+            if "Credential/password" in label or "URI/Database" in label:
                 out = pat.sub(lambda m: m.group(0).replace(m.group(1), "[REDACTED-SECRET]"), out)
             else:
                 out = pat.sub(f"[REDACTED:{label}]", out)

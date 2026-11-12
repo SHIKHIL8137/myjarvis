@@ -73,3 +73,8 @@ Standard OpenAI Whisper `base`/`small` models are weaker on conversational Malay
 ## Custom Domain Vocabulary Hints
 
 Add technical names, project titles, frameworks, or personal nouns (one per line or comma-separated) to `config/vocab_hints.txt` or edit **Settings → Voice & Audio Devices → Domain Vocabulary Hints** without modifying code.
+
+## Database Migrations & Optional Desktop Automation Dependencies
+
+- **Database Schema**: Jarvis automatically migrates SQLite/PostgreSQL schemas via Alembic through revision `0008_p11_command_history` (adding `project_aliases` in `0007_p11_project_aliases` and `command_history` in `0008_p11_command_history`).
+- **Windows Telemetry & Desktop Controls**: CPU/RAM/Disk/Battery/Network telemetry uses `psutil`, NVIDIA GPU metrics query `nvidia-smi` when available, Win32 window/media controls use built-in Windows `ctypes` (`user32`), and high-risk input automation (`allow_input_automation`) remains disabled by default unless explicitly enabled in Settings.

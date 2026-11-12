@@ -147,3 +147,20 @@ Executed with real hardware (`[1] Microphone Array (Realtek(R) Audio)` at 44.1 k
   - Tab switching across `Voice & Audio`, `Permissions & Privacy`, `System & Data`, `AI Providers & Routing`, and back to `Voice & Audio` rendered cleanly with **0 console or page errors**.
   - Host `Speaker Output Device` (`4` options) and `Microphone Selection` (`4` options) populated; passive browser mic/camera selects populated with `0` `getUserMedia()` calls prior to explicit test clicks.
   - Fake-device lifecycle test (`--use-fake-device-for-media-stream --use-fake-ui-for-media-stream`): `Test Microphone` opened `1` audio track (`Stop Mic Test` active), `Test Camera` opened video track (`<video>` `srcObject` attached), navigating away to `JARVIS ASSISTANT` stopped all tracks (`liveTracks: 0`, `['audio:ended', 'video:ended']`), and reopening `SETTINGS` -> `Voice & Audio` kept `liveTracks: 0` with `0` errors. See [SETTINGS_UX_FIX_REPORT.md](SETTINGS_UX_FIX_REPORT.md).
+
+## Full Intelligence, Filesystem, Automation, Memory & Desktop Awareness Verification (Stages A–G, 2026-11-12)
+
+- **Full Non-Live Python Test Suite (`.venv\Scripts\python.exe -m pytest -m "not live and not pg" -q -rs`)**: **250 passed, 2 skipped, 2 deselected** (`342.93s` / `0:05:42`).
+  - Skipped (Docker daemon not running on host): `tests\test_p10_11_hardening.py:221`, `tests\test_p10_12_hardening.py:165`.
+  - Deselected by marker filter (`-m "not live and not pg"`): `2` live/PostgreSQL tests.
+  - Note: `-m "mic"` collects `0` tests (`254 deselected`); streaming/continuous voice tests in `tests/test_continuous_voice.py` (`16` tests) ran and passed inside the full suite.
+- **Focused Stage A–F Suites (`tests/test_stage_a_filesystem_intelligence.py` through `tests/test_stage_f_voice_personality.py`)**: **16 passed, 0 failed** (`22.11s`).
+- **Static Analysis & Migrations**:
+  - `ruff check` across 21 Stage A–G backend modules + 6 stage test files: `All checks passed!`.
+  - `mypy --follow-imports=silent` across 16 Stage A–G source files (`jarvis/actions.py`, `api_deps.py`, `api_v2.py`, `config.py`, `decision/classifier.py`, `filesystem_access.py`, `intent.py`, `persona.py`, `proactive.py`, `sysinfo.py`, `translator.py`, `agents/command_history.py`, `agents/multistep.py`, `memory/five_way.py`, `db/migrations/versions/0007_p11_project_aliases.py`, `db/migrations/versions/0008_p11_command_history.py`): `Success: no issues found in 16 source files`.
+  - Alembic temporary SQLite round-trip: `ALEMBIC_ROUNDTRIP: OK head -> 0006_voice_pipeline_upgrade -> head`.
+- **Frontend (`apps/frontend`)**:
+  - `npm --prefix apps/frontend test` (`node --test "src/**/*.test.ts"`): **12 passed, 0 failed** (`158.73ms`).
+  - `npm --prefix apps/frontend run build` (`tsc --noEmit && vite build`): exited `0`, `47 modules transformed` (`dist/assets/index-doQ_RsV1.js` `314.18 kB`, `dist/assets/index-c9dVwR21.css` `25.72 kB`).
+- **Measured Telemetry & Latency**: `sysinfo.snapshot(include_processes=False)` uncached `512.72 ms`; deterministic NL `system_health` chat execution `37.15 ms`; `NVIDIA GeForce GTX 1650` (`4.0 GB` VRAM, `51.0°C`), `15.35 GB` RAM, `2` fixed disks.
+- **Browser CDP Environment Note**: Interactive Chrome DevTools Protocol subagent verification was blocked on this host because Windows Chrome did not expose `DevToolsActivePort` (remote debugging disabled). See [JARVIS_IMPLEMENTATION_REPORT.md](JARVIS_IMPLEMENTATION_REPORT.md).

@@ -12,6 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import audit, graph_live
+from . import sysinfo
 from .actions import ActionPermissionError
 from .api_learning import create_learning_router
 from .api_v2 import create_v2_router
@@ -244,6 +245,30 @@ def create_app(settings: Settings | None = None, assistant: Assistant | None = N
     @app.get("/api/status")
     async def status():
         return await A().status()
+
+    @app.get("/api/sysinfo")
+    async def get_sysinfo(processes: bool = True, limit: int = 20):
+        a = A()
+        snap = await asyncio.to_thread(sysinfo.snapshot, a.settings.monitoring, include_processes=processes)
+        recent_tasks = await a.orchestrator.tasks.list_tasks(limit=10)
+        recent_cmds = await a.orchestrator.command_history.list_recent(limit=25)
+        suggestions = a.proactive.collect(sys_snapshot=snap, recent_tasks=recent_tasks, recent_commands=recent_cmds)
+        return {
+            **snap,
+            "history": sysinfo.monitor_history(limit=limit),
+            "suggestions": suggestions,
+            "jarvis": {
+                "os_state": a.os_state,
+                "mode": a.settings.mode,
+                "active_brain": a.settings.boot_brain,
+                "active_provider": a.settings.providers.active_provider,
+                "queued_tasks": len([t for t in recent_tasks if t["status"] in ("queued", "running", "planning")]),
+                "failed_tasks": len([t for t in recent_tasks if t["status"] == "failed"]),
+                "voice_paused": a.voice.paused,
+                "stt_ready": a.stt.ready,
+                "tts_ready": a.tts.ready,
+            },
+        }
 
     # ---- chat ----------------------------------------------------------------------------------------
     @app.post("/api/chat")

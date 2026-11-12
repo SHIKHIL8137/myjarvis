@@ -10,8 +10,10 @@ import time
 from typing import AsyncIterator
 
 from . import audit, commands, graph_live, sysinfo
+from .proactive import ProactiveSuggestionEngine
 from .actions import ActionExecutor
 from .aec import EchoReferenceBuffer, NLMSEchoCanceller
+from .agents.multistep import build_multistep_plan, classify_task_category
 from .agents.orchestrator import AgentOrchestrator
 from .brain import Brain, BrainError, ToolsUnsupportedError
 from .config import DATA, Settings
@@ -41,7 +43,7 @@ from .persona import build_messages
 from .retrieval import search
 from .search import SearchError, WebSearchService
 from .stt import Whisper
-from .translator import Translator
+from .translator import Translator, transcript_requires_voice_clarification
 from .tts import PiperTTS, Speaker, StreamingSpeechBuffer
 from .voice import VoiceLoop
 from .wakeword import WakeWord
@@ -72,6 +74,109 @@ def needs_web_intent(text: str, has_notes: bool = False) -> bool:
 def extract_web_query(text: str) -> str:
     q = WEB_QUERY_STRIP.sub("", (text or "").strip()).strip(" ?!.")
     return q or text.strip()
+
+
+def _fs_tools() -> list[dict]:
+    """Read-only, permission-gated filesystem & document inspection tool schemas for Brain."""
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": "fs_get_project_structure",
+                "description": "Inspect the directory tree, top folders/files, and stack markers of an approved folder or project alias.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Folder path or approved project alias (e.g. 'ERP_V2' or 'Documents')"},
+                        "max_depth": {"type": "integer", "description": "Directory traversal depth (1-5, default 3)"},
+                    },
+                    "required": ["path"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "fs_list_directory",
+                "description": "List immediate files and subdirectories inside an approved directory or project alias.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string", "description": "Directory path or project alias"}},
+                    "required": ["path"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "fs_search_files",
+                "description": "Search filenames recursively inside an approved folder or project alias.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Filename substring or keyword (e.g. 'database', 'config', 'settings')"},
+                        "path": {"type": "string", "description": "Optional root folder path or alias"},
+                    },
+                    "required": ["query"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "fs_find_files_by_extension",
+                "description": "Find files with specific extensions (e.g. ['.py', '.json']) inside an approved folder or alias.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "extensions": {"type": "array", "items": {"type": "string"}, "description": "File extensions such as ['.py', '.yaml']"},
+                        "path": {"type": "string", "description": "Optional root folder path or alias"},
+                    },
+                    "required": ["extensions"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "fs_read_file",
+                "description": "Read text/code/config file contents safely inside an approved folder (secrets auto-redacted). Can also read PDF/DOCX/XLSX.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Full path or alias-relative path (e.g. 'ERP_V2/backend/config.py')"},
+                        "start_line": {"type": "integer", "description": "Optional 1-based start line"},
+                        "max_lines": {"type": "integer", "description": "Optional max lines to return (default 200)"},
+                    },
+                    "required": ["path"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "fs_read_document",
+                "description": "Extract structured readable text and page/sheet/slide metadata from PDF, DOCX, PPTX, XLSX, CSV, or Markdown documents.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string", "description": "Full or alias-relative path to the document"}},
+                    "required": ["path"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "fs_read_metadata",
+                "description": "Inspect file or directory metadata (size, timestamps, type) without reading contents.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string", "description": "File or folder path or alias"}},
+                    "required": ["path"],
+                },
+            },
+        },
+    ]
 
 
 def _web_tools(allow_page_fetch: bool) -> list[dict]:
@@ -107,6 +212,15 @@ def _web_tools(allow_page_fetch: bool) -> list[dict]:
     return tools
 
 
+def _assistant_tools(*, include_fs: bool, include_web: bool, allow_page_fetch: bool) -> list[dict]:
+    tools: list[dict] = []
+    if include_fs:
+        tools.extend(_fs_tools())
+    if include_web:
+        tools.extend(_web_tools(allow_page_fetch))
+    return tools
+
+
 class Assistant:
     def __init__(self, settings: Settings, data_dir=DATA, brain: Brain | None = None, search_service: WebSearchService | None = None):
         self.settings = settings
@@ -117,6 +231,7 @@ class Assistant:
         self.memory_store = PersonalMemoryStore(self.data_dir / "memory" / "records.jsonl", settings.memory)
         self.filesystem = SafeFilesystem(settings.filesystem)
         self.actions = ActionExecutor(settings.actions, self.filesystem)
+        self.proactive = ProactiveSuggestionEngine(settings.proactive)
         self.brain = brain or Brain(settings)
         self.history = History(self.data_dir / "history.jsonl", settings.history_turns)
         self.conversation_refs: set[str] = set()  # graph ids the current conversation retrieved (live graph links)
@@ -351,10 +466,15 @@ class Assistant:
         audit.set_online_enabled(new.internet.enabled)
         self.settings.memory = new.memory
         self.memory_store.spec = new.memory
+        if getattr(self, "orchestrator", None) is not None and getattr(self.orchestrator, "memory", None) is not None:
+            self.orchestrator.memory.mem_spec = new.memory
         self.settings.filesystem = new.filesystem
         self.filesystem.spec = new.filesystem
         self.settings.actions = new.actions
         self.actions.spec = new.actions
+        self.settings.monitoring = new.monitoring
+        self.settings.proactive = new.proactive
+        self.proactive.update_spec(new.proactive)
         self.settings.providers = new.providers
         self.settings.learning = new.learning
         self.knowledge.spec = new.learning
@@ -479,6 +599,19 @@ class Assistant:
         if not prompt_text or self._cancel_event.is_set():
             return self._cancel_event.is_set()
 
+        if clarify_msg := self._voice_clarification_message(rec, prompt_text):
+            self.bus.publish({
+                "type": "clarification_required",
+                "message": clarify_msg,
+                "transcript_id": rec.id,
+                "heard": prompt_text,
+            })
+            self.history.add("user", prompt_text)
+            self.history.add("assistant", clarify_msg)
+            if self.settings.tts.enabled:
+                self.speaker.say(clarify_msg)
+            return True
+
         graph_live.publish_os_event(
             self.bus,
             "assistant.transcript.final",
@@ -523,11 +656,27 @@ class Assistant:
         self.bus.publish({"type": "transcript_record", **rec.to_dict()})
         use_translated = bool(rec.translated_text and rec.target_language == "en" and rec.detected_language != "en")
         prompt_text = ((rec.translated_text if use_translated else rec.corrected_transcript) or "").strip()
+        if clarify_msg := self._voice_clarification_message(rec, prompt_text):
+            self.bus.publish({
+                "type": "clarification_required",
+                "message": clarify_msg,
+                "transcript_id": rec.id,
+                "heard": prompt_text,
+            })
+            return
         if not prompt_text:
             return
         self.bus.publish({"type": "user", "text": prompt_text, "transcript_id": rec.id})
         async for ev in self.stream_turn(prompt_text, speak=True, source="voice"):
             self.bus.publish(ev)
+
+    def _voice_clarification_message(self, rec, prompt_text: str) -> str | None:
+        return transcript_requires_voice_clarification(rec, prompt_text)
+
+    def _build_messages(self, *args, **kwargs):
+        kwargs.setdefault("personality_preset", self.settings.preferences.personality_preset)
+        kwargs.setdefault("custom_instructions", self.settings.preferences.custom_instructions)
+        return build_messages(*args, **kwargs)
 
     def _gather_context(self, text: str) -> dict:
         """Collect provenance-separated personal memory, history, feedback, notes, and indexed knowledge."""
@@ -537,8 +686,39 @@ class Assistant:
             q = f"{prev} {text}"
         hits = [(n, s) for n, s in search(self.store.all(), q, self.settings.context_notes) if s >= MIN_SCORE]
 
-        mem_hits = [(r, s) for r, s in self.memory_store.search(text, limit=3) if s >= 1.5]
-        memories_ctx = [(r.category, r.text) for r, _ in mem_hits]
+        memories_ctx: list[tuple[str, str]] = []
+        memory_ids: list[str] = []
+        seen_mem_texts: set[str] = set()
+        five_way = getattr(getattr(self, "orchestrator", None), "memory", None)
+        mem_enabled = bool(getattr(self.settings.memory, "enabled", True))
+        if mem_enabled:
+            mem_hits = [(r, s) for r, s in self.memory_store.search(q, limit=4) if s >= 1.5]
+            for r, _ in mem_hits:
+                if five_way is not None and not five_way.is_category_enabled(r.category):
+                    continue
+                norm_t = r.text.strip().lower()
+                if norm_t and norm_t not in seen_mem_texts:
+                    seen_mem_texts.add(norm_t)
+                    memories_ctx.append((r.category, r.text))
+                    memory_ids.append(r.id)
+            if five_way is not None:
+                try:
+                    five_hits = five_way.search_personal_memory(q, k=4)
+                    ret_ids: list[str] = []
+                    for fh in five_hits:
+                        if float(fh.get("score") or 0.0) < 0.25:
+                            continue
+                        ct = str(fh.get("content") or "").strip()
+                        norm_t = ct.lower()
+                        if ct and norm_t not in seen_mem_texts:
+                            seen_mem_texts.add(norm_t)
+                            memories_ctx.append((str(fh.get("memory_type") or "explicit"), ct))
+                            memory_ids.append(str(fh["id"]))
+                            ret_ids.append(str(fh["id"]))
+                    if ret_ids:
+                        five_way.mark_retrieved(ret_ids)
+                except Exception:
+                    pass
 
         win = self.history.window()
         win_contents = {m["content"] for m in win}
@@ -555,13 +735,63 @@ class Assistant:
             "hits": hits,
             "nodes": [n.id for n, _ in hits],
             "notes_ctx": [(n.title, n.excerpt[:self.settings.context_chars]) for n, _ in hits],
-            "memories_ctx": memories_ctx,
-            "memory_ids": [r.id for r, _ in mem_hits],
+            "memories_ctx": memories_ctx[:6],
+            "memory_ids": memory_ids[:6],
             "history_ctx": history_ctx,
             "feedback_ctx": feedback_ctx,
             "knowledge_ctx": knowledge_ctx,
             "knowledge_sources": [{"source_id": k["source_id"], "title": k["title"], "trust": k["trust"]} for k in kb_raw],
         }
+
+    def _record_adaptive_turn_memory(
+        self,
+        text: str,
+        *,
+        cmd_name: str = "",
+        intent: str = "",
+        paths: list[str] | None = None,
+        project_alias: str | None = None,
+        ok: bool = True,
+    ) -> None:
+        """Persist safe preference/project/command/conversation context without storing secrets or failed calls."""
+        if not ok or not bool(getattr(self.settings.memory, "enabled", True)):
+            return
+        five_way = getattr(getattr(self, "orchestrator", None), "memory", None)
+        if five_way is None:
+            return
+        from .security.pii_firewall import detect_secret
+
+        cleaned = (text or "").strip()
+        if not cleaned or detect_secret(cleaned):
+            return
+        try:
+            if project_alias and (paths or []):
+                names = ", ".join(Path(p).name for p in (paths or [])[:4])
+                five_way.record_adaptive_memory(
+                    content=f"Project {project_alias} inspection touched: {names}",
+                    category="project_memory",
+                    topic=str(project_alias),
+                    title=f"Project {project_alias}",
+                    source="command_derived",
+                )
+            if cmd_name and cmd_name not in ("task_status", "repeat_last_command", "show_recent_tasks", "show_failed_tasks", "last_request_status", "continue_task", "cancel_task"):
+                five_way.record_adaptive_memory(
+                    content=f"Executed workflow '{intent or cmd_name}': {cleaned[:160]}",
+                    category="command_memory",
+                    topic=intent or cmd_name,
+                    title=f"Command: {intent or cmd_name}",
+                    source="command_derived",
+                )
+            elif len(cleaned.split()) >= 6 and "?" not in cleaned[:3]:
+                five_way.record_adaptive_memory(
+                    content=cleaned[:240],
+                    category="conversation_memory",
+                    topic=intent or "conversation",
+                    title=cleaned[:50],
+                    source="conversation_derived",
+                )
+        except Exception:
+            pass
 
     def _context(self, text: str):
         q = text
@@ -634,9 +864,139 @@ class Assistant:
 
     async def _brain_complete(self, msgs: list[dict]) -> str:
         parts: list[str] = []
-        async for piece in self.brain.stream(msgs):
-            parts.append(piece)
+        async for ev in self.brain.stream_events(msgs):
+            if ev.get("type") == "token" and ev.get("text"):
+                parts.append(str(ev["text"]))
         return "".join(parts).strip()
+
+    async def _iter_tool_turn(
+        self,
+        msgs: list[dict],
+        *,
+        tools: list[dict] | None,
+        speak: bool,
+        cancel_event: asyncio.Event | None,
+        source: str,
+        task_id: str | None,
+        original_text: str,
+        turn_ctx: dict,
+    ) -> AsyncIterator[dict]:
+        """Unified multi-round Brain + tool loop for both Local and Online modes with clean fallback."""
+        gw = getattr(self.orchestrator, "gateway", None)
+        active_prov = getattr(self.settings.providers, "active_provider", "ollama") or "ollama"
+        use_gateway = gw is not None and active_prov != "ollama"
+
+        if use_gateway or not tools:
+            out_buf: list[str] = []
+            async for ev in self._stream_llm_with_tts(msgs, speak=speak, cancel_event=cancel_event, answer_out=out_buf):
+                yield ev
+                if ev["type"] == "interrupted":
+                    turn_ctx["interrupted"] = True
+                    return
+            turn_ctx["answer"] = out_buf[-1] if out_buf else ""
+            return
+
+        cur_msgs = list(msgs)
+        chunker = StreamingSpeechBuffer()
+        tools_supported = True
+        max_rounds = 4
+        answer = ""
+
+        for round_idx in range(max_rounds):
+            if cancel_event and cancel_event.is_set():
+                self.speaker.stop()
+                yield {"type": "interrupted"}
+                turn_ctx["interrupted"] = True
+                return
+
+            round_tools = tools if round_idx < max_rounds - 1 else None
+            round_answer = ""
+            round_calls: list[dict] = []
+            try:
+                async for ev in self.brain.stream_events(cur_msgs, tools=round_tools):
+                    if cancel_event and cancel_event.is_set():
+                        self.speaker.stop()
+                        yield {"type": "interrupted"}
+                        turn_ctx["interrupted"] = True
+                        return
+                    if ev["type"] == "token" and ev.get("text"):
+                        piece = ev["text"]
+                        round_answer += piece
+                        yield {"type": "token", "text": piece}
+                        if speak:
+                            for sentence in chunker.feed(piece):
+                                self.speaker.say_chunk(sentence, precleaned=True)
+                    elif ev["type"] == "tool_calls" and ev.get("calls"):
+                        round_calls = ev["calls"]
+            except ToolsUnsupportedError:
+                tools_supported = False
+                turn_ctx["tools_supported"] = False
+                if round_answer:
+                    yield {"type": "reset_answer"}
+                    if speak:
+                        self.speaker.stop()
+                chunker.reset()
+                if turn_ctx.get("defer_unsupported_to_web"):
+                    turn_ctx["answer"] = ""
+                    return
+                out_buf = []
+                async for ev in self._stream_llm_with_tts(cur_msgs, speak=speak, cancel_event=cancel_event, answer_out=out_buf):
+                    yield ev
+                    if ev["type"] == "interrupted":
+                        turn_ctx["interrupted"] = True
+                        return
+                turn_ctx["answer"] = out_buf[-1] if out_buf else ""
+                return
+
+            if not round_calls:
+                answer = round_answer
+                break
+
+            if round_answer:
+                yield {"type": "reset_answer"}
+                if speak:
+                    self.speaker.stop()
+            chunker.reset()
+            assistant_calls = [
+                {"type": "function", "function": {"name": c["name"], "arguments": c["arguments"]}}
+                for c in round_calls
+            ]
+            cur_msgs = [*cur_msgs, {"role": "assistant", "content": "", "tool_calls": assistant_calls}]
+            for c in round_calls[:3]:
+                if cancel_event and cancel_event.is_set():
+                    self.speaker.stop()
+                    yield {"type": "interrupted"}
+                    turn_ctx["interrupted"] = True
+                    return
+                q_str = str(c["arguments"].get("query") or c["arguments"].get("path") or c["arguments"].get("url") or "")
+                t_status = "searching" if c["name"] in ("web_search", "fetch_webpage") else "executing"
+                yield {"type": "tool", "status": t_status, "name": c["name"], "query": q_str}
+                self._set_os_state("Executing", source=source, detail=c["name"])
+                t_tool = time.perf_counter()
+                graph_live.tool_invoked(self, c["name"], query=q_str)
+                tool_out, srcs = await self._execute_tool(
+                    c,
+                    task_id=task_id,
+                    turn_ctx=turn_ctx,
+                    original_text=original_text,
+                )
+                ok_flag = '"error"' not in tool_out[:60] and '"blocked": true' not in tool_out
+                graph_live.tool_used(self, c["name"], query=q_str, ok=ok_flag, duration_ms=(time.perf_counter() - t_tool) * 1000.0)
+                turn_ctx.setdefault("tools_used", []).append(c["name"])
+                if srcs:
+                    turn_ctx.setdefault("web_sources", []).extend(srcs)
+                if turn_ctx.get("permission_request"):
+                    turn_ctx["tools_supported"] = tools_supported
+                    turn_ctx["answer"] = ""
+                    return
+                cur_msgs.append({"role": "tool", "content": tool_out})
+            self._set_os_state("Thinking", source=source)
+
+        turn_ctx["tools_supported"] = tools_supported
+        turn_ctx["answer"] = answer
+        if speak and answer.strip():
+            for sentence in chunker.flush():
+                self.speaker.say_chunk(sentence, precleaned=True)
 
     # ---- learning & training helpers -----------------------------------------------------------------
     def learning_overview(self) -> dict:
@@ -722,12 +1082,221 @@ class Assistant:
     def rollback_model(self, target_version_id: str | None = None) -> dict:
         return rollback_active_model(self.registry, target_version_id=target_version_id, audit_log=self.learning_audit)
 
-    async def _execute_tool(self, call: dict) -> tuple[str, list[dict]]:
-        """Execute ONLY approved backend web tools; wrap untrusted results strictly before returning to LLM."""
+    async def _resolve_fs_target_arg(self, raw_path: str | None) -> str:
+        """Resolve an explicit path, alias, registered project, known user folder, or default approved root."""
+        raw = str(raw_path or "").strip().strip("\"'")
+        if raw:
+            resolved_alias = await self.orchestrator.fs_access.resolve_alias(raw)
+            if resolved_alias:
+                return str(resolved_alias["resolved_path"])
+            low = raw.lower()
+            if low in ("documents", "my documents"):
+                return str(Path.home() / "Documents")
+            if low in ("downloads", "my downloads"):
+                return str(Path.home() / "Downloads")
+            if low in ("desktop", "my desktop"):
+                return str(Path.home() / "Desktop")
+            if low in ("pictures", "my pictures"):
+                return str(Path.home() / "Pictures")
+            if low in ("workspace", "notes"):
+                roots = list(getattr(self.settings.filesystem, "allowed_roots", []) or [])
+                if roots:
+                    return str(roots[0])
+            return raw
+
+        active_perms = [
+            p
+            for p in await self.orchestrator.fs_access.list_permissions(status="active")
+            if p.get("scope") in ("session", "persistent")
+        ]
+        if active_perms:
+            return str(active_perms[0]["canonical_folder_path"])
+        aliases = await self.orchestrator.fs_access.list_aliases()
+        if aliases:
+            return str(aliases[0]["folder_path"])
+        roots = list(getattr(self.settings.filesystem, "allowed_roots", []) or [])
+        return str(roots[0]) if roots else str(self.settings.notes_path)
+
+    async def _execute_fs_tool(
+        self,
+        name: str,
+        args: dict,
+        *,
+        task_id: str | None = None,
+        turn_ctx: dict | None = None,
+        original_text: str = "",
+    ) -> str:
+        """Execute a read-only, permission-gated filesystem tool and wrap untrusted outputs."""
+        from jarvis.filesystem_access import READ_OPS
+        from jarvis.security.untrusted import UNTRUSTED_DATA_POLICY, wrap_untrusted
+
+        fs_access = self.orchestrator.fs_access
+        raw_path = args.get("path") or args.get("folder") or ""
+        if not raw_path and original_text:
+            alias_hit = await fs_access.resolve_alias(original_text)
+            if alias_hit:
+                raw_path = str(alias_hit["resolved_path"])
+        target = await self._resolve_fs_target_arg(str(raw_path or ""))
+
+        op_map = {
+            "fs_get_project_structure": "list_directory",
+            "fs_list_directory": "list_directory",
+            "fs_search_files": "search_files",
+            "fs_find_files_by_extension": "search_files",
+            "fs_read_file": "read_file",
+            "fs_read_document": "read_file",
+            "fs_read_metadata": "read_metadata",
+        }
+        req_op = op_map.get(name, "read_file")
+        chk = await fs_access.authorize(target, req_op, task_id=task_id)
+        if chk.blocked:
+            return json.dumps({"error": chk.reason, "blocked": True, "code": chk.code, "path": chk.canonical_path}, ensure_ascii=False)
+        if not chk.allowed:
+            if turn_ctx is not None and not turn_ctx.get("permission_request"):
+                req_ops = list(READ_OPS) if name in ("fs_get_project_structure", "fs_read_file", "fs_read_document") else [req_op, "list_directory", "read_metadata"]
+                try:
+                    req = await fs_access.create_permission_request(
+                        target,
+                        req_ops,
+                        task_id=task_id,
+                        reason=f"Tool `{name}` needs permission for `{target}`",
+                        access_duration="once",
+                        deferred_action={
+                            "kind": "chat_turn_resume",
+                            "tool": name,
+                            "arguments": args,
+                            "folder": target,
+                            "original_text": original_text,
+                        },
+                    )
+                    turn_ctx["permission_request"] = req
+                except FilesystemSecurityError as exc:
+                    return json.dumps({"error": str(exc), "blocked": True, "code": exc.code}, ensure_ascii=False)
+            return json.dumps(
+                {
+                    "status": "permission_required",
+                    "path": chk.canonical_path,
+                    "message": "Owner permission required. Wait for owner decision via permission card.",
+                },
+                ensure_ascii=False,
+            )
+
+        try:
+            if name == "fs_get_project_structure":
+                res = await fs_access.execute_get_project_structure(
+                    target,
+                    task_id=task_id,
+                    max_depth=int(args.get("max_depth") or 3),
+                )
+                if turn_ctx is not None:
+                    turn_ctx.setdefault("paths", []).append(res["path"])
+                graph_live.filesystem_activity(self, task_id=task_id, folder_path=res["path"], files=[], operation="list_directory")
+                wrapped = wrap_untrusted(res["tree"], source_type="local_file", source_id="project_tree", title=res["name"])
+                return json.dumps(
+                    {
+                        "policy": UNTRUSTED_DATA_POLICY,
+                        "path": res["path"],
+                        "top_dirs": res["top_dirs"],
+                        "top_files": res["top_files"],
+                        "stack_markers": res["stack_markers"],
+                        "truncated": res["truncated"],
+                        "untrusted_tree": wrapped,
+                    },
+                    ensure_ascii=False,
+                )
+
+            if name == "fs_list_directory":
+                entries = await fs_access.execute_list_directory(target, task_id=task_id)
+                if turn_ctx is not None:
+                    turn_ctx.setdefault("paths", []).extend(e["path"] for e in entries[:15])
+                graph_live.filesystem_activity(self, task_id=task_id, folder_path=target, files=entries, operation="list_directory")
+                return json.dumps({"path": target, "count": len(entries), "entries": entries[:40]}, ensure_ascii=False)
+
+            if name == "fs_search_files":
+                query = str(args.get("query") or "").strip()
+                matches = await fs_access.execute_search_files(target, query=query, task_id=task_id)
+                if turn_ctx is not None:
+                    turn_ctx.setdefault("paths", []).extend(m["path"] for m in matches[:15])
+                graph_live.filesystem_activity(self, task_id=task_id, folder_path=target, files=matches, operation="search_files")
+                return json.dumps({"path": target, "query": query, "count": len(matches), "matches": matches[:25]}, ensure_ascii=False)
+
+            if name == "fs_find_files_by_extension":
+                exts = list(args.get("extensions") or [])
+                matches = await fs_access.execute_find_files_by_extension(target, exts, task_id=task_id)
+                if turn_ctx is not None:
+                    turn_ctx.setdefault("paths", []).extend(m["path"] for m in matches[:15])
+                graph_live.filesystem_activity(self, task_id=task_id, folder_path=target, files=matches, operation="search_files")
+                return json.dumps({"path": target, "extensions": exts, "count": len(matches), "matches": matches[:25]}, ensure_ascii=False)
+
+            if name in ("fs_read_file", "fs_read_document"):
+                if name == "fs_read_document":
+                    doc = await fs_access.execute_read_document(target, task_id=task_id)
+                else:
+                    start_ln = int(args.get("start_line") or 1)
+                    max_ln = int(args.get("max_lines") or 200)
+                    doc = await fs_access.execute_read_file(
+                        target,
+                        task_id=task_id,
+                        start_line=start_ln,
+                        max_lines=max_ln,
+                        max_bytes=28_000,
+                    )
+                if turn_ctx is not None:
+                    turn_ctx.setdefault("paths", []).append(doc["path"])
+                    if doc.get("redacted"):
+                        turn_ctx.setdefault("warnings", []).append(f"Secrets redacted in {doc['name']}: {', '.join(doc.get('redacted_kinds') or [])}")
+                    if doc.get("truncated"):
+                        turn_ctx.setdefault("warnings", []).append(f"Truncated preview of {doc['name']} ({doc.get('total_lines')} total lines)")
+                fitem = {"name": doc["name"], "path": doc["path"], "size_bytes": doc["size_bytes"]}
+                graph_live.filesystem_activity(self, task_id=task_id, folder_path=str(Path(doc["path"]).parent), files=[fitem], operation="read_file")
+                return json.dumps(
+                    {
+                        "policy": UNTRUSTED_DATA_POLICY,
+                        "path": doc["path"],
+                        "name": doc["name"],
+                        "encoding": doc.get("encoding"),
+                        "total_lines": doc.get("total_lines"),
+                        "truncated": doc.get("truncated"),
+                        "redacted": doc.get("redacted"),
+                        "redacted_kinds": doc.get("redacted_kinds"),
+                        "doc_meta": doc.get("doc_meta"),
+                        "untrusted_content": doc.get("untrusted_content"),
+                    },
+                    ensure_ascii=False,
+                )
+
+            if name == "fs_read_metadata":
+                meta = await fs_access.execute_read_metadata(target, task_id=task_id)
+                if turn_ctx is not None:
+                    turn_ctx.setdefault("paths", []).append(meta["path"])
+                return json.dumps(meta, ensure_ascii=False)
+        except FilesystemSecurityError as exc:
+            return json.dumps({"error": str(exc), "code": exc.code, "path": exc.path}, ensure_ascii=False)
+
+        return json.dumps({"error": f"tool {name!r} is not permitted"})
+
+    async def _execute_tool(
+        self,
+        call: dict,
+        *,
+        task_id: str | None = None,
+        turn_ctx: dict | None = None,
+        original_text: str = "",
+    ) -> tuple[str, list[dict]]:
+        """Execute ONLY approved backend web or scoped filesystem tools; wrap untrusted results strictly before returning to LLM."""
         from jarvis.security.untrusted import UNTRUSTED_DATA_POLICY, wrap_untrusted
 
         name = call.get("name", "")
         args = call.get("arguments") or {}
+        if name.startswith("fs_"):
+            out_json = await self._execute_fs_tool(
+                name,
+                args,
+                task_id=task_id,
+                turn_ctx=turn_ctx,
+                original_text=original_text,
+            )
+            return out_json, []
         if name == "web_search":
             query = str(args.get("query") or "").strip()
             if not query:
@@ -1042,6 +1611,95 @@ class Assistant:
             "ok": len(ast_issues) == 0,
         }
 
+    async def _synthesize_multistep_answer(
+        self,
+        goal: str,
+        step_outputs: dict,
+        paths: list[str],
+        warnings: list[str],
+    ) -> str:
+        """Synthesize verified multi-step filesystem evidence through Brain with untrusted content boundaries."""
+        from .security.untrusted import UNTRUSTED_DATA_POLICY, wrap_untrusted
+
+        evidence_parts: list[str] = []
+        for skey, val in step_outputs.items():
+            if not val:
+                continue
+            if skey.startswith("step-1") and isinstance(val, dict) and val.get("tree"):
+                evidence_parts.append(f"Structure ({val.get('path')}):\n{str(val['tree'])[:1600]}")
+            elif skey.startswith("step-2") and isinstance(val, dict) and val.get("matches"):
+                matched_names = ", ".join(m.get("name", "") for m in (val.get("matches") or [])[:12])
+                evidence_parts.append(f"Matched files in {val.get('root')}: {matched_names}")
+            elif isinstance(val, list):
+                for item in val[:3]:
+                    if isinstance(item, dict) and item.get("content"):
+                        evidence_parts.append(
+                            f"File: {item.get('path')}\n{str(item.get('content'))[:2800]}"
+                        )
+
+        evidence_blob = "\n\n".join(evidence_parts) if evidence_parts else f"Verified paths: {', '.join(paths[:10]) or 'none'}."
+        wrapped = wrap_untrusted(
+            evidence_blob,
+            source_type="local_file",
+            source_id="multistep_evidence",
+        )
+        today = datetime.datetime.now().strftime("%A %d %B %Y, %H:%M")
+        msgs = self._build_messages(
+            self.history.window(),
+            goal,
+            [("Multi-step verified evidence", wrapped)],
+            today,
+            online=bool(self.settings.internet.enabled and audit.is_online_enabled()),
+        )
+        msgs.insert(1, {"role": "system", "content": UNTRUSTED_DATA_POLICY})
+        try:
+            ans = await self._brain_complete(msgs)
+            if ans:
+                return ans
+        except BrainError:
+            pass
+        files_list = ", ".join(Path(p).name for p in paths[:8]) or "none"
+        return f"Completed multi-step inspection of `{goal[:80]}`. Verified paths touched: {files_list}."
+
+    async def _run_multistep_workflow(
+        self,
+        text: str,
+        *,
+        resolved_target: str | None,
+        alias_name: str | None = None,
+        task_id: str | None = None,
+        source: str = "text",
+        cancel_event: asyncio.Event | None = None,
+        steps_override: list[dict] | None = None,
+        resume_checkpoint: dict | None = None,
+    ) -> dict:
+        """Execute a decomposed multi-step task with DB checkpoints and permission pause/resume."""
+        steps = list(steps_override or build_multistep_plan(text, resolved_target=resolved_target, alias_name=alias_name))
+        if task_id and steps:
+            await self.orchestrator.tasks.update_task(
+                task_id,
+                checkpoint_patch={"multistep_plan": steps, "resolved_target": resolved_target, "project_alias": alias_name},
+            )
+        self._set_os_state("Planning", source=source, detail=f"multi_step:{len(steps)}")
+        res = await self.orchestrator.multistep.execute(
+            goal=text,
+            steps=steps,
+            task_id=task_id,
+            synthesize_fn=self._synthesize_multistep_answer,
+            cancel_event=cancel_event,
+            source=source,
+            resume_checkpoint=resume_checkpoint,
+        )
+        if res.get("command") == "permission_required" and res.get("permission_request"):
+            req = res["permission_request"]
+            self._set_os_state("Waiting for approval", source=source, detail=req["canonical_path"])
+            self.bus.publish({"type": "permission_requested", "request": req, "task_id": task_id})
+        if alias_name:
+            res["project_alias"] = alias_name
+        if resolved_target:
+            res["target_path"] = resolved_target
+        return res
+
     async def execute_deferred_action(self, req_data: dict, *, task_id: str | None = None) -> dict:
         """Execute a deferred filesystem/project operation immediately after owner approval."""
         deferred = dict(req_data.get("deferred_action") or {})
@@ -1093,12 +1751,105 @@ class Assistant:
                     await self.orchestrator.fs_access.consume_task_once_permissions(task_id)
                 return {"command": "filesystem_write", "reply": reply, "paths": [out["path"]], "file": out, "ok": True}
 
+            if kind == "chat_turn_resume":
+                tool_name = str(deferred.get("tool") or "fs_list_directory")
+                tool_args = dict(deferred.get("arguments") or {})
+                orig_text = str(deferred.get("original_text") or "")
+                turn_ctx: dict = {"paths": [], "warnings": [], "web_sources": [], "tools_used": []}
+                first_out, _ = await self._execute_tool(
+                    {"name": tool_name, "arguments": tool_args},
+                    task_id=task_id,
+                    turn_ctx=turn_ctx,
+                    original_text=orig_text,
+                )
+                turn_ctx["tools_used"].append(tool_name)
+                if orig_text:
+                    today = datetime.datetime.now().strftime("%A %d %B %Y, %H:%M")
+                    msgs = self._build_messages(
+                        self.history.window(),
+                        orig_text,
+                        [],
+                        today,
+                        online=bool(self.settings.internet.enabled and audit.is_online_enabled()),
+                    )
+                    msgs.append({"role": "assistant", "content": "", "tool_calls": [{"type": "function", "function": {"name": tool_name, "arguments": tool_args}}]})
+                    msgs.append({"role": "tool", "content": first_out})
+                    tools = _assistant_tools(include_fs=True, include_web=False, allow_page_fetch=False)
+                    async for ev in self._iter_tool_turn(
+                        msgs,
+                        tools=tools,
+                        speak=False,
+                        cancel_event=None,
+                        source="permission_resume",
+                        task_id=task_id,
+                        original_text=orig_text,
+                        turn_ctx=turn_ctx,
+                    ):
+                        _ = ev
+                    reply = str(turn_ctx.get("answer") or "").strip()
+                else:
+                    reply = first_out[:800]
+                if not reply:
+                    reply = f"Completed `{tool_name}` inside `{folder}`."
+                if task_id:
+                    await self.orchestrator.tasks.update_task(
+                        task_id,
+                        status="completed",
+                        append_tool=tool_name,
+                        generated_files=turn_ctx.get("paths") or [],
+                        current_step="Completed approved filesystem inspection",
+                        result=reply,
+                    )
+                    await self.orchestrator.fs_access.consume_task_once_permissions(task_id)
+                return {
+                    "command": "filesystem_ops",
+                    "reply": reply,
+                    "paths": turn_ctx.get("paths") or [],
+                    "warnings": turn_ctx.get("warnings") or [],
+                    "tools_used": turn_ctx.get("tools_used") or [],
+                    "ok": True,
+                }
+
+            if kind == "multistep_resume":
+                snap = await self.orchestrator.tasks.get_task(task_id) if task_id else None
+                cp = dict((snap or {}).get("checkpoint_json") or (snap or {}).get("checkpoint") or {})
+                return await self._run_multistep_workflow(
+                    str(deferred.get("goal") or deferred.get("original_text") or (snap or {}).get("user_request") or ""),
+                    resolved_target=str(deferred.get("folder") or folder or ""),
+                    task_id=task_id,
+                    steps_override=list(deferred.get("steps") or cp.get("multistep_plan") or []),
+                    resume_checkpoint=cp,
+                )
+
             if kind == "fs_read":
                 target_path = str(deferred.get("target") or folder)
                 doc = await self.orchestrator.fs_access.execute_read_file(target_path, task_id=task_id)
                 fitem = {"name": doc["name"], "path": doc["path"], "size_bytes": doc["size_bytes"]}
                 graph_live.filesystem_activity(self, task_id=task_id, folder_path=str(Path(doc["path"]).parent), files=[fitem], operation="read_file")
-                reply = f"Read `{doc['path']}` ({doc['size_bytes']} bytes): {doc['content'][:300]}"
+                orig_text = str(deferred.get("original_text") or "")
+                notices: list[str] = []
+                if doc.get("redacted"):
+                    notices.append(f"secrets redacted: {', '.join(doc.get('redacted_kinds') or [])}")
+                if doc.get("truncated"):
+                    notices.append("content truncated to safe preview")
+                notice_txt = f" [{' ; '.join(notices)}]" if notices else ""
+                reply = f"Read `{doc['path']}` ({doc['size_bytes']} bytes){notice_txt}: {doc['content'][:300]}"
+                if orig_text and re.search(r"\b(?:explain|summarize|what\s+is|analyze|describe)\b", orig_text, re.I):
+                    try:
+                        today = datetime.datetime.now().strftime("%A %d %B %Y, %H:%M")
+                        synth = await self._brain_complete(
+                            self._build_messages(
+                                [],
+                                f"{orig_text}\n\nFile: {doc['path']}{notice_txt}",
+                                [],
+                                today,
+                                untrusted_documents=[{"name": doc["name"], "path": doc["path"], "content": doc["content"], "sha256": doc.get("sha256", "")}],
+                            )
+                        )
+                        if synth:
+                            reply = synth + (f"\n\nNotice: {'; '.join(notices)}." if notices else "")
+                    except Exception:
+                        pass
                 if task_id:
                     await self.orchestrator.tasks.update_task(
                         task_id,
@@ -1178,6 +1929,12 @@ class Assistant:
             if task_id:
                 task = await self.orchestrator.tasks.cancel_task(task_id, reason="Access denied by owner")
                 await self.orchestrator.fs_access.consume_task_once_permissions(task_id)
+                await self.orchestrator.command_history.update_by_task(
+                    task_id,
+                    status="cancelled",
+                    result_summary=reply,
+                    error_info="Access denied by owner",
+                )
             self.history.add("assistant", reply)
             self._set_os_state("Completed", source="system", detail="permission_denied")
             self.bus.publish(
@@ -1196,6 +1953,14 @@ class Assistant:
         exec_res = await self.execute_deferred_action(req_data, task_id=task_id)
         reply = str(exec_res.get("reply") or "Completed authorized action.")
         task = await self.orchestrator.tasks.get_task(task_id) if task_id else None
+        if task_id:
+            await self.orchestrator.command_history.update_by_task(
+                task_id,
+                status=str((task or {}).get("status") or ("completed" if exec_res.get("ok", True) else "failed")),
+                tools_used=exec_res.get("tools_used"),
+                paths_touched=exec_res.get("paths") or [],
+                result_summary=reply,
+            )
         self.history.add("assistant", reply)
         self._set_os_state("Completed", source="system", detail=exec_res.get("command", "filesystem_ops"))
         self.bus.publish({"type": "graph_changed"})
@@ -1425,6 +2190,36 @@ class Assistant:
             self._set_os_state("Executing", source=source, detail="filesystem_ops")
             t_start = time.perf_counter()
             fs_info = self._parse_host_fs_request(text)
+            alias_hit = await self.orchestrator.fs_access.resolve_alias(text)
+            if alias_hit and not fs_info["explicit_path"]:
+                fs_info["target"] = str(alias_hit["resolved_path"])
+                fs_info["is_workspace_only"] = False
+                fs_info["unspecified_folder"] = False
+            task_cat = classify_task_category(text, intent=intent, department=plan.decision.department)
+            has_explicit_seq = bool(re.search(r"\b(?:and\s+then|then|after\s+that|followed\s+by)\b|;|->", text, re.I))
+            if (
+                task_cat == "multi_step"
+                and has_explicit_seq
+                and fs_info["primary_op"] not in WRITE_OPS
+                and fs_info["primary_op"] != "delete_file"
+                and not fs_info["is_workspace_only"]
+                and (alias_hit or fs_info["explicit_path"] or not fs_info["unspecified_folder"])
+            ):
+                return await self._run_multistep_workflow(
+                    text,
+                    resolved_target=fs_info["target"],
+                    alias_name=(alias_hit["alias"] if alias_hit else None),
+                    task_id=task_id,
+                    source=source,
+                    cancel_event=cancel_event,
+                )
+            # Analytical / multi-step read-only inspection queries benefit from Brain multi-tool exploration + synthesis.
+            if (
+                fs_info["primary_op"] not in WRITE_OPS
+                and fs_info["primary_op"] != "delete_file"
+                and re.search(r"\b(?:explain|summarize|analyze|what\s+is|how\s+does|database\s+connection|config(?:uration)?)\b", text, re.I)
+            ):
+                return None
             if fs_info["is_workspace_only"]:
                 graph_live.tool_invoked(self, "filesystem_search", query=text[:80])
                 try:
@@ -1687,6 +2482,30 @@ class Assistant:
                 reply = "Jarvis is in Local Mode (internet access is disabled). Enable Online Assisted Mode to run live web research."
             return {"command": "web_offline", "reply": reply, "paths": [], "ok": False}
 
+        if (
+            intent not in ("document_export", "reminder", "deep_research", "task_status", "memory_manage", "system_status", "docker_ops", "recovery_ops")
+            and classify_task_category(text, intent=intent, department=plan.decision.department) == "multi_step"
+            and bool(re.search(r"\b(?:and\s+then|then|after\s+that|followed\s+by)\b|;|->", text, re.I))
+        ):
+            fs_info = self._parse_host_fs_request(text)
+            alias_hit = await self.orchestrator.fs_access.resolve_alias(text)
+            resolved_target: str | None = None
+            alias_name: str | None = None
+            if alias_hit and not fs_info["explicit_path"]:
+                resolved_target = str(alias_hit["resolved_path"])
+                alias_name = str(alias_hit["alias"])
+            elif not fs_info["is_workspace_only"] and not fs_info["unspecified_folder"] and fs_info.get("target"):
+                resolved_target = str(fs_info["target"])
+            if resolved_target and fs_info["primary_op"] not in WRITE_OPS and fs_info["primary_op"] != "delete_file":
+                return await self._run_multistep_workflow(
+                    text,
+                    resolved_target=resolved_target,
+                    alias_name=alias_name,
+                    task_id=task_id,
+                    source=source,
+                    cancel_event=cancel_event,
+                )
+
         return None
 
     def _speak_sentences(self, buf: str, flush: bool = False) -> str:
@@ -1701,12 +2520,46 @@ class Assistant:
             return ""
         return buf
 
-    async def stream_turn(self, text: str, speak: bool = False, source: str = "text", cancel_event: asyncio.Event | None = None) -> AsyncIterator[dict]:
+    async def stream_turn(
+        self,
+        text: str,
+        speak: bool = False,
+        source: str = "text",
+        cancel_event: asyncio.Event | None = None,
+        *,
+        _in_replay: bool = False,
+    ) -> AsyncIterator[dict]:
         """Yields {"type": "meta"|"token"|"tool"|"reset_answer"|"interrupted"|"done"|"error", ...}. The only place a turn is executed."""
-        text = text.strip()
         eff_cancel = cancel_event or asyncio.Event()
         async with self._turn_lock:
             self._active_turn_cancel = eff_cancel
+            try:
+                async for ev in self._stream_turn_unlocked(
+                    text,
+                    speak=speak,
+                    source=source,
+                    cancel_event=eff_cancel,
+                    _in_replay=_in_replay,
+                ):
+                    yield ev
+            finally:
+                if self._active_turn_cancel is eff_cancel:
+                    self._active_turn_cancel = None
+
+    async def _stream_turn_unlocked(
+        self,
+        text: str,
+        speak: bool = False,
+        source: str = "text",
+        cancel_event: asyncio.Event | None = None,
+        *,
+        _in_replay: bool = False,
+    ) -> AsyncIterator[dict]:
+        text = text.strip()
+        eff_cancel = cancel_event or asyncio.Event()
+        prev_replay = getattr(self, "_in_replay", False)
+        self._in_replay = _in_replay
+        if True:
             self.speaker.stop()  # new input interrupts any ongoing speech
             self._set_activity("thinking")
             self._set_os_state("Understanding", source=source)
@@ -1720,6 +2573,15 @@ class Assistant:
                 if ui_cmd:
                     self._set_os_state("Executing", source=source, detail=ui_cmd["command"])
                     reply = ui_cmd["reply"]
+                    await self.orchestrator.command_history.record(
+                        text,
+                        task_category="informational",
+                        intent=ui_cmd["command"],
+                        status="completed",
+                        result_summary=reply,
+                        replayable=True,
+                        source=source,
+                    )
                     yield {"type": "meta", "command": ui_cmd["command"], "nodes": [], "model": None, "web_sources": []}
                     yield {"type": "token", "text": reply}
                     self.history.add("user", text)
@@ -1743,6 +2605,54 @@ class Assistant:
 
                 cmd = await commands.route(self, text)
                 if cmd:
+                    if cmd["name"] == "repeat_last_command" and cmd.get("replay_text") and not _in_replay:
+                        async for ev in self._stream_turn_unlocked(
+                            cmd["replay_text"],
+                            speak=speak,
+                            source="replay",
+                            cancel_event=eff_cancel,
+                            _in_replay=True,
+                        ):
+                            yield ev
+                        return
+                    if cmd["name"] == "continue_task" and cmd.get("replay_text") and not _in_replay:
+                        if cmd.get("resume_task"):
+                            rt = cmd["resume_task"]
+                            cp = dict(rt.get("checkpoint_json") or rt.get("checkpoint") or {})
+                            res = await self._run_multistep_workflow(
+                                rt["user_request"],
+                                resolved_target=cp.get("resolved_target"),
+                                alias_name=cp.get("project_alias"),
+                                task_id=rt["task_id"],
+                                source="continue",
+                                cancel_event=eff_cancel,
+                                steps_override=cp.get("multistep_plan"),
+                                resume_checkpoint=cp,
+                            )
+                            latest_task = await self.orchestrator.tasks.get_task(rt["task_id"])
+                            reply = str(res.get("reply") or "Continued previous task.")
+                            await self.orchestrator.command_history.update_by_task(
+                                rt["task_id"],
+                                status=str((latest_task or {}).get("status") or ("completed" if res.get("ok", True) else "failed")),
+                                tools_used=res.get("tools_used"),
+                                paths_touched=res.get("paths") or [],
+                                result_summary=reply,
+                            )
+                            yield {"type": "meta", "command": res.get("command", "multi_step"), "nodes": [], "model": None, "web_sources": [], "task": latest_task, "task_id": rt["task_id"], "permission_request": res.get("permission_request")}
+                            yield {"type": "token", "text": reply}
+                            self.history.add("user", text)
+                            self.history.add("assistant", reply)
+                            yield {"type": "done", "answer": reply, "nodes": [], "paths": res.get("paths") or [], "web_sources": [], "command": res.get("command", "multi_step"), "task": latest_task, "task_id": rt["task_id"], "permission_request": res.get("permission_request"), "ok": bool(res.get("ok", True)), "seconds": round(time.time() - t0, 2)}
+                            return
+                        async for ev in self._stream_turn_unlocked(
+                            cmd["replay_text"],
+                            speak=speak,
+                            source="continue",
+                            cancel_event=eff_cancel,
+                            _in_replay=True,
+                        ):
+                            yield ev
+                        return
                     self._set_os_state("Executing", source=source, detail=cmd["name"])
                     if cmd["name"] in {
                         "search_files", "read_file", "open_file", "open_app", "inspect_project",
@@ -1750,6 +2660,16 @@ class Assistant:
                     }:
                         graph_live.tool_used(self, cmd["name"], query=text[:80], ok=cmd.get("ok", True))
                     reply = cmd["reply"]
+                    await self.orchestrator.command_history.record(
+                        text,
+                        task_category=classify_task_category(text, intent=cmd["name"]),
+                        intent=cmd["name"],
+                        status=("completed" if cmd.get("ok", True) else "failed"),
+                        paths_touched=cmd.get("paths") or ([cmd["note"]] if cmd.get("note") else []),
+                        result_summary=reply,
+                        replayable=bool(cmd.get("replayable", True)),
+                        source=source,
+                    )
                     yield {"type": "meta", "command": cmd["name"], "nodes": cmd["nodes"], "model": None, "web_sources": []}
                     yield {"type": "token", "text": reply}
                     self.history.add("user", text)
@@ -1783,6 +2703,16 @@ class Assistant:
                     current_step=f"Planning {plan.workflow}",
                 )
                 current_task_id = task_row["task_id"]
+                await self.orchestrator.command_history.record(
+                    text,
+                    task_category=classify_task_category(text, intent=plan.decision.intent, department=plan.decision.department),
+                    intent=plan.decision.intent,
+                    department=plan.decision.department,
+                    task_id=current_task_id,
+                    status="running",
+                    replayable=(plan.decision.intent != "task_status"),
+                    source=source,
+                )
                 decision_summary: dict[str, object] = {
                     "department": plan.decision.department,
                     "intent": plan.decision.intent,
@@ -1817,6 +2747,12 @@ class Assistant:
                                     current_step="Blocked by filesystem security policy",
                                 )
                                 reply = f"Blocked by filesystem security policy: {chk_del.reason}"
+                                await self.orchestrator.command_history.update_by_task(
+                                    current_task_id,
+                                    status="failed",
+                                    result_summary=reply,
+                                    error_info=chk_del.reason,
+                                )
                                 yield {"type": "meta", "command": "filesystem_blocked", "nodes": [], "model": None, "web_sources": [], "decision": decision_summary, "task_id": current_task_id}
                                 yield {"type": "token", "text": reply}
                                 self.history.add("user", text)
@@ -1848,6 +2784,12 @@ class Assistant:
                         resync=True,
                     )
                     reply = f"Owner approval required before executing ({flags}). Review and approve request `{req['token']}` inline or in Approvals."
+                    await self.orchestrator.command_history.update_by_task(
+                        current_task_id,
+                        status="awaiting_approval",
+                        result_summary=reply,
+                        error_info=f"Owner approval required ({flags})",
+                    )
                     yield {"type": "meta", "command": "approval_required", "nodes": [], "model": None, "web_sources": [], "decision": decision_summary, "approval": req, "task": updated_task, "task_id": current_task_id}
                     yield {"type": "token", "text": reply}
                     self.history.add("user", text)
@@ -1883,11 +2825,14 @@ class Assistant:
                 if planned is not None:
                     if planned.get("interrupted") or eff_cancel.is_set():
                         await self.orchestrator.tasks.cancel_task(current_task_id, reason="Interrupted by user")
+                        await self.orchestrator.command_history.update_by_task(current_task_id, status="cancelled", error_info="Interrupted by user")
                         self.speaker.stop()
                         yield {"type": "interrupted"}
                         return
                     reply = planned["reply"]
                     cmd_name = planned["command"]
+                    eff_cmd_status = "awaiting_permission" if cmd_name == "permission_required" else ("awaiting_approval" if (cmd_name == "approval_required" or planned.get("approval_token")) else "completed")
+                    err_detail = None
                     if cmd_name not in ("permission_required", "approval_required") and not (
                         cmd_name == "dev_autonomous" and planned.get("approval_token")
                     ):
@@ -1899,7 +2844,7 @@ class Assistant:
                             eff_status = planned_out_status
                         else:
                             eff_status = "completed"
-                        err_detail = None
+                        eff_cmd_status = eff_status
                         if cmd_name == "deep_research" and planned.get("export_ok") is False:
                             err_detail = f"Artifact generation failed: {planned.get('export_error')}"
                         await self.orchestrator.tasks.update_task(
@@ -1918,6 +2863,23 @@ class Assistant:
                             status="awaiting_approval",
                             append_permission=planned.get("approval_token"),
                             current_step="Waiting for owner approval",
+                        )
+                    await self.orchestrator.command_history.update_by_task(
+                        current_task_id,
+                        status=eff_cmd_status,
+                        tools_used=planned.get("tools_used"),
+                        paths_touched=planned.get("paths") or [],
+                        result_summary=reply,
+                        error_info=err_detail,
+                    )
+                    if eff_cmd_status == "completed":
+                        self._record_adaptive_turn_memory(
+                            text,
+                            cmd_name=planned["command"],
+                            intent=plan.decision.intent,
+                            paths=planned.get("paths") or [],
+                            project_alias=planned.get("project_alias"),
+                            ok=bool(planned.get("ok", True)),
                         )
                     latest_task = await self.orchestrator.tasks.get_task(current_task_id)
                     yield {
@@ -1983,157 +2945,168 @@ class Assistant:
                     "web_sources": [],
                 }
 
-                # Local Mode (default): incremental sentence-level streaming LLM -> Piper TTS
-                if not online:
-                    msgs = build_messages(
-                        self.history.window(),
-                        text,
-                        notes_ctx,
-                        today,
-                        online=False,
-                        memories=ctx_bundle["memories_ctx"] or None,
-                        history_hits=ctx_bundle["history_ctx"] or None,
-                        feedback_lessons=ctx_bundle["feedback_ctx"] or None,
-                        knowledge_hits=ctx_bundle["knowledge_ctx"] or None,
+                isolate_web = bool(
+                    online
+                    and (
+                        plan.decision.intent in ("web_research", "research")
+                        or getattr(plan.decision, "needs_live_web", False)
                     )
+                )
+                msgs = self._build_messages(
+                    self.history.window(),
+                    text,
+                    [] if isolate_web else notes_ctx,
+                    today,
+                    online=online,
+                    memories=None if isolate_web else (ctx_bundle["memories_ctx"] or None),
+                    history_hits=None if isolate_web else (ctx_bundle["history_ctx"] or None),
+                    feedback_lessons=ctx_bundle["feedback_ctx"] or None,
+                    knowledge_hits=ctx_bundle["knowledge_ctx"] or None,
+                    isolate_untrusted_context=isolate_web,
+                )
+                include_fs = bool(getattr(self.orchestrator, "fs_access", None)) and not isolate_web
+                include_web = bool(online and self.settings.internet.tool_calling)
+                tools = _assistant_tools(
+                    include_fs=include_fs,
+                    include_web=include_web,
+                    allow_page_fetch=self.settings.internet.allow_page_fetch,
+                ) or None
+
+                turn_ctx: dict = {
+                    "answer": "",
+                    "paths": [],
+                    "warnings": [],
+                    "web_sources": [],
+                    "tools_used": [],
+                    "tools_supported": tools is not None,
+                    "defer_unsupported_to_web": bool(online),
+                }
+                async for ev in self._iter_tool_turn(
+                    msgs,
+                    tools=tools,
+                    speak=speak,
+                    cancel_event=eff_cancel,
+                    source=source,
+                    task_id=current_task_id,
+                    original_text=text,
+                    turn_ctx=turn_ctx,
+                ):
+                    yield ev
+                    if turn_ctx.get("interrupted") or ev.get("type") == "interrupted":
+                        return
+
+                if turn_ctx.get("permission_request"):
+                    req = turn_ctx["permission_request"]
+                    updated_task = await self.orchestrator.tasks.update_task(
+                        current_task_id,
+                        status="awaiting_permission",
+                        plan=[f"Request scoped permission on `{req['canonical_path']}`", "Resume inspection and synthesize explanation"],
+                        append_permission=req["request_id"],
+                        current_step=f"Waiting for permission ({', '.join(req.get('requested_operations') or [])})",
+                    )
+                    self._set_os_state("Waiting for approval", source=source, detail=req["canonical_path"])
+                    self.bus.publish({"type": "permission_requested", "request": req, "task_id": current_task_id})
+                    reply = f"Permission required to inspect `{req['canonical_path']}` ({', '.join(req.get('requested_operations') or [])}). Approve or deny in the inline permission card."
+                    await self.orchestrator.command_history.update_by_task(
+                        current_task_id,
+                        status="awaiting_permission",
+                        tools_used=turn_ctx.get("tools_used"),
+                        result_summary=reply,
+                    )
+                    yield {
+                        "type": "meta",
+                        "command": "permission_required",
+                        "nodes": nodes,
+                        "model": None,
+                        "web_sources": [],
+                        "decision": decision_summary,
+                        "permission_request": req,
+                        "task": updated_task,
+                        "task_id": current_task_id,
+                    }
+                    yield {"type": "token", "text": reply}
+                    self.history.add("user", text)
+                    self.history.add("assistant", reply)
+                    if speak:
+                        self.speaker.say(reply)
+                    yield {
+                        "type": "done",
+                        "answer": reply,
+                        "nodes": nodes,
+                        "paths": [],
+                        "web_sources": [],
+                        "command": "permission_required",
+                        "permission_request": req,
+                        "task": updated_task,
+                        "task_id": current_task_id,
+                        "ok": False,
+                        "seconds": round(time.time() - t0, 2),
+                    }
+                    return
+
+                answer = str(turn_ctx.get("answer") or "")
+                web_sources = list(turn_ctx.get("web_sources") or [])
+                tools_supported = bool(turn_ctx.get("tools_supported", True))
+                used_tools = list(turn_ctx.get("tools_used") or [])
+
+                if online and not used_tools and (not tools_supported or not answer or needs_web_intent(text, has_notes=bool(hits))):
+                    q = extract_web_query(text)
+                    if answer:
+                        yield {"type": "reset_answer"}
+                    answer = ""
+                    yield {"type": "tool", "status": "searching", "name": "web_search", "query": q}
+                    self._set_os_state("Executing", source=source, detail="web_search")
+                    t_tool = time.perf_counter()
+                    graph_live.tool_invoked(self, "web_search", query=q)
+                    try:
+                        res = await self.search.search(q)
+                        graph_live.tool_used(self, "web_search", query=q, ok=True, duration_ms=(time.perf_counter() - t_tool) * 1000.0)
+                        self._set_os_state("Thinking", source=source)
+                        web_sources = res["results"]
+                        msgs = self._build_messages(
+                            self.history.window(),
+                            text,
+                            [] if isolate_web else notes_ctx,
+                            today,
+                            online=True,
+                            web_results=web_sources,
+                            memories=None if isolate_web else (ctx_bundle["memories_ctx"] or None),
+                            history_hits=None if isolate_web else (ctx_bundle["history_ctx"] or None),
+                            feedback_lessons=ctx_bundle["feedback_ctx"] or None,
+                            knowledge_hits=ctx_bundle["knowledge_ctx"] or None,
+                            isolate_untrusted_context=isolate_web,
+                        )
+                    except SearchError as e:
+                        msgs = self._build_messages(
+                            self.history.window(),
+                            text,
+                            [] if isolate_web else notes_ctx,
+                            today,
+                            online=True,
+                            web_results=[{"title": "Web search error", "url": "", "snippet": str(e)}],
+                            memories=None if isolate_web else (ctx_bundle["memories_ctx"] or None),
+                            history_hits=None if isolate_web else (ctx_bundle["history_ctx"] or None),
+                            feedback_lessons=ctx_bundle["feedback_ctx"] or None,
+                            knowledge_hits=ctx_bundle["knowledge_ctx"] or None,
+                            isolate_untrusted_context=isolate_web,
+                        )
                     out_buf: list[str] = []
                     async for ev in self._stream_llm_with_tts(msgs, speak=speak, cancel_event=eff_cancel, answer_out=out_buf):
                         yield ev
                         if ev["type"] == "interrupted":
                             return
                     answer = out_buf[-1] if out_buf else ""
-                else:
-                    # Online Assisted Mode: isolate pure web-research turns from private memory/notes to prevent untrusted mix/exfil.
-                    isolate_web = bool(
-                        plan.decision.intent in ("web_research", "research") or getattr(plan.decision, "needs_live_web", False)
-                    )
-                    msgs = build_messages(
-                        self.history.window(),
-                        text,
-                        [] if isolate_web else notes_ctx,
-                        today,
-                        online=True,
-                        memories=None if isolate_web else (ctx_bundle["memories_ctx"] or None),
-                        history_hits=None if isolate_web else (ctx_bundle["history_ctx"] or None),
-                        feedback_lessons=ctx_bundle["feedback_ctx"] or None,
-                        knowledge_hits=ctx_bundle["knowledge_ctx"] or None,
-                        isolate_untrusted_context=isolate_web,
-                    )
-                    tools = _web_tools(self.settings.internet.allow_page_fetch) if self.settings.internet.tool_calling else None
-                    answer, chunker = "", StreamingSpeechBuffer()
-                    tool_calls: list[dict] = []
-                    tools_supported = tools is not None
-
-                    if tools_supported:
-                        try:
-                            async for ev in self.brain.stream_events(msgs, tools=tools):
-                                if eff_cancel.is_set():
-                                    self.speaker.stop()
-                                    yield {"type": "interrupted"}
-                                    return
-                                if ev["type"] == "token":
-                                    answer += ev["text"]
-                                    yield {"type": "token", "text": ev["text"]}
-                                elif ev["type"] == "tool_calls":
-                                    tool_calls = ev["calls"]
-                        except ToolsUnsupportedError:
-                            tools_supported = False
-                            answer = ""
-
-                    if tool_calls:
-                        if answer:
-                            yield {"type": "reset_answer"}
-                        answer = ""
-                        chunker.reset()
-                        assistant_calls = [
-                            {"type": "function", "function": {"name": c["name"], "arguments": c["arguments"]}}
-                            for c in tool_calls
-                        ]
-                        msgs = [*msgs, {"role": "assistant", "content": "", "tool_calls": assistant_calls}]
-                        for c in tool_calls[:3]:
-                            if eff_cancel.is_set():
-                                self.speaker.stop()
-                                yield {"type": "interrupted"}
-                                return
-                            yield {"type": "tool", "status": "searching", "name": c["name"], "query": c["arguments"].get("query") or c["arguments"].get("url") or ""}
-                            self._set_os_state("Executing", source=source, detail=c["name"])
-                            t_tool = time.perf_counter()
-                            q_str = str(c["arguments"].get("query") or c["arguments"].get("url") or "")
-                            graph_live.tool_invoked(self, c["name"], query=q_str)
-                            tool_out, srcs = await self._execute_tool(c)
-                            graph_live.tool_used(self, c["name"], query=q_str, ok=("error" not in tool_out[:40]), duration_ms=(time.perf_counter() - t_tool) * 1000.0)
-                            self._set_os_state("Thinking", source=source)
-                            web_sources.extend(srcs)
-                            msgs.append({"role": "tool", "content": tool_out})
-                        out_buf = []
-                        async for ev in self._stream_llm_with_tts(msgs, speak=speak, cancel_event=cancel_event, answer_out=out_buf):
-                            yield ev
-                            if ev["type"] == "interrupted":
-                                return
-                        answer = out_buf[-1] if out_buf else ""
-                    elif (not tools_supported or not answer) or needs_web_intent(text, has_notes=bool(hits)):
-                        if not tools_supported or needs_web_intent(text, has_notes=bool(hits)):
-                            q = extract_web_query(text)
-                            if answer:
-                                yield {"type": "reset_answer"}
-                            answer = ""
-                            chunker.reset()
-                            yield {"type": "tool", "status": "searching", "name": "web_search", "query": q}
-                            self._set_os_state("Executing", source=source, detail="web_search")
-                            t_tool = time.perf_counter()
-                            graph_live.tool_invoked(self, "web_search", query=q)
-                            try:
-                                res = await self.search.search(q)
-                                graph_live.tool_used(self, "web_search", query=q, ok=True, duration_ms=(time.perf_counter() - t_tool) * 1000.0)
-                                self._set_os_state("Thinking", source=source)
-                                web_sources = res["results"]
-                                msgs = build_messages(
-                                    self.history.window(),
-                                    text,
-                                    [] if isolate_web else notes_ctx,
-                                    today,
-                                    online=True,
-                                    web_results=web_sources,
-                                    memories=None if isolate_web else (ctx_bundle["memories_ctx"] or None),
-                                    history_hits=None if isolate_web else (ctx_bundle["history_ctx"] or None),
-                                    feedback_lessons=ctx_bundle["feedback_ctx"] or None,
-                                    knowledge_hits=ctx_bundle["knowledge_ctx"] or None,
-                                    isolate_untrusted_context=isolate_web,
-                                )
-                            except SearchError as e:
-                                msgs = build_messages(
-                                    self.history.window(),
-                                    text,
-                                    [] if isolate_web else notes_ctx,
-                                    today,
-                                    online=True,
-                                    web_results=[{"title": "Web search error", "url": "", "snippet": str(e)}],
-                                    memories=None if isolate_web else (ctx_bundle["memories_ctx"] or None),
-                                    history_hits=None if isolate_web else (ctx_bundle["history_ctx"] or None),
-                                    feedback_lessons=ctx_bundle["feedback_ctx"] or None,
-                                    knowledge_hits=ctx_bundle["knowledge_ctx"] or None,
-                                    isolate_untrusted_context=isolate_web,
-                                )
-                            out_buf = []
-                            async for ev in self._stream_llm_with_tts(msgs, speak=speak, cancel_event=eff_cancel, answer_out=out_buf):
-                                yield ev
-                                if ev["type"] == "interrupted":
-                                    return
-                            answer = out_buf[-1] if out_buf else ""
-                        else:
-                            if speak and answer.strip():
-                                self.speaker.say(answer)
-                    else:
-                        if speak and answer.strip():
-                            self.speaker.say(answer)
 
                 answer = answer.strip()
                 if not answer:
                     raise BrainError("The model returned an empty reply.")
+                if turn_ctx.get("warnings"):
+                    uniq_warn = list(dict.fromkeys(turn_ctx["warnings"]))
+                    answer = f"{answer}\n\nSafety/Inspection Notice: {'; '.join(uniq_warn)}"
                 self.history.add("user", text)
                 self.history.add("assistant", answer)
                 st = self.brain.last_stats
-                # Deduplicate source URLs preserving order
+                # Deduplicate source URLs and verified file paths preserving order
                 seen_urls = set()
                 uniq_sources = []
                 for s in web_sources:
@@ -2141,23 +3114,43 @@ class Assistant:
                     if u and u not in seen_urls:
                         seen_urls.add(u)
                         uniq_sources.append(s)
+                all_paths = list(dict.fromkeys([n.path for n, _ in hits] + list(turn_ctx.get("paths") or [])))
                 if current_task_id:
+                    for tname in dict.fromkeys(used_tools):
+                        await self.orchestrator.tasks.update_task(current_task_id, append_tool=tname)
                     await self.orchestrator.tasks.update_task(
                         current_task_id,
                         status="completed",
                         result=answer[:1000],
+                        generated_files=list(dict.fromkeys(turn_ctx.get("paths") or [])),
                         current_step="Responded via LLM",
                     )
                     await self.orchestrator.fs_access.consume_task_once_permissions(current_task_id)
+                    await self.orchestrator.command_history.update_by_task(
+                        current_task_id,
+                        status="completed",
+                        tools_used=used_tools,
+                        paths_touched=all_paths,
+                        result_summary=answer,
+                    )
+                self._record_adaptive_turn_memory(
+                    text,
+                    cmd_name=(used_tools[0] if used_tools else ""),
+                    intent=plan.decision.intent,
+                    paths=all_paths,
+                    ok=True,
+                )
                 latest_task = await self.orchestrator.tasks.get_task(current_task_id) if current_task_id else None
                 yield {
                     "type": "done",
                     "answer": answer,
                     "nodes": nodes,
-                    "paths": [n.path for n, _ in hits],
+                    "paths": all_paths,
                     "memory_ids": ctx_bundle["memory_ids"],
                     "knowledge_sources": ctx_bundle["knowledge_sources"],
                     "web_sources": uniq_sources,
+                    "tools_used": used_tools,
+                    "warnings": turn_ctx.get("warnings") or [],
                     "command": None,
                     "task": latest_task,
                     "task_id": current_task_id,
@@ -2171,22 +3164,22 @@ class Assistant:
             except BrainError as e:
                 if current_task_id:
                     await self.orchestrator.tasks.update_task(current_task_id, status="failed", error_info=str(e), current_step="Model error")
+                    await self.orchestrator.command_history.update_by_task(current_task_id, status="failed", error_info=str(e))
                 self._set_os_state("Error", source=source, detail=str(e))
                 if speak:
                     self.speaker.say("I'm afraid I can't reach my language model, sir.")
                 yield {"type": "error", "message": str(e)}
             finally:
-                if self._active_turn_cancel is eff_cancel:
-                    self._active_turn_cancel = None
+                self._in_replay = prev_replay
                 next_act = "speaking" if self.speaker.speaking else "idle"
                 self._set_activity(next_act)
                 if self.os_state not in ("Error", "Waiting for approval"):
                     rest = "Listening" if self.voice.mic_active else "Idle"
                     self._set_os_state("Speaking" if self.speaker.speaking else rest, source=source)
 
-    async def chat(self, text: str, speak: bool = False) -> dict:
+    async def chat(self, text: str, speak: bool = False, *, source: str = "text", _in_replay: bool = False) -> dict:
         last = {}
-        async for ev in self.stream_turn(text, speak):
+        async for ev in self.stream_turn(text, speak, source=source, _in_replay=_in_replay):
             last = ev
         if last.get("type") == "error":
             raise BrainError(last["message"])
@@ -2258,10 +3251,5 @@ class Assistant:
             "offline_enforced": self.settings.offline_enforced,
             "mode": self.settings.mode,
             "internet": self.search.status(),
-            "system": {
-                "ram": sysinfo.ram(),
-                "gpu": await asyncio.to_thread(sysinfo.gpu),
-                "cpu_pct": sysinfo.cpu(),
-                "audio": await asyncio.to_thread(sysinfo.audio),
-            },
+            "system": await asyncio.to_thread(sysinfo.snapshot, self.settings.monitoring, include_processes=False),
         }

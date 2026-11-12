@@ -362,6 +362,10 @@ class Brain:
 
     async def stream_events(self, messages: list[dict], tools: list[dict] | None = None, *, _allow_think_fallback: bool = True) -> AsyncIterator[dict]:
         """Stream `/api/chat` (or gated cloud provider) yielding {"type": "token", "text"} and {"type": "tool_calls", "calls"}."""
+        if type(self).stream is not Brain.stream and type(self).stream_events is Brain.stream_events:
+            async for piece in self.stream(messages):
+                yield {"type": "token", "text": piece}
+            return
         if self.provider in ("openai", "anthropic", "openrouter", "gemini", "huggingface", "custom"):
             async for ev in self._cloud_complete(self.provider, messages):
                 yield ev

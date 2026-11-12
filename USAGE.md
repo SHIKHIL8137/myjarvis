@@ -95,3 +95,20 @@ Inside **JARVIS ASSISTANT**, click **Voice (`N`)** in the workspace header to op
 - **Immutable Original vs Editable Correction**: Copy `original_transcript` or edit `corrected_transcript` and optionally re-translate; original audio and `original_transcript` are never overwritten.
 - **Retry Pass & Candidate Comparison**: Re-run STT on the stored original audio with any model (`base`, `small`, `small.en`), language (`auto`, `en`, `ml`, `mixed`, `hi`, `ta`), quality tier (`fast`, `balanced`, `high`), or preprocessing profile (`off`, `light`, `standard`), and expand **Compare passes** to review scores.
 - **Local Consent & Privacy Controls**: Explicitly approve a corrected sample for local offline evaluation (`data/eval_consented/`), or permanently delete individual/all transcripts and stored audio buffers.
+
+
+## Operations Drawer (`History`, `Aliases`, `Memory`, `Desktop`, `System`)
+
+Use the header controls or natural-language commands in **JARVIS ASSISTANT** to inspect and operate the workspace drawer (`OperationsDrawer.tsx`):
+
+- **History**: Review persisted multi-step and single-step command history (`/api/v2/commands`), inspect execution status, or trigger safe command replay (`repeat last command`).
+- **Aliases**: Bind short project names to approved local folders (`project_aliases`), then inspect trees or read project files (`inspect myjarvis`, `find .py files in myjarvis`). All aliases remain gated by `FilesystemAccessManager`.
+- **Memory**: Toggle individual 5-way personal memory categories (`is_category_enabled`) or run scoped conversation clearing without wiping long-term preferences.
+- **Desktop**: View registered automation actions (`/api/v2/actions/registry`), approve or reject confirmation-gated actions (`/api/v2/actions/{token}/confirm|reject`), switch or list Win32 windows, control media playback (`play`, `pause`, `next`, `previous`), or open verified `https://` URLs. High-risk input automation stays off by default (`allow_input_automation = False`).
+- **System**: Inspect live CPU, RAM, NVIDIA GPU/VRAM, Disk, Battery, Network, and top process telemetry (`/api/v2/system/health`), plus review or dismiss non-executing proactive suggestions (`/api/v2/system/suggestions`).
+
+
+## Personality Presets & Safe Voice Commands
+
+- **Personality Switching**: Choose among `professional`, `friendly`, `concise`, `technical`, `detailed`, or `custom` (with optional `custom_instructions`) via **Settings** or natural language (`switch personality to concise`).
+- **Voice Clarification Guard**: Low-confidence or script-mismatched voice utterances that map to mutating actions pause and prompt for explicit verbal/text confirmation before executing.

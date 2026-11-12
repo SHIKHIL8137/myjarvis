@@ -2,6 +2,7 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 import json
+import re
 import time
 from typing import Awaitable, Callable
 
@@ -179,21 +180,42 @@ def heuristic_classify(text: str) -> DecisionEnvelope:
         needs_write = any(w in lowered for w in ("implement", "fix", "add ", "edit", "refactor", "create", "migrate", "write"))
         is_sec_audit = any(w in lowered for w in ("security audit", "vulnerability", "vuln", "audit"))
         is_debug = any(w in lowered for w in ("debug", "failing test", "traceback", "stack trace"))
-        dev_intent = "dev_coding" if needs_write else ("security_audit" if is_sec_audit else ("dev_debug" if is_debug else "dev_architecture"))
-        env = DecisionEnvelope(
-            layer=2,
-            department="dev",
-            intent=dev_intent,
-            complexity="heavy_coding" if needs_write else "complex_reasoning",
-            needs_live_web=is_web,
-            needs_project_context=True,
-            risk_tier="WRITE" if needs_write else "READ",
-            confidence=0.84,
-            latency_ms=round((time.perf_counter() - t0) * 1000.0, 3),
-            language=lang,
-            classifier_source="heuristic",
+        explicit_review = bool(
+            re.search(
+                r"\b(?:review|audit|inspect)\s+(?:(?:my|the|this)\s+)?(?:[A-Za-z0-9_.-]+\s+)?(?:project|repo|codebase|code|tests?)\b[^\n]{0,40}\b(?:architecture|dependencies)\b|"
+                r"\b(?:review|audit)\s+(?:(?:my|the|this)\s+)?(?:[A-Za-z0-9_.-]+\s+)?(?:project|repo|codebase|code|tests?)\b|"
+                r"\bcode\s+and\s+tests?\b|\brun\s+(?:the\s+)?(?:dev|workforce)\b",
+                lowered,
+            )
         )
-        return enforce_security_boundary(s, env)
+        is_readonly_inspect = (
+            not needs_write
+            and not is_sec_audit
+            and not is_debug
+            and not explicit_review
+            and bool(
+                re.search(
+                    r"\b(?:open|inspect|find|search|read|list|show|explain|summarize|what\s+is|where\s+is|config(?:uration)?|database|structure)\b",
+                    lowered,
+                )
+            )
+        )
+        if not is_readonly_inspect:
+            dev_intent = "dev_coding" if needs_write else ("security_audit" if is_sec_audit else ("dev_debug" if is_debug else "dev_architecture"))
+            env = DecisionEnvelope(
+                layer=2,
+                department="dev",
+                intent=dev_intent,
+                complexity="heavy_coding" if needs_write else "complex_reasoning",
+                needs_live_web=is_web,
+                needs_project_context=True,
+                risk_tier="WRITE" if needs_write else "READ",
+                confidence=0.84,
+                latency_ms=round((time.perf_counter() - t0) * 1000.0, 3),
+                language=lang,
+                classifier_source="heuristic",
+            )
+            return enforce_security_boundary(s, env)
 
     if is_fs:
         env = DecisionEnvelope(
