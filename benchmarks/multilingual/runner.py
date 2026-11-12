@@ -32,6 +32,18 @@ def _summarize_group(rows: list[dict]) -> dict:
     lang_checked = [r for r in rows if r.get("lang_correct") is not None]
     rtfs = [r["rtf"] for r in rows if r.get("rtf") is not None]
     secs = [r["seconds"] for r in rows]
+    script_mismatches = sum(1 for r in rows if "script_mismatch" in (r.get("quality_flags") or []))
+    empties = sum(1 for r in rows if not (r.get("hypothesis") or "").strip())
+    hallucinations = sum(
+        1
+        for r in rows
+        if any(
+            f in (r.get("quality_flags") or [])
+            for f in ("repetition_hallucination", "short_audio_long_hallucination", "implausible_word_rate")
+        )
+    )
+    low_q = sum(1 for r in rows if r.get("recognition_quality") == "low")
+    retries = sum(1 for r in rows if r.get("retry_triggered"))
     return {
         "count": len(rows),
         "evaluated_count": len(evaluated),
@@ -44,6 +56,11 @@ def _summarize_group(rows: list[dict]) -> dict:
             round(sum(1 for r in lang_checked if r["lang_correct"]) / len(lang_checked), 4)
             if lang_checked else None
         ),
+        "script_mismatch_count": script_mismatches,
+        "empty_count": empties,
+        "hallucination_or_loop_count": hallucinations,
+        "low_quality_count": low_q,
+        "fallback_triggered_count": retries,
         "mean_seconds": round(sum(secs) / len(secs), 3) if secs else 0.0,
         "mean_rtf": round(sum(rtfs) / len(rtfs), 3) if rtfs else None,
     }
@@ -90,6 +107,7 @@ def run_benchmark(
             "id": item["id"],
             "audio_path": str(audio_path),
             "language": (item.get("language") or "auto").lower(),
+            "requested_language": (item.get("requested_language") or "auto").lower(),
             "category": item.get("category") or "normal_speech",
             "reference": item.get("reference") or "",
             "reference_verified": bool(item.get("reference_verified", bool(item.get("reference")))),
@@ -120,7 +138,11 @@ def run_benchmark(
             by_cat: dict[str, list[dict]] = defaultdict(list)
 
             for s in loaded_samples:
-                res = stt.transcribe(s["audio"], save_audio=False)
+                res = stt.transcribe(
+                    s["audio"],
+                    language=s.get("requested_language", "auto"),
+                    save_audio=False,
+                )
                 hyp = (res.get("original_transcript") or res.get("text") or "").strip()
                 has_ref = bool(s["reference"].strip()) and s["reference_verified"]
                 metrics = compute_text_metrics(s["reference"], hyp) if has_ref else None
@@ -128,6 +150,7 @@ def run_benchmark(
                 row = {
                     "id": s["id"],
                     "expected_language": s["language"],
+                    "requested_language": s.get("requested_language", "auto"),
                     "category": s["category"],
                     "source": s["source"],
                     "reference_verified": s["reference_verified"],
@@ -141,6 +164,9 @@ def run_benchmark(
                     "avg_logprob": res.get("avg_logprob"),
                     "no_speech_prob": res.get("no_speech_prob"),
                     "compression_ratio": res.get("compression_ratio"),
+                    "recognition_quality": res.get("recognition_quality"),
+                    "quality_flags": list(res.get("quality_flags") or []),
+                    "retry_triggered": bool(res.get("retry_triggered", False)),
                     "script": script_profile(hyp),
                     "reference": s["reference"],
                     "hypothesis": hyp,
@@ -205,8 +231,8 @@ def render_comparison_markdown(report: dict) -> str:
         "",
         "## Model & Preset Summary",
         "",
-        "| Model | Preset | Load (s) | Peak RSS (MB) | Mean Latency (s) | Mean RTF | Lang Acc | Mean WER | Mean CER | Sub Rate | Del Rate | Ins Rate |",
-        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| Model | Preset | Load (s) | Peak RSS (MB) | Mean Latency (s) | Mean RTF | Lang Acc | Mean WER | Mean CER | Sub Rate | Del Rate | Ins Rate | Script Mismatch | Empty | Hallucinations |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for r in report.get("runs", []):
         o = r["overall"]
@@ -215,19 +241,21 @@ def render_comparison_markdown(report: dict) -> str:
             f"| {r['model']} | {r['quality']} | {r['load_seconds']:.2f} | {r['peak_rss_mb']:.1f} | "
             f"{o['mean_seconds']:.2f} | {o['mean_rtf'] or 0.0:.2f}x | {fmt_pct(o['lang_detection_accuracy'])} | "
             f"{fmt_pct(o['mean_wer'])} | {fmt_pct(o['mean_cer'])} | {fmt_pct(o['mean_sub_rate'])} | "
-            f"{fmt_pct(o['mean_del_rate'])} | {fmt_pct(o['mean_ins_rate'])} |"
+            f"{fmt_pct(o['mean_del_rate'])} | {fmt_pct(o['mean_ins_rate'])} | "
+            f"{o.get('script_mismatch_count', 0)} | {o.get('empty_count', 0)} | {o.get('hallucination_or_loop_count', 0)} |"
         )
     lines.append("")
     lines.append("## Per-Language Breakdown")
     lines.append("")
-    lines.append("| Model | Preset | Language | Samples | Evaluated | Lang Acc | WER | CER |")
-    lines.append("|---|---|---|---:|---:|---:|---:|---:|")
+    lines.append("| Model | Preset | Language | Samples | Evaluated | Lang Acc | WER | CER | Script Mismatch | Empty |")
+    lines.append("|---|---|---|---:|---:|---:|---:|---:|---:|---:|")
     for r in report.get("runs", []):
         for lang, g in r.get("by_language", {}).items():
             fmt_pct = lambda v: f"{v * 100:.1f}%" if isinstance(v, (int, float)) else "N/A"
             lines.append(
                 f"| {r['model']} | {r['quality']} | `{lang}` | {g['count']} | {g['evaluated_count']} | "
-                f"{fmt_pct(g['lang_detection_accuracy'])} | {fmt_pct(g['mean_wer'])} | {fmt_pct(g['mean_cer'])} |"
+                f"{fmt_pct(g['lang_detection_accuracy'])} | {fmt_pct(g['mean_wer'])} | {fmt_pct(g['mean_cer'])} | "
+                f"{g.get('script_mismatch_count', 0)} | {g.get('empty_count', 0)} |"
             )
     return "\n".join(lines) + "\n"
 

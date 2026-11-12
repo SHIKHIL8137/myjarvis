@@ -114,3 +114,13 @@ Executed with real hardware (`[1] Microphone Array (Realtek(R) Audio)` at 44.1 k
 - **Live Diagnostic Samples Verification**:
   - `benchmarks/samples/live_mixed.wav` (pure room noise floor, `rms=0.00058`): short-circuited without Whisper hallucination (`text=''`, `provider='none'`, `quality_flags=['no_speech_energy', 'very_low_input_volume', 'mostly_silence']`).
   - `benchmarks/samples/live_malayalam.wav`: flagged `quality_flags=['script_mismatch']`, `recognition_quality='low'`, `retry_triggered=True` when Whisper `small` emitted Devanagari on `ml` speech (optional local Malayalam specialized weights not installed offline yet).
+
+## Speech & Translation Targeted Fix Phase Verification (2026-11-12)
+
+- **Full Python Test Suite (`.\.venv\Scripts\pytest.exe -q -rs`)**: **232 passed, 4 skipped, 0 failed** (`352.31s`, including real microphone open/stream/release, live Ollama Qwen translation & tool-calling, DB migrations, API, security, and targeted speech fix regressions). See [SPEECH_TRANSLATION_FIX_REPORT.md](SPEECH_TRANSLATION_FIX_REPORT.md).
+  - Skipped (host prerequisites absent): Docker daemon not active (`test_p10_11_hardening.py:221`, `test_p10_12_hardening.py:165`) and `JARVIS_PG_TEST_URL` / `JARVIS_PG_SCRATCH_URL` unset (`test_p10_11_hardening.py:378`, `test_p10_pgvector_memory.py:193`).
+- **Static Checks**: `ruff check jarvis/stt.py jarvis/asr_providers.py jarvis/translator.py jarvis/api.py tests/test_speech_pipeline_upgrade.py benchmarks/multilingual/runner.py` and `mypy` across modified speech modules exited `0`.
+- **Frontend (`apps/frontend`)**: `npm test` **7 passed, 0 failed** (`graphCore.test.ts` + `speechStatus.test.ts`); `tsc --noEmit && vite build` transformed `43` modules (`dist/assets/index-CT6zLmQu.js` `266.86 kB`).
+- **Separated Synthetic vs Real Benchmarks**:
+  - `benchmarks/multilingual/manifest.json` (`15` verified English WAVs): `small balanced` `10.7%` WER / `3.7%` CER / `0` script mismatches / `0` hallucinations; `base balanced` `12.9%` WER / `3.5%` CER / `0` script mismatches / `0` hallucinations.
+  - `benchmarks/multilingual/manifest_live.json` (`4` live mic WAVs, no fabricated references, `WER=N/A`): `en` (`2/2` clean), `ml` (`1` `script_mismatch` flagged on generic `small`), `mixed` (`1` `empty` short-circuit on silent input, `0` hallucinations).

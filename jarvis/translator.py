@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import collections
 from dataclasses import asdict, dataclass, field
+from difflib import SequenceMatcher
 import json
 import logging
 from pathlib import Path
@@ -36,9 +37,43 @@ _NUMBER_RE = re.compile(r"\d+(?:[.,:/-]\d+)*")
 _TECH_TOKEN_RE = re.compile(r"\b[A-Za-z][A-Za-z0-9._+-]{2,}\b")
 _NEGATION_RE = re.compile(
     r"(?:\b(?:no|not|never|none|nothing|neither|nor|without|don't|dont|doesn't|didn't|won't|can't|cannot|shouldn't|couldn't|isn't|aren't|wasn't|weren't)\b"
-    r"|ഇല്ല|അല്ല|വേണ്ട|അരുത്|नहीं|मत|ना|இல்லை|வேண்டாம்)",
+    r"|ഇല്ല|അല്ല|വേണ്ട|അരുത്|കഴിയില്ല|പറ്റില്ല|കൂടാ|യില്ല|नहीं|मत|ना|இல்லை|வேண்டாம்|மாட்ட)",
     re.I,
 )
+_DATETIME_ANCHOR_RE = re.compile(
+    r"(?:\b\d{1,2}:\d{2}(?:\s?(?:am|pm))?\b|\b\d{1,2}\s?(?:am|pm)\b"
+    r"|\b(?:today|tomorrow|yesterday|tonight|morning|afternoon|evening|night)\b"
+    r"|\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b"
+    r"|\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b"
+    r"|ഇന്ന്|നാളെ|ഇന്നലെ|രാവിലെ|വൈകിട്ട്|രാത്രി)",
+    re.I,
+)
+_QUESTION_START_RE = re.compile(
+    r"^(?:who|what|when|where|why|how|which|whose|whom|is|are|was|were|do|does|did|can|could|will|would|should|have|has)\b"
+    r"|^(?:എന്ത്|എന്താണ്|എപ്പോൾ|എവിടെ|എങ്ങനെ|ആര്|ഏത്)",
+    re.I,
+)
+_CHATTER_PREFIXES = (
+    "here is",
+    "here's",
+    "sure,",
+    "certainly",
+    "i fixed",
+    "i have corrected",
+    "the corrected",
+    "note:",
+    "explanation:",
+)
+_STOPWORDS = {
+    "a", "an", "the", "is", "are", "was", "were", "be", "been", "to", "of",
+    "in", "on", "at", "for", "and", "or", "it", "its", "this", "that", "with",
+    "from", "by", "as", "my", "your", "our", "me", "you", "please",
+}
+_CROSS_TIME_EQUIV: dict[str, set[str]] = {
+    "today": {"today", "ഇന്ന്", "आज", "இன்று"},
+    "tomorrow": {"tomorrow", "നാളെ", "कल", "நாளை"},
+    "yesterday": {"yesterday", "ഇന്നലെ", "कल", "நேற்று"},
+}
 _SCRIPT_RANGES: dict[str, tuple[int, int]] = {
     "ml": (0x0D00, 0x0D7F),
     "hi": (0x0900, 0x097F),
@@ -71,10 +106,13 @@ class TranscriptRecord:
     source_language: str = "unknown"
     recognition_model: str = ""
     recognition_quality: str = "medium"
+    review_needed: bool = False
     translation_provider: str | None = None
     status: str = "completed"
     quality_flags: list[str] = field(default_factory=list)
     attempts: list[dict] = field(default_factory=list)
+    provider_status: dict = field(default_factory=dict)
+    provider_errors: list[dict] = field(default_factory=list)
     audio_diagnostics: dict = field(default_factory=dict)
     translation_verification: dict | None = None
     eval_consent: bool = False
@@ -115,17 +153,59 @@ def _count_script_chars(text: str, lang: str) -> tuple[int, int]:
     return matched, total
 
 
+def _extract_tech_and_entities(text: str, *, include_initial_cap: bool = False) -> list[str]:
+    """Extract technical identifiers, mixed-case tokens, acronyms, dotted names, and proper nouns."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for idx, raw_tok in enumerate(text.split()):
+        tok = raw_tok.strip(".,!?;:\"'()[]{}")
+        if len(tok) < 2:
+            continue
+        is_tech = (
+            ("_" in tok or "." in tok or "/" in tok or "::" in tok)
+            or (any(c.isdigit() for c in tok) and any(c.isalpha() for c in tok))
+            or (sum(1 for c in tok if c.isupper()) >= 2)
+            or (any(c.isupper() for c in tok[1:]) and any(c.islower() for c in tok))
+        )
+        is_proper = bool(tok[0].isupper() and (idx > 0 or include_initial_cap))
+        if is_tech or is_proper:
+            key = tok.lower()
+            if key not in seen:
+                seen.add(key)
+                out.append(tok)
+    return out
+
+
+def _content_words(text: str) -> list[str]:
+    words = re.findall(r"[^\W_]{2,}", text.lower(), flags=re.UNICODE)
+    return [w for w in words if w not in _STOPWORDS]
+
+
+def _word_covered(word: str, target_words: list[str], target_squashed: str) -> bool:
+    if word in target_words or word in target_squashed:
+        return True
+    return any(SequenceMatcher(None, word, tw).ratio() >= 0.72 for tw in target_words)
+
+
 def guard_correction(raw: str, candidate: str) -> tuple[str, bool, list[str]]:
-    """Reject hallucinated or meaning-altering LLM transcript edits."""
+    """Reject hallucinated, conversational, paraphrased, or meaning-altering LLM transcript edits."""
     flags: list[str] = []
     raw_clean = raw.strip()
+    cand_raw = (candidate or "").strip()
     cand_clean = _strip_llm_noise(candidate)
     if not raw_clean:
         return "", True, flags
     if not cand_clean:
         return raw_clean, False, ["correction_rejected_empty"]
 
-    # Reject large length expansion/shrinkage (typical sign of LLM commentary or dropped words)
+    # Reject conversational LLM chatter / commentary / multi-paragraph explanations
+    cand_low = cand_clean.lower()
+    cand_raw_low = cand_raw.lower()
+    if "\n\n" in cand_raw or any(cand_low.startswith(p) or cand_raw_low.startswith(p) for p in _CHATTER_PREFIXES):
+        flags.append("correction_rejected_llm_chatter")
+        return raw_clean, False, flags
+
+    # Reject large length expansion/shrinkage
     if len(cand_clean) > max(int(len(raw_clean) * 1.45), len(raw_clean) + 28):
         flags.append("correction_rejected_expansion")
         return raw_clean, False, flags
@@ -140,25 +220,88 @@ def guard_correction(raw: str, candidate: str) -> tuple[str, bool, list[str]]:
         flags.append("correction_rejected_number_mismatch")
         return raw_clean, False, flags
 
-    # Reject negation loss/flip
-    raw_neg = len(_NEGATION_RE.findall(raw_clean))
-    cand_neg = len(_NEGATION_RE.findall(cand_clean))
-    if raw_neg != cand_neg:
+    # Require dates / times / day anchors to survive intact
+    raw_dt = [m.lower().strip() for m in _DATETIME_ANCHOR_RE.findall(raw_clean)]
+    cand_dt = [m.lower().strip() for m in _DATETIME_ANCHOR_RE.findall(cand_clean)]
+    if raw_dt != cand_dt:
+        flags.append("correction_rejected_datetime_mismatch")
+        return raw_clean, False, flags
+
+    # Require technical identifiers & proper names to remain present (allowing spacing/casing normalization)
+    cand_squashed = re.sub(r"[\s._-]+", "", cand_low)
+    raw_squashed = re.sub(r"[\s._-]+", "", raw_clean.lower())
+    for ent in _extract_tech_and_entities(raw_clean, include_initial_cap=False):
+        ent_sq = re.sub(r"[\s._-]+", "", ent.lower())
+        if ent.lower() not in cand_low and ent_sq not in cand_squashed:
+            flags.append("correction_rejected_entity_mismatch")
+            return raw_clean, False, flags
+
+    # Reject negation loss/flip or local negation-scope shift
+    raw_neg_matches = list(_NEGATION_RE.finditer(raw_clean))
+    cand_neg_matches = list(_NEGATION_RE.finditer(cand_clean))
+    if len(raw_neg_matches) != len(cand_neg_matches):
         flags.append("correction_rejected_negation_change")
+        return raw_clean, False, flags
+    for rm, cm in zip(raw_neg_matches, cand_neg_matches):
+        r_ctx = _content_words(raw_clean[rm.end() : rm.end() + 32])[:2]
+        c_ctx = _content_words(cand_clean[cm.end() : cm.end() + 32])[:3]
+        if r_ctx and c_ctx and not any(_word_covered(rw, c_ctx, "".join(c_ctx)) for rw in r_ctx):
+            flags.append("correction_rejected_negation_change")
+            return raw_clean, False, flags
+
+    # Reject question/command/intent flip
+    raw_q = raw_clean.endswith("?")
+    cand_q = cand_clean.endswith("?")
+    raw_interr = bool(_QUESTION_START_RE.match(raw_clean))
+    cand_interr = bool(_QUESTION_START_RE.match(cand_clean))
+    if (raw_q and not cand_q and not cand_interr) or (not raw_q and not raw_interr and cand_q):
+        flags.append("correction_rejected_intent_change")
+        return raw_clean, False, flags
+
+    # Detect meaningful word drop or hallucinated word insertion
+    raw_cw = _content_words(raw_clean)
+    cand_cw = _content_words(cand_clean)
+    dropped = [w for w in raw_cw if not _word_covered(w, cand_cw, cand_squashed)]
+    invented = [w for w in cand_cw if not _word_covered(w, raw_cw, raw_squashed)]
+    if len(dropped) >= 2 or len(invented) >= 2 or (len(raw_cw) <= 4 and (dropped or invented)):
+        flags.append("correction_rejected_word_drift")
+        return raw_clean, False, flags
+
+    # Reject unnecessary cosmetic-only paraphrases that rewrite sentence structure
+    if len(raw_clean) >= 12 and SequenceMatcher(None, raw_clean.lower(), cand_low).ratio() < 0.72:
+        flags.append("correction_rejected_paraphrase")
         return raw_clean, False, flags
 
     return cand_clean, True, flags
 
 
 def verify_translation(source: str, translated: str, source_lang: str, target_lang: str) -> dict:
-    """Deterministically verify semantic anchors between source text and translation."""
+    """Deterministically check structural/anchor cues between source and translation.
+    Heuristic verification only: never guarantees full semantic equivalence."""
     src = source.strip()
     tr = translated.strip()
     warnings: list[str] = []
+    note = "Heuristic structural check only; full semantic equivalence requires human or contextual review."
     if not src:
-        return {"passed": True, "uncertain": False, "warnings": [], "score": 1.0}
+        return {
+            "passed": True,
+            "uncertain": False,
+            "warnings": [],
+            "score": 1.0,
+            "semantic_equivalence_proven": False,
+            "check_method": "heuristic_anchors",
+            "note": note,
+        }
     if not tr:
-        return {"passed": False, "uncertain": True, "warnings": ["empty_translation"], "score": 0.0}
+        return {
+            "passed": False,
+            "uncertain": True,
+            "warnings": ["empty_translation"],
+            "score": 0.0,
+            "semantic_equivalence_proven": False,
+            "check_method": "heuristic_anchors",
+            "note": note,
+        }
 
     # 1. Numbers must be preserved
     src_nums = _NUMBER_RE.findall(src)
@@ -167,40 +310,73 @@ def verify_translation(source: str, translated: str, source_lang: str, target_la
         if num not in tr_nums:
             warnings.append(f"missing_number:{num}")
 
-    # 2. Negation parity check (when both sides express standard negation markers)
+    # 1b. Explicit time/day anchors preserved (with safe cross-lingual day table)
+    src_dt = [m.lower().strip() for m in _DATETIME_ANCHOR_RE.findall(src)]
+    tr_low = tr.lower()
+    for anchor in src_dt:
+        if ":" in anchor or "am" in anchor or "pm" in anchor:
+            digits = _NUMBER_RE.findall(anchor)
+            if digits and not all(d in tr_nums or d in tr_low for d in digits):
+                warnings.append(f"missing_time:{anchor}")
+        elif anchor in _CROSS_TIME_EQUIV and source_lang != target_lang:
+            if not any(eq in tr_low for eq in _CROSS_TIME_EQUIV[anchor]):
+                warnings.append(f"missing_time_anchor:{anchor}")
+
+    # 2. Negation parity check (covering EN + Malayalam/Hindi/Tamil negation particles)
     src_neg = bool(_NEGATION_RE.search(src))
     tr_neg = bool(_NEGATION_RE.search(tr))
     if src_neg != tr_neg:
         warnings.append("negation_mismatch")
 
-    # 3. Question mark parity
-    if ("?" in src) != ("?" in tr):
+    # 3. Question / command intent parity
+    src_q = ("?" in src) or bool(_QUESTION_START_RE.match(src))
+    tr_q = ("?" in tr) or bool(_QUESTION_START_RE.match(tr)) or any(
+        tr.rstrip(".! ").endswith(sfx) for sfx in ("ണോ", "യോ", "മോ", "ല്ലേ", "ണ്ടോ")
+    )
+    if ("?" in src) != ("?" in tr) or (src_q != tr_q):
         warnings.append("question_tone_mismatch")
 
-    # 4. Target script sanity check
+    # 4. Target script sanity & untranslated echo detection
     if target_lang in ("en", "ml", "hi", "ta", "te", "kn"):
         matched, total = _count_script_chars(tr, target_lang)
         if total >= 6 and matched == 0:
             warnings.append(f"target_script_missing:{target_lang}")
         elif target_lang != "en" and total >= 10 and (matched / max(1, total)) < 0.25:
             warnings.append(f"low_target_script_ratio:{target_lang}")
+    if (
+        source_lang != target_lang
+        and target_lang not in ("none", "mixed", source_lang)
+        and len(src) >= 12
+        and tr_low == src.lower()
+    ):
+        warnings.append("untranslated_copy")
 
-    # 5. Technical / proper capitalized Latin terms preserved when translating to English
-    if target_lang == "en":
-        src_cap = [t for t in _TECH_TOKEN_RE.findall(src) if any(c.isupper() for c in t[1:]) or t[0].isupper()]
-        for term in src_cap:
-            if term.lower() not in tr.lower():
+    # 5. Technical identifiers & proper names preserved cleanly across code-switched / target outputs
+    for term in _extract_tech_and_entities(src, include_initial_cap=False):
+        if target_lang == "en" or any(c.isdigit() or c in "._-/" for c in term) or (
+            sum(1 for c in term if c.isupper()) >= 2
+        ) or any(c.isupper() for c in term[1:]):
+            if term.lower() not in tr_low:
                 warnings.append(f"missing_term:{term}")
 
-    # 6. Extreme length anomaly
+    # 6. Extreme expansion / truncation anomaly
     ratio = len(tr) / max(1, len(src))
-    if ratio > 4.0 or ratio < 0.2:
+    if len(src) >= 12 and (ratio > 2.8 or ratio < 0.25):
+        warnings.append("length_ratio_anomaly")
+    elif ratio > 4.0 or ratio < 0.2:
         warnings.append("length_ratio_anomaly")
 
+    warnings = list(dict.fromkeys(warnings))
     score = round(max(0.0, 1.0 - 0.25 * len(warnings)), 3)
     uncertain = len(warnings) > 0
     critical = any(
-        w.startswith(("empty_translation", "missing_number", "negation_mismatch", "target_script_missing"))
+        w.startswith((
+            "empty_translation",
+            "missing_number",
+            "negation_mismatch",
+            "target_script_missing",
+            "untranslated_copy",
+        ))
         for w in warnings
     )
     return {
@@ -208,6 +384,9 @@ def verify_translation(source: str, translated: str, source_lang: str, target_la
         "uncertain": uncertain,
         "warnings": warnings,
         "score": score,
+        "semantic_equivalence_proven": False,
+        "check_method": "heuristic_anchors",
+        "note": note,
     }
 
 
@@ -252,10 +431,13 @@ class TranscriptStore:
             source_language=str(getattr(row, "source_language", row.detected_language) or row.detected_language),
             recognition_model=str(meta.get("recognition_model", row.model) or row.model),
             recognition_quality=str(getattr(row, "recognition_quality", "medium") or "medium"),
+            review_needed=bool(meta.get("review_needed", False)),
             translation_provider=meta.get("translation_provider") or row.translation_engine,
             status=str(meta.get("status", "completed")),
             quality_flags=list(meta.get("quality_flags", [])),
             attempts=list(meta.get("attempts", [])),
+            provider_status=dict(meta.get("provider_status", {})),
+            provider_errors=list(meta.get("provider_errors", [])),
             audio_diagnostics=dict(meta.get("audio_diagnostics", {})),
             translation_verification=meta.get("translation_verification"),
             eval_consent=bool(meta.get("eval_consent", False)),
@@ -271,10 +453,13 @@ class TranscriptStore:
             "no_speech_prob": rec.no_speech_prob,
             "compression_ratio": rec.compression_ratio,
             "recognition_model": rec.recognition_model,
+            "review_needed": rec.review_needed,
             "translation_provider": rec.translation_provider,
             "status": rec.status,
             "quality_flags": rec.quality_flags,
             "attempts": rec.attempts,
+            "provider_status": rec.provider_status,
+            "provider_errors": rec.provider_errors,
             "audio_diagnostics": rec.audio_diagnostics,
             "translation_verification": rec.translation_verification,
             "eval_consent": rec.eval_consent,
@@ -608,10 +793,11 @@ class Translator:
                     )
                     w_txt = str(w_tr.get("text", "") or "").strip()
                     if w_txt:
-                        translated = w_txt
-                        engine = "whisper"
-                        if bool(getattr(cfg, "verify_translations", True)):
-                            verification = verify_translation(corrected, translated, lang, "en")
+                        w_ver = verify_translation(corrected, w_txt, lang, "en") if bool(getattr(cfg, "verify_translations", True)) else None
+                        if w_ver is None or w_ver.get("passed", True) or self.brain is None:
+                            translated = w_txt
+                            engine = "whisper"
+                            verification = w_ver
                 except Exception as e:
                     log.warning("whisper translate failed, falling back to qwen: %s", e)
 
@@ -629,9 +815,25 @@ class Translator:
                     log.warning("qwen translation failed: %s", e)
                     flags.append(f"translation_error:{e}")
 
+        rec_quality = str(stt_res.get("recognition_quality") or stt_res.get("quality") or "medium")
+        provider_status = dict(stt_res.get("provider_status") or {})
+        provider_errors = list(stt_res.get("provider_errors") or [])
+        translation_uncertain = bool(verification and verification.get("uncertain"))
+        review_needed = bool(
+            stt_res.get("review_needed", False)
+            or rec_quality != "high"
+            or translation_uncertain
+            or bool(provider_errors)
+        )
+
         if not raw_text:
             status = "empty"
-        elif "uncertain_transcript" in flags or (verification and verification.get("uncertain")):
+        elif (
+            "uncertain_transcript" in flags
+            or rec_quality == "low"
+            or translation_uncertain
+            or bool(provider_errors)
+        ):
             status = "uncertain"
         else:
             status = "completed"
@@ -655,11 +857,14 @@ class Translator:
             translation_provider=engine,
             model=model_name,
             recognition_model=model_name,
-            recognition_quality=str(stt_res.get("quality", "medium") or "medium"),
+            recognition_quality=rec_quality,
+            review_needed=review_needed,
             seconds=float(stt_res.get("seconds", 0.0) or 0.0),
             status=status,
             quality_flags=flags,
             attempts=list(stt_res.get("attempts", [])),
+            provider_status=provider_status,
+            provider_errors=provider_errors,
             audio_diagnostics=dict(stt_res.get("audio_diagnostics", {})),
             translation_verification=verification,
             eval_consent=False,

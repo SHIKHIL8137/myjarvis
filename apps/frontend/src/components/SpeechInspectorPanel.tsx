@@ -1,15 +1,20 @@
 import React, { useState } from "react";
 import { apiFetch } from "../api/client";
+import { classifyTranscriptStatus } from "../speechStatus";
 
 export interface VoiceAttemptItem {
   provider?: string;
   model?: string;
   language?: string | null;
   quality?: string;
+  quality_tier?: string;
   confidence?: number;
   score?: number;
   detected_language?: string;
   text?: string;
+  reason?: string;
+  flags?: string[];
+  error?: string;
 }
 
 export interface VoiceTranscriptItem {
@@ -26,11 +31,22 @@ export interface VoiceTranscriptItem {
   translation_engine?: string | null;
   model?: string;
   recognition_quality?: string;
+  review_needed?: boolean;
   seconds?: number;
   created_at?: number;
   status?: string;
   quality_flags?: string[];
   attempts?: VoiceAttemptItem[];
+  provider_status?: {
+    requested?: string;
+    available?: boolean;
+    reason?: string;
+  };
+  provider_errors?: Array<{
+    provider?: string;
+    model?: string;
+    error?: string;
+  }>;
   audio_diagnostics?: {
     sample_rate?: number;
     channels?: number;
@@ -48,6 +64,9 @@ export interface VoiceTranscriptItem {
     uncertain?: boolean;
     warnings?: string[];
     score?: number;
+    semantic_equivalence_proven?: boolean;
+    check_method?: string;
+    note?: string;
   } | null;
   eval_consent?: boolean;
 }
@@ -68,7 +87,7 @@ const LANG_OPTIONS = [
   ["ta", "Tamil"],
 ];
 
-const MODEL_OPTIONS = ["base", "small", "small.en", "tiny", "medium"];
+const MODEL_OPTIONS = ["base", "small", "small.en", "tiny", "medium", "malayalam_whisper", "indic_conformer"];
 const QUALITY_OPTIONS = ["fast", "balanced", "high"];
 const PREP_OPTIONS = ["light", "standard", "off"];
 
@@ -201,6 +220,9 @@ export const SpeechInspectorPanel: React.FC<SpeechInspectorPanelProps> = ({
 
   const diag = active?.audio_diagnostics;
   const confPct = Math.round((active?.confidence || 0) * 100);
+  const recQuality = active?.recognition_quality || "medium";
+  const statusSummary = classifyTranscriptStatus(active);
+  const qualityBadge = { label: statusSummary.qualityLabel, cls: statusSummary.qualityTone };
   const currentDraft =
     selectedId === active?.id ? draftCorrection : active?.corrected_transcript || active?.original_transcript || "";
 
@@ -236,11 +258,17 @@ export const SpeechInspectorPanel: React.FC<SpeechInspectorPanelProps> = ({
           <div className="row wrap between" style={{ gap: 6 }}>
             <div className="row wrap" style={{ gap: 6 }}>
               <span className="pill info">Lang: {active.detected_language}</span>
+              <span className={`pill ${qualityBadge.cls}`}>{qualityBadge.label}</span>
               <span className={`pill ${confPct >= 75 ? "ok" : confPct >= 50 ? "warn" : "danger"}`}>
                 Conf: {confPct}%
               </span>
-              {active.model && <span className="chip static">{active.model} · {active.recognition_quality || "balanced"}</span>}
+              {active.model && <span className="chip static">{active.model} · {recQuality}</span>}
               {active.status === "uncertain" && <span className="pill warn">Uncertain</span>}
+              {active.provider_status?.available === false && (
+                <span className="pill danger">
+                  Provider unavailable: {active.provider_status.requested || "specialist"}
+                </span>
+              )}
               {active.quality_flags?.map((f) => (
                 <span key={f} className="pill warn">{f}</span>
               ))}
@@ -254,6 +282,20 @@ export const SpeechInspectorPanel: React.FC<SpeechInspectorPanelProps> = ({
               Delete Audio &amp; Record
             </button>
           </div>
+
+          {((active.provider_errors && active.provider_errors.length > 0) || active.provider_status?.available === false) && (
+            <div className="card" style={{ padding: "6px 10px", borderColor: "var(--warn, #d97706)" }}>
+              <small className="dim">Provider / Fallback Notes</small>
+              <div className="mono" style={{ fontSize: 11.5, marginTop: 2 }}>
+                {active.provider_status?.available === false && (
+                  <div>{active.provider_status.requested}: {active.provider_status.reason || "Unavailable locally; fell back."}</div>
+                )}
+                {active.provider_errors?.map((pe, idx) => (
+                  <div key={idx}>{pe.provider || pe.model || "provider"}: {pe.error}</div>
+                ))}
+              </div>
+            </div>
+          )}
 
           {active.audio_id && (
             <div className="row wrap between" style={{ gap: 8, alignItems: "center" }}>
@@ -337,14 +379,22 @@ export const SpeechInspectorPanel: React.FC<SpeechInspectorPanelProps> = ({
                   Translated ({active.target_language}) · {active.translation_engine || "qwen"}
                 </small>
                 {active.translation_verification && (
-                  <span className={`pill ${active.translation_verification.uncertain ? "warn" : "ok"}`}>
+                  <span
+                    className={`pill ${active.translation_verification.uncertain ? "warn" : "ok"}`}
+                    title={active.translation_verification.note || "Heuristic structural verification"}
+                  >
                     {active.translation_verification.uncertain
-                      ? `Verify: ${(active.translation_verification.warnings || []).join(", ")}`
-                      : "Verified"}
+                      ? `Translation uncertain: ${(active.translation_verification.warnings || []).join(", ")}`
+                      : "Heuristic anchors OK"}
                   </span>
                 )}
               </div>
               <p style={{ margin: "4px 0 0", fontSize: 13 }}>{active.translated_text}</p>
+              {active.translation_verification?.uncertain && active.translation_verification.note && (
+                <small className="dim" style={{ display: "block", marginTop: 4 }}>
+                  {active.translation_verification.note}
+                </small>
+              )}
             </div>
           )}
 
@@ -384,7 +434,7 @@ export const SpeechInspectorPanel: React.FC<SpeechInspectorPanelProps> = ({
                 <div style={{ marginTop: 6, display: "grid", gap: 4 }}>
                   {active.attempts.map((a, idx) => (
                     <div key={idx} className="dim mono" style={{ fontSize: 11 }}>
-                      #{idx + 1} [{a.model}/{a.quality} lang={a.language || a.detected_language}] score={a.score} conf={Math.round((a.confidence || 0) * 100)}%: {a.text}
+                      #{idx + 1} [{a.provider || "fw"}/{a.model}/{a.quality_tier || a.quality || "?"} {a.reason ? `(${a.reason}) ` : ""}lang={a.language || a.detected_language}] score={a.score} conf={Math.round((a.confidence || 0) * 100)}%: {a.error ? `ERROR: ${a.error}` : a.text}
                     </div>
                   ))}
                 </div>

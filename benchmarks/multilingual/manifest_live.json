@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "description": "Real recorded microphone WAVs from benchmarks/samples/ kept strictly separate from synthetic tests. No reference transcripts are fabricated; only language/script/quality/latency/empty metrics are evaluated until human-verified references are supplied via opt-in consent.",
+  "samples": [
+    {
+      "id": "live_wake",
+      "audio": "../samples/live_wake.wav",
+      "language": "en",
+      "requested_language": "en",
+      "category": "live_wake",
+      "source": "real_mic_recording",
+      "reference": "",
+      "reference_verified": false
+    },
+    {
+      "id": "live_english",
+      "audio": "../samples/live_english.wav",
+      "language": "en",
+      "requested_language": "en",
+      "category": "live_english",
+      "source": "real_mic_recording",
+      "reference": "",
+      "reference_verified": false
+    },
+    {
+      "id": "live_malayalam",
+      "audio": "../samples/live_malayalam.wav",
+      "language": "ml",
+      "requested_language": "ml",
+      "category": "live_malayalam",
+      "source": "real_mic_recording",
+      "reference": "",
+      "reference_verified": false
+    },
+    {
+      "id": "live_mixed",
+      "audio": "../samples/live_mixed.wav",
+      "language": "mixed",
+      "requested_language": "mixed",
+      "category": "live_mixed",
+      "source": "real_mic_recording",
+      "reference": "",
+      "reference_verified": false
+    }
+  ]
+}
+

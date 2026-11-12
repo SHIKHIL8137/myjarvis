@@ -328,7 +328,7 @@ class MalayalamASRProvider(ASRProvider):
                         str(self.ct2_dir),
                         device="cpu",
                         compute_type=opt.compute_type,
-                        cpu_threads=opt.cpu_threads,
+                        cpu_threads=max(1, int(opt.cpu_threads)),
                         local_files_only=True,
                     )
             assert self._ct2_model is not None
@@ -365,7 +365,13 @@ class MalayalamASRProvider(ASRProvider):
 
         with self._lock:
             if self._hf_pipe is None:
+                import torch
                 from transformers import pipeline
+
+                try:
+                    torch.set_num_threads(max(1, int(opt.cpu_threads)))
+                except Exception:
+                    pass
                 self._hf_pipe = pipeline(
                     "automatic-speech-recognition",
                     model=str(self.hf_dir),
@@ -455,7 +461,7 @@ class IndicConformerProvider(ASRProvider):
                 self._recognizer = sherpa_onnx.OfflineRecognizer.from_nemo_ctc(
                     model=str(m),
                     tokens=str(tok),
-                    num_threads=max(1, min(4, int(opt.cpu_threads))),
+                    num_threads=max(1, int(opt.cpu_threads)),
                     provider="cpu",
                 )
         assert self._recognizer is not None
