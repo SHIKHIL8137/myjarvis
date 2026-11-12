@@ -4,7 +4,6 @@ voice/model switching, filesystem search/inspection, and learning/training lifec
 import re
 
 from . import audit
-from .actions import ActionPermissionError
 from .brain import BrainError
 from .filesystem import FilesystemPermissionError
 from .learning.feedback import is_correction_statement
@@ -149,6 +148,8 @@ async def route_intent(a, text: str) -> dict | None:
         a.speaker.stop()
         if hasattr(a, "actions"):
             a.actions.tasks.cancel_active()
+        if hasattr(a, "orchestrator"):
+            a.orchestrator.cancel_active_runs(reason="User stop command")
         return _res("stop", "Stopped.", speak=False)
 
     if PAUSE_VOICE.match(text):
@@ -395,36 +396,45 @@ async def route_intent(a, text: str) -> dict | None:
         return _res("search_history", f"Found {len(hits)} past turns: {snippets}", history_hits=hits)
 
     # Filesystem & action execution commands
-    if m := SEARCH_FILES.match(text):
-        if hasattr(a, "filesystem"):
-            q = m.group(1).strip(" .?!\"'")
-            try:
-                matches = a.filesystem.search(q, limit=10)
-                if not matches:
-                    return _res("search_files", f"No files or folders matched '{q}' inside allowed directories.", ok=False)
-                listed = ", ".join(x["name"] for x in matches[:5])
-                return _res("search_files", f"Found {len(matches)} matching files: {listed}.", files=matches)
-            except FilesystemPermissionError as e:
-                return _res("search_files", str(e), ok=False)
+    # Host directories / explicit OS paths route through DecisionEngine + P10.20 FilesystemAccessManager
+    _host_fs_cue = bool(
+        re.search(
+            r"(?:[A-Za-z]:\\|\\\\[^\s]+|\b(?:documents|downloads|desktop|pictures|pdf\s+documents?|folder|directory)\b|\.\.)",
+            text or "",
+            re.I,
+        )
+    )
+    if not _host_fs_cue:
+        if m := SEARCH_FILES.match(text):
+            if hasattr(a, "filesystem"):
+                q = m.group(1).strip(" .?!\"'")
+                try:
+                    matches = a.filesystem.search(q, limit=10)
+                    if not matches:
+                        return _res("search_files", f"No files or folders matched '{q}' inside allowed directories.", ok=False)
+                    listed = ", ".join(x["name"] for x in matches[:5])
+                    return _res("search_files", f"Found {len(matches)} matching files: {listed}.", files=matches)
+                except FilesystemPermissionError as e:
+                    return _res("search_files", str(e), ok=False)
 
-    if m := READ_DOC.match(text):
-        if hasattr(a, "filesystem"):
-            target = m.group(1).strip(" .?!\"'")
-            try:
-                doc = a.filesystem.read_document(target, max_chars=2500)
-                preview = doc["content"][:600].replace("\n", " ").strip()
-                return _res("read_file", f"{doc['path']} ({doc['chars']} chars): {preview}", document=doc)
-            except Exception as e:
-                return _res("read_file", f"Could not read {target}: {e}", ok=False)
+        if m := READ_DOC.match(text):
+            if hasattr(a, "filesystem"):
+                target = m.group(1).strip(" .?!\"'")
+                try:
+                    doc = a.filesystem.read_document(target, max_chars=2500)
+                    preview = doc["content"][:600].replace("\n", " ").strip()
+                    return _res("read_file", f"{doc['path']} ({doc['chars']} chars): {preview}", document=doc)
+                except Exception as e:
+                    return _res("read_file", f"Could not read {target}: {e}", ok=False)
 
-    if m := OPEN_FILE.match(text):
-        if hasattr(a, "actions"):
-            target = m.group(1).strip(" .?!\"'")
-            try:
-                out = a.actions.request_or_execute("open_file", {"path": target})
-                return _res("open_file", f"Opened {out.get('opened', target)}.", action_result=out)
-            except Exception as e:
-                return _res("open_file", f"Could not open {target}: {e}", ok=False)
+        if m := OPEN_FILE.match(text):
+            if hasattr(a, "actions"):
+                target = m.group(1).strip(" .?!\"'")
+                try:
+                    out = a.actions.request_or_execute("open_file", {"path": target})
+                    return _res("open_file", f"Opened {out.get('opened', target)}.", action_result=out)
+                except Exception as e:
+                    return _res("open_file", f"Could not open {target}: {e}", ok=False)
 
     if m := OPEN_APP.match(text):
         app_name = m.group(1).strip().lower()

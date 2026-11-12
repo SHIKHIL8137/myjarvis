@@ -33,7 +33,6 @@ from .config import (
     setup_logging,
 )
 from .search import SearchError, SearchOfflineError
-from .stt import SUPPORTED_LANGUAGES, list_local_models
 
 log = logging.getLogger("jarvis.api")
 MAX_WAV = 10 * 1024 * 1024
@@ -84,7 +83,7 @@ class MicIn(BaseModel):
 
 
 class VoiceSessionIn(BaseModel):
-    action: str = Field(..., pattern="^(start|pause|resume|stop|interrupt|mode)$")
+    action: str = Field(..., pattern="^(start|pause|resume|stop|interrupt|mode|recover)$")
     mode: str | None = Field(None, max_length=20)
 
 
@@ -300,13 +299,23 @@ def create_app(settings: Settings | None = None, assistant: Assistant | None = N
         a = A()
         a._set_os_state("Transcribing", source="voice", detail="whisper")
         stt_res = await asyncio.to_thread(a.stt.transcribe, audio, language=language, quality=quality)
+        raw_text = (stt_res.get("text") or "").strip()
+        if raw_text:
+            graph_live.publish_os_event(
+                a.bus,
+                "assistant.transcript.partial",
+                legacy_type="transcript_partial",
+                source_department="assistant",
+                payload={"text": raw_text, "language": stt_res.get("language", "unknown")},
+                text=raw_text,
+            )
         rec = await a.translator.process_stt(stt_res, a.settings.translation, audio=audio, target_override=translate_to)
         t_payload = rec.to_dict()
         a.bus.publish({"type": "transcript_record", **t_payload})
         prompt_text = (rec.translated_text if (rec.translated_text and rec.target_language == "en" and rec.detected_language != "en") else rec.corrected_transcript or "").strip()
         if not prompt_text:
             a._set_os_state("Idle", source="voice")
-            return {"transcript": t_payload, "prompt": "", "ok": False, "answer": ""}
+            return {"transcript": t_payload, "prompt": "", "ok": False, "answer": "", "ui": None}
         graph_live.publish_os_event(
             a.bus,
             "assistant.transcript.final",
@@ -322,11 +331,13 @@ def create_app(settings: Settings | None = None, assistant: Assistant | None = N
         async for ev in a.stream_turn(prompt_text, speak=speak, source="voice"):
             a.bus.publish(ev)
             turn_events.append(ev)
-            if ev.get("type") in ("done", "error"):
+            if ev.get("type") in ("done", "error", "interrupted"):
                 done_ev = ev
         if done_ev.get("type") == "error":
             raise BrainError(done_ev.get("message") or "Turn failed")
-        return {"transcript": t_payload, "prompt": prompt_text, "ok": done_ev.get("ok", True), **done_ev}
+        if done_ev.get("type") == "interrupted":
+            return {"transcript": t_payload, "prompt": prompt_text, "ok": False, "interrupted": True, "answer": "", "ui": None}
+        return {"transcript": t_payload, "prompt": prompt_text, "ok": done_ev.get("ok", True), "ui": done_ev.get("ui"), **done_ev}
 
     @app.post("/api/voice/correct")
     async def correct_transcript(body: CorrectIn):
@@ -393,6 +404,8 @@ def create_app(settings: Settings | None = None, assistant: Assistant | None = N
             "mode": a.voice.mode,
             "paused": a.voice.paused,
             "mic_suspended": a.voice.mic_suspended,
+            "mic_active": a.voice.mic_active,
+            "wake_ready": a.wake.ready,
             "duplex": a.voice.duplex_info(),
             "tts_status": a.speaker.status(),
             "error": a.voice.last_error,
@@ -413,7 +426,9 @@ def create_app(settings: Settings | None = None, assistant: Assistant | None = N
         elif act == "resume":
             a.voice.resume()
         elif act == "interrupt":
-            a.voice.interrupt(reason="manual_interrupt")
+            await a.interrupt_all(reason="manual_interrupt")
+        elif act == "recover":
+            await asyncio.to_thread(a.voice.recover, mode=body.mode)
         elif act == "mode":
             if not body.mode:
                 raise ValueError("mode is required when action is 'mode'")
@@ -426,6 +441,8 @@ def create_app(settings: Settings | None = None, assistant: Assistant | None = N
             "mode": a.voice.mode,
             "paused": a.voice.paused,
             "mic_suspended": a.voice.mic_suspended,
+            "mic_active": a.voice.mic_active,
+            "wake_ready": a.wake.ready,
             "duplex": a.voice.duplex_info(),
             "tts_status": a.speaker.status(),
             "error": a.voice.last_error,
@@ -433,14 +450,7 @@ def create_app(settings: Settings | None = None, assistant: Assistant | None = N
 
     @app.post("/api/voice/interrupt")
     async def voice_interrupt():
-        a = A()
-        a.voice.interrupt(reason="manual_interrupt")
-        return {
-            "ok": True,
-            "state": a.voice.state,
-            "audio_state": a.voice.audio_state.value,
-            "mode": a.voice.mode,
-        }
+        return await A().interrupt_all(reason="manual_interrupt")
 
     @app.post("/api/voice/ptt")
     async def ptt():
@@ -543,66 +553,14 @@ def create_app(settings: Settings | None = None, assistant: Assistant | None = N
     # ---- config --------------------------------------------------------------------------------------
     @app.get("/api/config")
     async def get_config():
-        s = A().settings
-        return {
-            "tts": s.tts.model_dump(),
-            "wake": s.wake.model_dump(),
-            "audio": s.audio.model_dump(),
-            "stt": s.stt.model_dump(),
-            "translation": s.translation.model_dump(),
-            "internet": s.internet.model_dump(exclude={"allowed_search_hosts"}),
-            "memory": s.memory.model_dump(),
-            "filesystem": s.filesystem.model_dump(),
-            "actions": s.actions.model_dump(),
-            "providers": s.providers.model_dump(),
-            "learning": s.learning.model_dump(),
-            "history_turns": s.history_turns,
-            "boot_brain": s.boot_brain,
-            "offline_enforced": s.offline_enforced,
-            "mode": s.mode,
-            "num_ctx": A().brain.spec.num_ctx,
-            "voices": sorted(p.stem for p in (ROOT / "models" / "piper").glob("*.onnx")),
-            "stt_models": list_local_models(),
-            "stt_languages": SUPPORTED_LANGUAGES,
-            "api_keys_configured": _api_keys_status(),
-        }
+        from .api_deps import build_consolidated_settings
+        return build_consolidated_settings(A())
 
     @app.put("/api/config")
     async def put_config(request: Request):
+        from .api_deps import apply_settings_patch
         patch = await request.json()
-        allowed = {
-            "tts", "wake", "audio", "stt", "translation", "internet",
-            "history_turns", "boot_brain", "num_ctx",
-            "memory", "filesystem", "actions", "providers", "learning",
-        }
-        if not isinstance(patch, dict) or set(patch) - allowed:
-            raise ValueError("only tts, wake, audio, stt, translation, internet, history_turns, boot_brain and num_ctx can be changed here")
-        if "num_ctx" in patch:  # context size of the current brain; Ollama reloads the model with it on the next request
-            from .config import BrainSpec
-            b, n = A().brain, patch.pop("num_ctx")
-            if not isinstance(n, int) or isinstance(n, bool) or not 1024 <= n <= 8192:
-                raise ValueError("num_ctx must be an integer between 1024 and 8192 (4 GB VRAM)")
-            spec = BrainSpec.model_validate({**b.spec.model_dump(), "num_ctx": n})
-            if b.current in b.settings.brains:
-                b.settings.brains[b.current] = spec
-                save_overrides({"brains": {b.current: {"num_ctx": n}}})
-            else:
-                b.adhoc[b.current] = spec
-        if "voice" in patch.get("tts", {}) and not (ROOT / "models" / "piper" / f"{patch['tts']['voice']}.onnx").exists():
-            raise ValueError("that Piper voice is not installed in models/piper")
-        if "model" in patch.get("stt", {}):
-            local_models = list_local_models()
-            if local_models and patch["stt"]["model"] not in local_models:
-                raise ValueError(f"STT model {patch['stt']['model']!r} is not downloaded locally ({', '.join(local_models)})")
-        if "api_key" in patch.get("internet", {}):
-            raise ValueError("API keys must be configured via /api/internet/key, never in settings")
-        raw = A().settings.model_dump()
-        for k, v in patch.items():
-            raw[k] = {**raw[k], **v} if isinstance(v, dict) else v
-        new = Settings.model_validate(raw)  # raises ValueError/ValidationError on bad values -> 422
-        save_overrides(patch)
-        A().apply_settings(new)
-        A().bus.publish({"type": "internet", **A().search.status()})
+        apply_settings_patch(A(), patch, allow_gateway_and_prefs=True)
         return {"ok": True}
 
     @app.get("/api/drill/connections")
@@ -629,18 +587,22 @@ def create_app(settings: Settings | None = None, assistant: Assistant | None = N
                 missed, gap = ([], False)
                 if since_seq > 0:
                     missed, gap = a.bus.events_since(since_seq)
+                raw_os_state = getattr(a, "os_state", "Idle")
+                safe_os_state = "Idle" if (raw_os_state == "Listening" and not a.voice.mic_active) else raw_os_state
                 yield sse({
                     "type": "hello",
                     "schema_version": 1,
                     "seq": a.bus.latest_seq,
                     "resync_required": gap,
                     "activity": a.activity,
-                    "assistant_state": getattr(a, "os_state", "Idle"),
+                    "assistant_state": safe_os_state,
                     "voice": a.voice.state,
                     "audio_state": a.voice.audio_state.value,
                     "voice_mode": a.voice.mode,
                     "paused": a.voice.paused,
                     "mic_suspended": a.voice.mic_suspended,
+                    "mic_active": a.voice.mic_active,
+                    "wake_ready": a.wake.ready,
                     "duplex": a.voice.duplex_info(),
                     "tts_status": a.speaker.status(),
                     "internet": a.search.status(),

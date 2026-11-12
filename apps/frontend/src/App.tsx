@@ -1,139 +1,231 @@
-import React, { Suspense, lazy, useCallback, useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { apiFetch, setConfirmHandler } from "./api/client";
-import { BrainExplorer } from "./components/BrainExplorer";
 import { DEFAULT_FORCES, type ForceConfig, type GalaxyHandle } from "./components/GalaxyCanvas";
-import { Inspector } from "./components/Inspector";
-import { JarvisCorePanel } from "./components/JarvisCorePanel";
-import { VoiceDock } from "./components/VoiceDock";
-import { startGraph } from "./graphStore";
-import { connState, onConnState, onEvent } from "./live";
+import { VoiceDock, type UiDirective } from "./components/VoiceDock";
+import { AssistantHome, type ChatFeedItem } from "./features/AssistantHome";
 import type { SystemOverview, SystemStatus } from "./features/OverviewPanel";
+import { SettingsPanel } from "./features/SettingsPanel";
+import { startGraph } from "./graphStore";
+import { connState, onConnState, onEvent, type ConnState } from "./live";
 import type { Inspectable, View } from "./shell";
 
-const Overview = lazy(() => import("./features/OverviewPanel").then((m) => ({ default: m.OverviewPanel })));
-const Chat = lazy(() => import("./features/ChatPanel").then((m) => ({ default: m.ChatPanel })));
-const Assistant = lazy(() => import("./features/AssistantPanel").then((m) => ({ default: m.AssistantPanel })));
-const Decision = lazy(() => import("./features/DecisionPanel").then((m) => ({ default: m.DecisionPanel })));
-const Workforce = lazy(() => import("./features/WorkforcePanel").then((m) => ({ default: m.WorkforcePanel })));
-const Skills = lazy(() => import("./features/SkillsPanel").then((m) => ({ default: m.SkillsPanel })));
-const Memory = lazy(() => import("./features/MemoryPanel").then((m) => ({ default: m.MemoryPanel })));
-const Graph = lazy(() => import("./features/GraphView").then((m) => ({ default: m.GraphView })));
-const Gateway = lazy(() => import("./features/GatewayPanel").then((m) => ({ default: m.GatewayPanel })));
-const Learning = lazy(() => import("./features/LearningPanel").then((m) => ({ default: m.LearningPanel })));
-const Recovery = lazy(() => import("./features/RecoveryPanel").then((m) => ({ default: m.RecoveryPanel })));
-const Settings = lazy(() => import("./features/SettingsPanel").then((m) => ({ default: m.SettingsPanel })));
+type PrimaryDest = "assistant" | "settings";
 
-const MODULES: Array<[View, string]> = [
-  ["graph", "Knowledge Graph"],
-  ["chat", "Chat"],
-  ["overview", "System Overview"],
-  ["assistant", "Docs & Reminders"],
-  ["workforce", "Workforce"],
-  ["projects", "Projects"],
-  ["skills", "Skills"],
-  ["memory", "Memory"],
-  ["decision", "Decision"],
-  ["gateway", "Gateway"],
-  ["learning", "Learning"],
-  ["recovery", "Recovery"],
-  ["settings", "Settings"],
-];
-const VALID_VIEWS = new Set(MODULES.map(([v]) => v));
-const viewFromHash = (): View => {
-  const v = location.hash.replace(/^#\/?/, "") as View;
-  return VALID_VIEWS.has(v) ? v : "graph";
+interface UiPreferences {
+  theme: string;
+  compact_mode: boolean;
+  reduced_motion: boolean;
+}
+
+const destFromHash = (): PrimaryDest => {
+  const seg = (location.hash.replace(/^#\/?/, "").split("/")[0] || "assistant").toLowerCase();
+  return seg === "settings" || seg === "gateway" ? "settings" : "assistant";
+};
+
+const hashWantsGraph = (): boolean => {
+  const seg = (location.hash.replace(/^#\/?/, "").split("/")[0] || "").toLowerCase();
+  return seg === "graph";
 };
 
 export const App: React.FC = () => {
-  const [view, setView] = useState<View>(viewFromHash);
-  const [leftOpen, setLeftOpen] = useState(() => innerWidth >= 960 && localStorage.getItem("jarvis.left") !== "0");
-  const [rightOpen, setRightOpen] = useState(() => innerWidth >= 1080 && localStorage.getItem("jarvis.right") !== "0");
+  const [dest, setDest] = useState<PrimaryDest>(destFromHash);
+  const [showGraphStage, setShowGraphStage] = useState<boolean>(hashWantsGraph);
+
+  useEffect(() => {
+    const seg = (location.hash.replace(/^#\/?/, "").split("/")[0] || "").toLowerCase();
+    if (!location.hash || seg === "workspace") {
+      history.replaceState(null, "", "#/assistant");
+    }
+  }, []);
+  const [feed, setFeed] = useState<ChatFeedItem[]>([]);
   const [inspect, setInspect] = useState<Inspectable | null>(null);
-  const [inspDrawer, setInspDrawer] = useState(false);
-  const [toasts, setToasts] = useState<Array<{ id: number; msg: string }>>([]);
-  const [status, setStatus] = useState<SystemStatus | null>(null);
-  const [overview, setOverview] = useState<SystemOverview | null>(null);
-  const [backendDown, setBackendDown] = useState(false);
-  const [live, setLive] = useState(connState());
-  const [voice, setVoice] = useState<{ state: string; mic: boolean; mode?: string }>({ state: "idle", mic: false });
-  const [assistantState, setAssistantState] = useState("Idle");
-  const [stateDetail, setStateDetail] = useState("");
-  const [audioLevel, setAudioLevel] = useState(0);
   const [searchInput, setSearchInput] = useState("");
   const [searchQuery, setSearchQuery] = useState("");
   const [forces, setForces] = useState<ForceConfig>(DEFAULT_FORCES);
-  const [chatAsk, setChatAsk] = useState<string | undefined>();
-  const [chatVisited, setChatVisited] = useState(view === "chat");
-  const [navArg, setNavArg] = useState<string | undefined>();
+  const [status, setStatus] = useState<SystemStatus | null>(null);
+  const [overview, setOverview] = useState<SystemOverview | null>(null);
+  const [backendDown, setBackendDown] = useState(false);
+  const [live, setLive] = useState<ConnState>(connState);
+  const [uiPrefs, setUiPrefs] = useState<UiPreferences>({
+    theme: "cyan-hud",
+    compact_mode: false,
+    reduced_motion: false,
+  });
+
+  const [assistantState, setAssistantState] = useState("Idle");
+  const [stateDetail, setStateDetail] = useState("");
+  const [audioLevel, setAudioLevel] = useState(0);
+  const [voice, setVoice] = useState<{ state: string; mic: boolean; mode?: string; error?: string | null }>({
+    state: "idle",
+    mic: false,
+  });
+
+  const [toasts, setToasts] = useState<Array<{ id: number; msg: string }>>([]);
   const [confirmMsg, setConfirmMsg] = useState("");
 
+  const canvasRef = useRef<GalaxyHandle>(null);
   const dialog = useRef<HTMLDialogElement>(null);
   const confirmResolve = useRef<(ok: boolean) => void>();
-  const composer = useRef<HTMLTextAreaElement>(null);
-  const canvasRef = useRef<GalaxyHandle>(null);
-  const toastId = useRef(0);
+  const browserRecRef = useRef(false);
+  const hostMicRef = useRef(false);
 
   const notify = useCallback((msg: string) => {
-    const id = ++toastId.current;
-    setToasts((t) => [...t.slice(-3), { id, msg }]);
-    setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 5000);
+    const id = Date.now() + Math.random();
+    setToasts((all) => [...all.slice(-3), { id, msg }]);
+    setTimeout(() => setToasts((all) => all.filter((t) => t.id !== id)), 5000);
   }, []);
 
   const navigate = useCallback((v: View, arg?: string) => {
-    if (v === "chat" && arg) setChatAsk(arg);
-    if (v === "graph" && arg) {
-      setInspect({ kind: "node", id: arg });
-      setLeftOpen(true);
-      setTimeout(() => canvasRef.current?.focus(arg), 80);
+    if (v === "settings" || v === "gateway") {
+      setDest("settings");
+      location.hash = "/settings";
+      return;
     }
-    setNavArg(v === "workforce" || v === "memory" ? arg : undefined);
-    location.hash = `/${v}`;
+    setDest("assistant");
+    location.hash = "/assistant";
+    if (v === "graph" || (arg && (arg.startsWith("project:") || arg.startsWith("memory:") || arg.includes(":")))) {
+      setShowGraphStage(true);
+      if (arg) {
+        setInspect({ kind: "node", id: arg });
+        setTimeout(() => canvasRef.current?.focus(arg), 80);
+      }
+    }
   }, []);
 
   const doInspect = useCallback((item: Inspectable | null) => {
     setInspect(item);
-    if (item && view === "graph") setLeftOpen(true);
-    if (item && view !== "graph") setInspDrawer(true);
-  }, [view]);
+  }, []);
+
+  const applyUiDirective = useCallback((ui?: UiDirective | null) => {
+    if (!ui) return;
+    if (ui.focus === "graph") {
+      setDest("assistant");
+      location.hash = "/assistant";
+      setShowGraphStage(true);
+      return;
+    }
+    if ("open_drawer" in ui) {
+      if (ui.open_drawer === "explorer") {
+        setDest("assistant");
+        location.hash = "/assistant";
+        setShowGraphStage(true);
+      } else if (ui.open_drawer === "system") {
+        setDest("settings");
+        location.hash = "/settings";
+      } else if (ui.open_drawer) {
+        setDest("assistant");
+        location.hash = "/assistant";
+      }
+    }
+  }, []);
+
+  const handleBrowserRecChange = useCallback((active: boolean) => {
+    browserRecRef.current = active;
+    if (active) {
+      setAssistantState("Listening");
+      setStateDetail("browser_mic");
+    } else {
+      setAssistantState(hostMicRef.current ? "Listening" : "Idle");
+      setStateDetail("");
+    }
+  }, []);
 
   const refreshStatus = useCallback(async () => {
-    const [st, ov] = await Promise.allSettled([apiFetch<SystemStatus>("/status"), apiFetch<SystemOverview>("/v2/system/overview")]);
+    const [st, ov, sCfg] = await Promise.allSettled([
+      apiFetch<SystemStatus>("/status"),
+      apiFetch<SystemOverview>("/v2/system/overview"),
+      apiFetch<{ preferences?: UiPreferences }>("/v2/settings"),
+    ]);
     setBackendDown(st.status === "rejected" && ov.status === "rejected");
-    setStatus(st.status === "fulfilled" ? st.value : null);
+    const stVal = st.status === "fulfilled" ? st.value : null;
+    if (stVal?.voice) {
+      const micOn = Boolean(stVal.voice.mic_active);
+      hostMicRef.current = micOn;
+      setVoice({
+        state: stVal.voice.audio_state || stVal.voice.state || "idle",
+        mic: micOn,
+        mode: stVal.voice.mode,
+        error: stVal.voice.error || null,
+      });
+      if (!micOn && !browserRecRef.current) {
+        setAssistantState((cur) => (cur === "Listening" ? "Idle" : cur));
+      }
+    }
+    if (sCfg.status === "fulfilled" && sCfg.value?.preferences) {
+      setUiPrefs((prev) => ({ ...prev, ...sCfg.value.preferences }));
+    }
+    setStatus(stVal);
     setOverview(ov.status === "fulfilled" ? ov.value : null);
   }, []);
 
   useEffect(() => {
-    const onHash = () => setView(viewFromHash());
+    const onHash = () => {
+      setDest(destFromHash());
+      if (hashWantsGraph()) setShowGraphStage(true);
+    };
     addEventListener("hashchange", onHash);
     return () => removeEventListener("hashchange", onHash);
   }, []);
+
   useEffect(() => {
     const t = setTimeout(() => setSearchQuery(searchInput), 180);
     return () => clearTimeout(t);
   }, [searchInput]);
-  useEffect(() => { if (view === "chat") setChatVisited(true); }, [view]);
-  useEffect(() => { localStorage.setItem("jarvis.left", leftOpen ? "1" : "0"); }, [leftOpen]);
-  useEffect(() => { localStorage.setItem("jarvis.right", rightOpen ? "1" : "0"); }, [rightOpen]);
 
   useEffect(() => {
-    setConfirmHandler((message) => new Promise<boolean>((resolve) => {
-      confirmResolve.current = resolve;
-      setConfirmMsg(message);
-      dialog.current?.showModal();
-    }));
+    setConfirmHandler(
+      (message) =>
+        new Promise<boolean>((resolve) => {
+          confirmResolve.current = resolve;
+          setConfirmMsg(message);
+          dialog.current?.showModal();
+        })
+    );
     const stopGraph = startGraph();
     const offConn = onConnState(() => setLive(connState()));
     let timer = 0;
-    const soon = () => { clearTimeout(timer); timer = window.setTimeout(refreshStatus, 400); };
+    const soon = () => {
+      clearTimeout(timer);
+      timer = window.setTimeout(refreshStatus, 400);
+    };
     const offEv = onEvent((ev) => {
       if (ev.type === "voice_state" || ev.type === "hello") {
         const loop = ev.state ?? ev.voice ?? "off";
-        setVoice({ state: ev.audio_state || loop, mic: loop !== "off" && !["IDLE", "ERROR", undefined].includes(ev.audio_state), mode: ev.mode || ev.voice_mode });
-        if (ev.assistant_state) setAssistantState(ev.assistant_state);
+        const micActive = Boolean(
+          ev.mic_active ??
+            (loop !== "off" &&
+              !ev.paused &&
+              !ev.mic_suspended &&
+              !["IDLE", "ERROR", "RESUMING", "TTS_SPEAKING", undefined].includes(ev.audio_state))
+        );
+        hostMicRef.current = micActive;
+        setVoice({
+          state: ev.audio_state || loop,
+          mic: micActive,
+          mode: ev.mode || ev.voice_mode,
+          error: ev.error || null,
+        });
+        if (ev.error) {
+          setAssistantState("Error");
+          setStateDetail(ev.error);
+        } else if (ev.assistant_state) {
+          const next = ev.assistant_state === "Listening" && !micActive && !browserRecRef.current ? "Idle" : ev.assistant_state;
+          setAssistantState(next);
+        }
+      } else if (ev.type === "voice_error") {
+        hostMicRef.current = false;
+        const msg = ev.error || ev.message || "Microphone error";
+        setVoice((v) => ({ ...v, mic: false, state: "ERROR", error: msg }));
+        setAssistantState("Error");
+        setStateDetail(msg);
+        notify(msg);
       } else if (ev.type === "assistant_state" || ev.event_type === "assistant.state.changed") {
-        if (ev.state) setAssistantState(ev.state);
+        const raw = ev.state || "";
+        const safe = raw === "Listening" && !hostMicRef.current && !browserRecRef.current ? "Idle" : raw;
+        if (safe) setAssistantState(safe);
         setStateDetail(ev.detail || "");
+      } else if (ev.type === "ui_action" && ev.ui) {
+        applyUiDirective(ev.ui as UiDirective);
       } else if (ev.type === "level" && typeof ev.rms === "number") {
         setAudioLevel(Math.min(1, ev.rms * 3));
       } else if (ev.type === "speaking") {
@@ -145,11 +237,28 @@ export const App: React.FC = () => {
         setStateDetail(ev.message);
         notify(ev.message);
       }
-      if (["hello", "agent_run_update", "model", "voice_changed", "internet", "graph_event"].includes(ev.type)) soon();
+      if (
+        [
+          "hello",
+          "agent_run_update",
+          "model",
+          "voice_changed",
+          "internet",
+          "graph_event",
+          "config_updated",
+          "filesystem_permissions_changed",
+          "task_updated",
+        ].includes(ev.type)
+      ) {
+        soon();
+      }
     });
     refreshStatus();
     const poll = setInterval(() => !document.hidden && refreshStatus(), 30000);
-    const onReject = (e: PromiseRejectionEvent) => { notify(e.reason?.message || String(e.reason)); e.preventDefault(); };
+    const onReject = (e: PromiseRejectionEvent) => {
+      notify(e.reason?.message || String(e.reason));
+      e.preventDefault();
+    };
     addEventListener("unhandledrejection", onReject);
     return () => {
       stopGraph();
@@ -159,135 +268,109 @@ export const App: React.FC = () => {
       clearTimeout(timer);
       removeEventListener("unhandledrejection", onReject);
     };
-  }, [notify, refreshStatus]);
+  }, [notify, refreshStatus, applyUiDirective]);
 
   const closeConfirm = (ok: boolean) => {
     dialog.current?.close();
     confirmResolve.current?.(ok);
     confirmResolve.current = undefined;
   };
+
   const shell = { onNotify: notify, onInspect: doInspect, onNavigate: navigate };
-  const selectedId = inspect?.kind === "node" ? inspect.id : null;
-  const pendingCount = overview?.pending_approvals.length || 0;
+  const pendingCount = overview?.pending_approvals?.length || 0;
+  const hudClasses = [
+    "os-hud",
+    uiPrefs.compact_mode ? "compact-mode" : "",
+    uiPrefs.reduced_motion ? "reduced-motion" : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
 
   return (
-    <div className="os-hud">
-      <a className="skip" href="#workspace">Skip to content</a>
+    <div className={hudClasses} data-theme={uiPrefs.theme || "cyan-hud"}>
+      <a className="skip" href="#workspace">
+        Skip to content
+      </a>
 
-      {/* Minimal Top HUD Command Strip */}
+      {/* Strict 2-Destination OS Header: JARVIS ASSISTANT & SETTINGS */}
       <header className="hud-topbar">
         <div className="row" style={{ gap: 10 }}>
-          <button className="ghost icon mobile-only" aria-label="Toggle Brain Explorer" onClick={() => setLeftOpen((o) => !o)}>☰</button>
-          <span className="logo" aria-hidden="true">J</span>
+          <span className="logo" aria-hidden="true">
+            J
+          </span>
           <div className="brand-title">
             <span>J.A.R.V.I.S</span>
-            <small className="mono dim">AI OPERATING SYSTEM</small>
+            <small className="mono dim">CENTRAL AI MANAGER</small>
           </div>
           <span className={`pill ${backendDown ? "danger" : status ? "ok" : ""}`}>
             {backendDown ? "Offline" : status ? `${status.mode} · ${status.brain.model}` : "Connecting"}
           </span>
         </div>
 
-        <nav className="hud-nav" aria-label="OS Workspaces">
-          {MODULES.map(([v, label]) => (
-            <button
-              key={v}
-              className={view === v ? "active" : "ghost"}
-              aria-current={view === v ? "page" : undefined}
-              onClick={() => navigate(v)}
-            >
-              {label}
-              {v === "workforce" && pendingCount > 0 && <b className="badge">{pendingCount}</b>}
-            </button>
-          ))}
+        <nav className="hud-nav" aria-label="OS Destinations">
+          <button
+            className={dest === "assistant" ? "active" : "ghost"}
+            aria-current={dest === "assistant" ? "page" : undefined}
+            onClick={() => navigate("assistant")}
+          >
+            JARVIS ASSISTANT
+            {pendingCount > 0 && <span className="pill warn">{pendingCount}</span>}
+          </button>
+          <button
+            className={dest === "settings" ? "active" : "ghost"}
+            aria-current={dest === "settings" ? "page" : undefined}
+            onClick={() => navigate("settings")}
+          >
+            SETTINGS
+          </button>
         </nav>
 
-        <div className="row" style={{ gap: 6 }}>
-          {view !== "graph" && (
-            <button className="ghost" onClick={() => setInspDrawer((o) => !o)}>Inspector</button>
-          )}
-          <button className="ghost icon mobile-only" aria-label="Toggle Jarvis Core" onClick={() => setRightOpen((o) => !o)}>◎</button>
+        <div className="row" style={{ gap: 8 }}>
+          <span className={`status ${live === "online" ? "ok" : live === "offline" ? "danger" : "warn"}`}>
+            <i className="dot" /> {live}
+          </span>
         </div>
       </header>
 
-      {/* Main 3-Column HUD Cockpit */}
-      <div className="hud-stage">
-        {view === "graph" && (
-          <BrainExplorer
-            open={leftOpen}
-            onToggleOpen={() => setLeftOpen((o) => !o)}
-            selectedId={selectedId}
-            inspect={inspect}
-            searchInput={searchInput}
-            onSearchInput={setSearchInput}
-            forces={forces}
-            onChangeForces={setForces}
-            conn={live}
-            modeLabel={status?.mode || "offline"}
-            onFocusNode={(id) => canvasRef.current?.focus(id)}
-            onUnpinNode={(id) => canvasRef.current?.unpin(id)}
+      <main className="workspace" id="workspace">
+        {dest === "assistant" ? (
+          <AssistantHome
             {...shell}
-          />
-        )}
-
-        <main id="workspace" className="hud-center" tabIndex={-1}>
-          <Suspense fallback={<p className="empty pad">Loading module…</p>}>
-            {view === "graph" && (
-              <Graph
-                {...shell}
-                selectedId={selectedId}
-                query={searchQuery}
-                forces={forces}
-                onChangeForces={setForces}
-                canvasRef={canvasRef}
-              />
-            )}
-            {view === "overview" && <Overview {...shell} overview={overview} status={status} />}
-            {chatVisited && (
-              <div className="keep" hidden={view !== "chat"}>
-                <Chat {...shell} ask={chatAsk} onAskConsumed={() => setChatAsk(undefined)} composerRef={composer} />
-              </div>
-            )}
-            {view === "assistant" && <Assistant onNotify={notify} />}
-            {view === "decision" && <Decision onNotify={notify} />}
-            {view === "workforce" && <Workforce {...shell} section="workforce" initialProject={navArg} />}
-            {view === "projects" && <Workforce {...shell} section="projects" />}
-            {view === "skills" && <Skills onNotify={notify} />}
-            {view === "memory" && <Memory {...shell} />}
-            {view === "gateway" && <Gateway onNotify={notify} />}
-            {view === "learning" && <Learning onNotify={notify} />}
-            {view === "recovery" && <Recovery onNotify={notify} />}
-            {view === "settings" && <Settings {...shell} />}
-          </Suspense>
-        </main>
-
-        {view === "graph" && (
-          <JarvisCorePanel
-            open={rightOpen}
-            onToggleOpen={() => setRightOpen((o) => !o)}
             assistantState={assistantState}
             stateDetail={stateDetail}
             audioLevel={audioLevel}
+            voiceLoopState={voice}
             status={status}
             overview={overview}
             backendDown={backendDown}
             live={live}
-            {...shell}
+            feed={feed}
+            setFeed={setFeed}
+            showGraphStage={showGraphStage}
+            onToggleGraphStage={setShowGraphStage}
+            inspect={inspect}
+            forces={forces}
+            onChangeForces={setForces}
+            canvasRef={canvasRef}
+            searchInput={searchInput}
+            searchQuery={searchQuery}
+            onSearchInput={setSearchInput}
           />
+        ) : (
+          <SettingsPanel {...shell} />
         )}
+      </main>
 
-        {view !== "graph" && inspDrawer && (
-          <Inspector item={inspect} onClose={() => setInspDrawer(false)} {...shell} />
-        )}
-      </div>
-
-      {/* Persistent Voice Command Dock across all OS workspaces */}
       <VoiceDock
         assistantState={assistantState}
         stateDetail={stateDetail}
         voiceLoopState={voice}
         audioLevel={audioLevel}
         onAudioLevel={setAudioLevel}
+        onBrowserRecChange={handleBrowserRecChange}
+        onUiAction={applyUiDirective}
+        inAssistantView={dest === "assistant"}
+        onFeedChange={setFeed}
         {...shell}
       />
 
@@ -295,17 +378,35 @@ export const App: React.FC = () => {
         {toasts.map((t) => (
           <div key={t.id} className="toast">
             <span>{t.msg}</span>
-            <button className="ghost icon" aria-label="Dismiss notification" onClick={() => setToasts((all) => all.filter((x) => x.id !== t.id))}>✕</button>
+            <button
+              className="ghost icon"
+              aria-label="Dismiss notification"
+              onClick={() => setToasts((all) => all.filter((x) => x.id !== t.id))}
+            >
+              ✕
+            </button>
           </div>
         ))}
       </div>
 
-      <dialog ref={dialog} className="confirm" onCancel={(e) => { e.preventDefault(); closeConfirm(false); }} aria-labelledby="confirm-title">
+      <dialog
+        ref={dialog}
+        className="confirm"
+        onCancel={(e) => {
+          e.preventDefault();
+          closeConfirm(false);
+        }}
+        aria-labelledby="confirm-title"
+      >
         <h2 id="confirm-title">Please confirm</h2>
         <p>{confirmMsg}</p>
         <div className="row end">
-          <button className="ghost" autoFocus onClick={() => closeConfirm(false)}>Cancel</button>
-          <button className="danger" onClick={() => closeConfirm(true)}>Confirm</button>
+          <button className="ghost" autoFocus onClick={() => closeConfirm(false)}>
+            Cancel
+          </button>
+          <button className="danger" onClick={() => closeConfirm(true)}>
+            Confirm
+          </button>
         </div>
       </dialog>
     </div>

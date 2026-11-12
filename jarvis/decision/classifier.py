@@ -8,7 +8,14 @@ from typing import Awaitable, Callable
 from .rules import (
     DEV_KEYWORDS,
     DOC_EXPORT_RE,
+    DOCKER_OPS_RE,
+    FILESYSTEM_OPS_RE,
+    HOST_FOLDER_TARGET_RE,
+    MEMORY_MANAGE_RE,
+    RECOVERY_OPS_RE,
     REMINDER_RE,
+    SYSTEM_STATUS_RE,
+    TASK_STATUS_RE,
     WEB_RESEARCH_RE,
     detect_text_language,
     enforce_security_boundary,
@@ -53,6 +60,13 @@ def heuristic_classify(text: str) -> DecisionEnvelope:
     doc_m = DOC_EXPORT_RE.search(s)
     is_rem = bool(REMINDER_RE.search(s))
     is_web = bool(WEB_RESEARCH_RE.search(s))
+    is_docker = bool(DOCKER_OPS_RE.search(s))
+    is_recovery = bool(RECOVERY_OPS_RE.search(s))
+    is_sys = bool(SYSTEM_STATUS_RE.search(s))
+    is_task_status = bool(TASK_STATUS_RE.search(s))
+    is_fs = bool(FILESYSTEM_OPS_RE.search(s))
+    has_host_folder = bool(HOST_FOLDER_TARGET_RE.search(s))
+    is_mem = bool(MEMORY_MANAGE_RE.search(s))
 
     # Ambiguity / underspecified cue detection
     is_vague = (
@@ -60,17 +74,29 @@ def heuristic_classify(text: str) -> DecisionEnvelope:
         and any(w in lowered for w in ("fix that", "do that thing", "handle it", "yesterday", "what we discussed", "അത് ചെയ്യൂ", "അതു ശരിയാക്കൂ"))
     )
 
-    if is_dev:
-        needs_write = any(w in lowered for w in ("implement", "fix", "add ", "edit", "refactor", "create", "migrate", "write"))
+    if is_task_status:
         env = DecisionEnvelope(
             layer=2,
-            department="dev",
-            intent="dev_coding" if needs_write else "dev_architecture",
-            complexity="heavy_coding" if needs_write else "complex_reasoning",
-            needs_live_web=is_web,
-            needs_project_context=True,
-            risk_tier="WRITE" if needs_write else "READ",
-            confidence=0.84,
+            department="assistant",
+            intent="task_status",
+            complexity="trivial",
+            risk_tier="READ",
+            confidence=0.92,
+            latency_ms=round((time.perf_counter() - t0) * 1000.0, 3),
+            language=lang,
+            classifier_source="heuristic",
+        )
+        return enforce_security_boundary(s, env)
+
+    if is_fs and has_host_folder and not is_dev:
+        is_mut = any(w in lowered for w in ("create", "write", "edit", "save", "delete", "remove", "report"))
+        env = DecisionEnvelope(
+            layer=2,
+            department="assistant",
+            intent="filesystem_ops",
+            complexity="standard",
+            risk_tier="WRITE" if is_mut else "READ",
+            confidence=0.91,
             latency_ms=round((time.perf_counter() - t0) * 1000.0, 3),
             language=lang,
             classifier_source="heuristic",
@@ -99,8 +125,98 @@ def heuristic_classify(text: str) -> DecisionEnvelope:
             department="assistant",
             intent="reminder_manage",
             complexity="trivial",
-            risk_tier="WRITE",
+            risk_tier="READ" if any(w in lowered for w in ("list", "show", "what are")) else "WRITE",
             confidence=0.88,
+            latency_ms=round((time.perf_counter() - t0) * 1000.0, 3),
+            language=lang,
+            classifier_source="heuristic",
+        )
+        return enforce_security_boundary(s, env)
+
+    if is_docker:
+        env = DecisionEnvelope(
+            layer=2,
+            department="system",
+            intent="docker_ops",
+            complexity="standard",
+            risk_tier="READ",
+            confidence=0.90,
+            latency_ms=round((time.perf_counter() - t0) * 1000.0, 3),
+            language=lang,
+            classifier_source="heuristic",
+        )
+        return enforce_security_boundary(s, env)
+
+    if is_recovery:
+        env = DecisionEnvelope(
+            layer=2,
+            department="system",
+            intent="recovery_ops",
+            complexity="standard",
+            risk_tier="READ",
+            confidence=0.90,
+            latency_ms=round((time.perf_counter() - t0) * 1000.0, 3),
+            language=lang,
+            classifier_source="heuristic",
+        )
+        return enforce_security_boundary(s, env)
+
+    if is_sys:
+        env = DecisionEnvelope(
+            layer=2,
+            department="system",
+            intent="system_status",
+            complexity="trivial",
+            risk_tier="READ",
+            confidence=0.90,
+            latency_ms=round((time.perf_counter() - t0) * 1000.0, 3),
+            language=lang,
+            classifier_source="heuristic",
+        )
+        return enforce_security_boundary(s, env)
+
+    if is_dev:
+        needs_write = any(w in lowered for w in ("implement", "fix", "add ", "edit", "refactor", "create", "migrate", "write"))
+        is_sec_audit = any(w in lowered for w in ("security audit", "vulnerability", "vuln", "audit"))
+        is_debug = any(w in lowered for w in ("debug", "failing test", "traceback", "stack trace"))
+        dev_intent = "dev_coding" if needs_write else ("security_audit" if is_sec_audit else ("dev_debug" if is_debug else "dev_architecture"))
+        env = DecisionEnvelope(
+            layer=2,
+            department="dev",
+            intent=dev_intent,
+            complexity="heavy_coding" if needs_write else "complex_reasoning",
+            needs_live_web=is_web,
+            needs_project_context=True,
+            risk_tier="WRITE" if needs_write else "READ",
+            confidence=0.84,
+            latency_ms=round((time.perf_counter() - t0) * 1000.0, 3),
+            language=lang,
+            classifier_source="heuristic",
+        )
+        return enforce_security_boundary(s, env)
+
+    if is_fs:
+        env = DecisionEnvelope(
+            layer=2,
+            department="assistant",
+            intent="filesystem_ops",
+            complexity="standard",
+            risk_tier="READ",
+            confidence=0.87,
+            latency_ms=round((time.perf_counter() - t0) * 1000.0, 3),
+            language=lang,
+            classifier_source="heuristic",
+        )
+        return enforce_security_boundary(s, env)
+
+    if is_mem:
+        env = DecisionEnvelope(
+            layer=2,
+            department="assistant",
+            intent="memory_manage",
+            complexity="standard",
+            risk_tier="READ" if any(w in lowered for w in ("list", "show", "search", "inspect", "check")) else "WRITE",
+            confidence=0.87,
             latency_ms=round((time.perf_counter() - t0) * 1000.0, 3),
             language=lang,
             classifier_source="heuristic",
@@ -185,8 +301,8 @@ class ExistingLLMClassifier(DecisionClassifier):
                     "Classify the user request strictly into JSON with keys: "
                     "department (assistant|dev|system|chat), "
                     "intent (general_chat|dev_coding|dev_architecture|dev_review|dev_debug|document_export|"
-                    "reminder_manage|web_research|memory_manage|system_status|clarification_needed|"
-                    "sensitive_action_request|security_audit), "
+                    "reminder_manage|web_research|memory_manage|filesystem_ops|system_status|docker_ops|"
+                    "recovery_ops|clarification_needed|sensitive_action_request|security_audit), "
                     "complexity (trivial|standard|complex_reasoning|heavy_coding), "
                     "needs_live_web (bool), needs_project_context (bool), risk_tier (READ|WRITE|EXECUTE), "
                     "confidence (0..1), clarifying_question (string or null)."

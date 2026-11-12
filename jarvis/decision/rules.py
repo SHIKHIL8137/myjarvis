@@ -8,16 +8,55 @@ SLASH_CMD = re.compile(r"^/([a-z0-9_-]+)(?:\s+(.*))?$", re.I | re.S)
 HARD_STOP = re.compile(r"^\W*(?:jarvis\W+)?(?:stop(?:\s+talking|\s+speaking)?|quiet|silence|cancel)\W*$", re.I)
 DEV_KEYWORDS = re.compile(
     r"\b(?:repo(?:sitory)?|codebase|refactor|implement|bug\s*fix|unit\s*test|pytest|endpoint|"
-    r"migration|alembic|worktree|opencode|graphify|architecture|pull\s+request|git\s+diff|backend|frontend)\b",
+    r"migration|alembic|worktree|opencode|graphify|architecture|pull\s+request|git\s+diff|backend|frontend|"
+    r"fix\s+(?:the\s+|this\s+)?bug|debug\s+(?:the\s+|this\s+)?(?:error|failure|issue|module)|"
+    r"find\s+bugs|(?:review|analyze|inspect|audit|check)\s+(?:(?:my|the|this)\s+)?(?:[A-Za-z0-9_.-]+\s+)?"
+    r"(?:project|repo|codebase|app|code)|project(?:'s)?\b[^\n]{0,40}\b(?:code|tests?|bugs?|modules?))\b",
     re.I,
 )
 DOC_EXPORT_RE = re.compile(
-    r"\b(?:generate|create|export|build|write|make)\s+(?:a\s+|an\s+)?(?:formatted\s+)?(pdf|docx|word|pptx|powerpoint|slides?|xlsx|excel|spreadsheet)\b",
+    r"\b(?:generate|create|export|build|write|make|prepare)\s+(?:a\s+|an\s+|me\s+a\s+)?(?:formatted\s+|summary\s+)?(pdf|docx|word|pptx|powerpoint|slides?|xlsx|excel|spreadsheet)\b",
     re.I,
 )
-REMINDER_RE = re.compile(r"\b(?:remind\s+me|set\s+(?:a\s+)?reminder|schedule\s+(?:a\s+)?reminder|my\s+reminders)\b", re.I)
+REMINDER_RE = re.compile(
+    r"\b(?:remind\s+me|set\s+(?:a\s+)?reminder|schedule\s+(?:a\s+)?reminder|(?:list|show|what\s+are)\s+(?:(?:all|my|pending|active)\s+)*reminders?)\b",
+    re.I,
+)
 WEB_RESEARCH_RE = re.compile(
     r"\b(?:search\s+(?:the\s+)?(?:web|internet|online)|look\s+up\s+online|latest\s+news|weather\b|stock\s+price|current\s+version)\b",
+    re.I,
+)
+FILESYSTEM_OPS_RE = re.compile(
+    r"\b(?:(?:list|show|find|search|inspect|read|open|create|write|edit|save|delete)\s+"
+    r"(?:(?:[A-Za-z0-9_-]+\s+){0,3})?"
+    r"(?:files?|folders?|directories|workspace\s+files?|pdf\s+documents?|documents?|downloads?|desktop|reports?\b)|"
+    r"(?:list|show|find|search|inspect|read|open|create|write|edit|save|delete)\b[^\n]{0,60}"
+    r"(?:my\s+|the\s+)?(?:documents|downloads|desktop|pictures|folder|directory)\b|"
+    r"what\s+files\s+are\s+in\b|[A-Za-z]:\\|\\\\[A-Za-z0-9_.-]+\\)",
+    re.I,
+)
+TASK_STATUS_RE = re.compile(
+    r"\b(?:(?:check|list|show|what\s+are|status\s+of)\s+(?:(?:all|my|the|current|active|pending|running)\s+)*tasks?)\b",
+    re.I,
+)
+HOST_FOLDER_TARGET_RE = re.compile(
+    r"(?:[A-Za-z]:\\|\\\\[^\s]+|\b(?:my\s+|the\s+)?(?:documents|downloads|desktop|pictures|folder|directory)\b)",
+    re.I,
+)
+MEMORY_MANAGE_RE = re.compile(
+    r"\b(?:(?:list|show|inspect|search|check)\s+(?:(?:all|my|personal)\s+)*memor(?:y|ies)|remember\s+this\b|save\s+this\s+to\s+memory\b)\b",
+    re.I,
+)
+DOCKER_OPS_RE = re.compile(
+    r"\b(?:docker\s+(?:status|daemon|containers?|images?|ps|info|sandbox)|(?:check|show|is|verify)\s+docker\b)\b",
+    re.I,
+)
+RECOVERY_OPS_RE = re.compile(
+    r"\b(?:(?:list|show|check|verify|status\s+of)\s+(?:(?:all|latest|my)\s+)*(?:backups?|snapshots?|recovery(?:\s+targets?)?|database\s+targets?)|disaster\s+recovery\s+status)\b",
+    re.I,
+)
+SYSTEM_STATUS_RE = re.compile(
+    r"\b(?:(?:check|show|monitor|report|what\s+is)\s+(?:the\s+|current\s+|my\s+)?(?:system\s+(?:health|status|metrics|resources)|cpu|ram|memory\s+usage|gpu|vram|audio\s+devices?|hardware\s+status)|system\s+(?:status|health)\b)\b",
     re.I,
 )
 
@@ -40,7 +79,7 @@ _NEGATION_PREFIX_RE = re.compile(
 
 _SENSITIVE_RULES: list[tuple[str, re.Pattern]] = [
     ("shell_execution", re.compile(r"\b(?:run\s+(?:shell|bash|powershell|cmd|terminal)|subprocess|os\.system|exec(?:ute)?\s+command|bash\s+-c)\b", re.I)),
-    ("file_deletion", re.compile(r"\b(?:delete\s+(?:the\s+|all\s+)?file|remove\s+files?|rm\s+-rf|rmdir|unlink|wipe\s+(?:directory|disk|folder)|del\s+/f|ഡിലീറ്റ്|നീക്കം)\b", re.I)),
+    ("file_deletion", re.compile(r"\b(?:delete\s+(?:(?:the|all|my)\s+)*files?|remove\s+(?:(?:the|all|my)\s+)*files?|rm\s+-rf|rmdir|unlink|wipe\s+(?:directory|disk|folder)|del\s+/f|ഡിലീറ്റ്|നീക്കം)\b", re.I)),
     ("database_migration", re.compile(r"\b(?:alembic\s+(?:upgrade|downgrade)|run\s+(?:db\s+)?migration|drop\s+table|alter\s+table|truncate\s+table)\b", re.I)),
     ("database_restore", re.compile(r"\b(?:pg_restore|restore\s+(?:prod(?:uction)?\s+)?database|restore\s+postgres|overwrite\s+(?:live\s+)?db)\b", re.I)),
     ("git_commit_or_merge", re.compile(r"\b(?:git\s+(?:commit|merge|push|rebase|reset\s+--hard)|merge\s+(?:branch|worktree|pr))\b", re.I)),

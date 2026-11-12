@@ -7,9 +7,10 @@ import random
 import threading
 import time
 from typing import AsyncIterator
+from urllib.parse import urlsplit
 
 from ..brain import Brain
-from ..config import has_provider_api_key
+from ..config import get_provider_api_key, has_provider_api_key
 from ..core.resources import ResourceGovernor
 from ..db.engine import DatabaseManager
 from ..db.models import AuditEventRow, LLMUsageLogRow
@@ -146,6 +147,10 @@ class ModelGateway:
             ("openai", p.openai_model, OpenAICompatAdapter("openai", p.openai_base_url).capabilities(p.openai_model)),
             ("anthropic", p.anthropic_model, AnthropicAdapter(p.anthropic_base_url).capabilities(p.anthropic_model)),
         ]
+        if getattr(p, "custom_base_url", "") and getattr(p, "custom_model", ""):
+            cloud_entries.append(
+                ("custom", p.custom_model, OpenAICompatAdapter("custom", p.custom_base_url).capabilities(p.custom_model))
+            )
         for prov, mid, cap in cloud_entries:
             self._cap_cache[f"{prov}:{mid}"] = cap
             out.append(cap)
@@ -306,20 +311,154 @@ class ModelGateway:
             "tokens_24h": total_tokens,
             "daily_budget": self.settings.gateway.daily_token_budget,
             "by_provider": by_p,
-            "breakers": {k: self.breaker_status(k) for k in ("ollama", "openrouter", "gemini", "huggingface", "openai", "anthropic")},
+            "breakers": {k: self.breaker_status(k) for k in ("ollama", "openrouter", "gemini", "huggingface", "openai", "anthropic", "custom")},
             "governor": self.governor.stats(),
         }
 
+    def select_model_for_task(self, role: str = "fast") -> tuple[str, list[str]]:
+        """Resolve (primary_model_key, fallback_chain) from Settings -> Providers role routing."""
+        p = self.settings.providers
+        boot = self.settings.boot_brain
+        role_map = {
+            "fast": getattr(p, "fast_model", "") or boot,
+            "advanced": getattr(p, "advanced_model", "") or boot,
+            "coding": getattr(p, "coding_model", "") or boot,
+            "embedding": getattr(p, "embedding_model", "") or "nomic-embed-text",
+        }
+        primary = (role_map.get(role, boot) or boot).strip()
+        active_prov = getattr(p, "active_provider", "ollama") or "ollama"
+        if ":" not in primary and primary not in self.settings.brains and active_prov != "ollama":
+            primary = f"{active_prov}:{primary}"
+
+        fallbacks: list[str] = []
+        fb_prov = (getattr(p, "fallback_provider", "") or "").strip().lower()
+        if fb_prov and fb_prov != "ollama":
+            fb_model_attr = {
+                "openrouter": p.openrouter_model,
+                "gemini": p.gemini_model,
+                "huggingface": p.huggingface_model,
+                "openai": p.openai_model,
+                "anthropic": p.anthropic_model,
+                "custom": getattr(p, "custom_model", ""),
+            }.get(fb_prov, "")
+            if fb_model_attr:
+                cand = f"{fb_prov}:{fb_model_attr}"
+                if cand != primary:
+                    fallbacks.append(cand)
+        if boot not in (primary, *fallbacks):
+            fallbacks.append(boot)
+        return primary, fallbacks
+
     def _build_cloud_adapter(self, prov: str):
         allowed = {h.lower() for h in self.settings.providers.allowed_cloud_hosts}
+        if prov == "custom" and getattr(self.settings.providers, "custom_base_url", ""):
+            custom_host = (urlsplit(self.settings.providers.custom_base_url).hostname or "").lower()
+            if custom_host:
+                allowed.add(custom_host)
         if prov in OPENAI_COMPAT_PROVIDERS:
             url_attr, _ = OPENAI_COMPAT_PROVIDERS[prov]
-            return OpenAICompatAdapter(prov, getattr(self.settings.providers, url_attr), allowed_hosts=allowed)
+            base_url = getattr(self.settings.providers, url_attr, "")
+            if not base_url:
+                raise CloudGatewayError(f"Base URL for provider {prov!r} is not configured.", category="config_missing", retryable=False)
+            return OpenAICompatAdapter(prov, base_url, allowed_hosts=allowed)
         if prov == "gemini":
             return GeminiAdapter(self.settings.providers.gemini_base_url, allowed_hosts=allowed)
         if prov == "anthropic":
             return AnthropicAdapter(self.settings.providers.anthropic_base_url, allowed_hosts=allowed)
         raise CloudGatewayError(f"Unsupported provider {prov!r}", category="unsupported", retryable=False)
+
+    async def health_check_provider(self, provider: str, *, transport_factory=None) -> dict:
+        """Probe provider availability safely while respecting offline/egress security policy."""
+        prov = (provider or "").strip().lower()
+        if prov == "ollama":
+            try:
+                if hasattr(self.brain, "health"):
+                    h = await self.brain.health()
+                    if isinstance(h, dict) and h.get("up", True):
+                        models = list(h.get("models") or [])
+                        return {
+                            "ok": True,
+                            "provider": "ollama",
+                            "version": h.get("version"),
+                            "models_count": len(models),
+                            "models": models[:20],
+                            "loaded": list(h.get("loaded") or []),
+                            "breaker": self.breaker_status("ollama"),
+                        }
+                    return {
+                        "ok": False,
+                        "provider": "ollama",
+                        "error": (h or {}).get("error", "Ollama is unreachable"),
+                        "breaker": self.breaker_status("ollama"),
+                    }
+                models = await self.brain.installed()
+                return {
+                    "ok": True,
+                    "provider": "ollama",
+                    "models_count": len(models),
+                    "models": models[:20],
+                    "breaker": self.breaker_status("ollama"),
+                }
+            except Exception as e:
+                return {"ok": False, "provider": "ollama", "error": str(e), "breaker": self.breaker_status("ollama")}
+
+        key = get_provider_api_key(prov)
+        if not key:
+            return {"ok": False, "provider": prov, "error": "missing API key", "key_configured": False, "breaker": self.breaker_status(prov)}
+
+        if self.settings.offline_enforced or not self.settings.providers.allow_cloud:
+            return {
+                "ok": False,
+                "provider": prov,
+                "key_configured": True,
+                "category": "offline_or_cloud_disabled",
+                "error": "Key configured securely, but outbound check requires Online Assisted Mode and allow_cloud=true.",
+                "breaker": self.breaker_status(prov),
+            }
+
+        try:
+            adapter = self._build_cloud_adapter(prov)
+            res = await adapter.health_check(api_key=key, transport_factory=transport_factory)
+            res["key_configured"] = True
+            res["breaker"] = self.breaker_status(prov)
+            return res
+        except Exception as e:
+            return {"ok": False, "provider": prov, "key_configured": True, "error": str(e), "breaker": self.breaker_status(prov)}
+
+    async def test_route(
+        self,
+        *,
+        role: str = "fast",
+        require_tools: bool = False,
+        require_vision: bool = False,
+        json_mode: bool = False,
+        project_privacy_level: str = "private",
+        messages: list[dict] | None = None,
+    ) -> dict:
+        """Evaluate model routing, capability fit, privacy policy, and circuit breakers for a role."""
+        primary, fallbacks = self.select_model_for_task(role)
+        msgs = messages or [{"role": "user", "content": "Health route test"}]
+        req = GatewayRequest(
+            model_key=primary,
+            messages=msgs,
+            require_tools=require_tools,
+            require_vision=require_vision,
+            json_mode=json_mode,
+            project_privacy_level=project_privacy_level,
+        )
+        candidates = [primary] + [m for m in fallbacks if m != primary]
+        eligible, rejections = self.inspect_candidate_eligibility(req, candidates)
+        return {
+            "role": role,
+            "primary": primary,
+            "candidates": candidates,
+            "eligible": eligible,
+            "selected": eligible[0] if eligible else None,
+            "rejections": rejections,
+            "privacy_level": project_privacy_level,
+            "online_enabled": bool(self.settings.internet.enabled and not self.settings.offline_enforced),
+            "breakers": {k: self.breaker_status(k) for k in ("ollama", "openrouter", "gemini", "huggingface", "openai", "anthropic", "custom")},
+        }
 
     async def stream_with_fallback(
         self,

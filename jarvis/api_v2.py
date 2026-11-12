@@ -9,10 +9,17 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from . import graph_live
-from .api_deps import make_assistant_dep
+from .api_deps import (
+    apply_settings_patch,
+    build_consolidated_settings,
+    list_settings_devices,
+    make_assistant_dep,
+)
 from .api_decision import create_decision_subrouter
 from .api_skills import create_skills_subrouter
+from .config import PROVIDER_ENV_VARS, delete_provider_api_key, has_provider_api_key, set_provider_api_key
 from .departments.assistant.documents import parse_document
+from .filesystem_access import ALL_OPS, FS_OPERATION_GROUPS, FilesystemSecurityError
 from .gateway.gateway import CloudGatewayError
 from .gateway.interface import GatewayRequest
 from .integrations import graphify_adapter
@@ -150,6 +157,49 @@ class MemorySupersedeIn(BaseModel):
     new_content: str = Field(..., min_length=1, max_length=4000)
     title: str = ""
     topic: str = ""
+
+
+class FsPermissionDecideIn(BaseModel):
+    decision: str = Field(..., pattern="^(allow_once|allow_session|always_read_only|allow_persistent|deny)$")
+    decided_by: str = Field("owner", min_length=1, max_length=64)
+    duration_seconds: int | None = Field(None, ge=30, le=86_400)
+    allowed_operations: list[str] | None = None
+    execute_deferred: bool = True
+
+
+class FsPermissionCreateIn(BaseModel):
+    folder_path: str = Field(..., min_length=1, max_length=800)
+    operations: list[str] = Field(..., min_length=1)
+    scope: str = Field("persistent", pattern="^(once|session|persistent)$")
+    granted_by: str = Field("owner", min_length=1, max_length=64)
+    purpose: str = "Configured in Settings"
+    expires_in_seconds: int | None = Field(None, ge=30, le=2_592_000)
+
+
+class FsPermissionUpdateIn(BaseModel):
+    granted_operations: list[str] | None = None
+    scope: str | None = Field(None, pattern="^(once|session|persistent)$")
+    actor: str = Field("owner", min_length=1, max_length=64)
+
+
+class FsPolicyUpdateIn(BaseModel):
+    sensitive_file_policy: str | None = Field(None, pattern="^(block|warn|metadata_only)$")
+    cloud_data_policy: str | None = Field(None, pattern="^(never|redacted|approved_only)$")
+    allow_always_read_only: bool | None = None
+    max_read_bytes: int | None = Field(None, ge=4096, le=50_000_000)
+    allowed_extensions: list[str] | None = None
+
+
+class ProviderKeyIn(BaseModel):
+    api_key: str = Field(..., min_length=4, max_length=512)
+
+
+class RouteTestIn(BaseModel):
+    role: str = Field("fast", pattern="^(fast|advanced|coding|embedding)$")
+    require_tools: bool = False
+    require_vision: bool = False
+    json_mode: bool = False
+    project_privacy_level: str = Field("private", pattern="^(public|internal|private|confidential|restricted)$")
 
 
 def create_v2_router(fallback=None) -> APIRouter:
@@ -345,12 +395,41 @@ def create_v2_router(fallback=None) -> APIRouter:
     @router.post("/approvals/{token}/decide")
     async def decide_approval(token: str, body: ApprovalDecideIn, a=Depends(get_a)):
         try:
-            return await asyncio.to_thread(
+            row_before = await asyncio.to_thread(a.orchestrator.approvals.get, token)
+            res = await asyncio.to_thread(
                 a.orchestrator.resume_workflow_after_approval,
                 token=token,
                 approved=body.approved,
                 decided_by=body.decided_by,
             )
+            task_id = ((row_before or {}).get("args") or {}).get("task_id") if isinstance(row_before, dict) else None
+            if task_id:
+                status = "completed" if body.approved else "cancelled"
+                reply = (
+                    f"Owner approved `{token}`. Action authorized."
+                    if body.approved
+                    else f"Owner denied `{token}`. Privileged action aborted safely."
+                )
+                task = await a.orchestrator.tasks.update_task(
+                    task_id,
+                    status=status,
+                    current_step=reply,
+                    result=reply,
+                )
+                a.history.add("assistant", reply)
+                a.bus.publish(
+                    {
+                        "type": "assistant_message",
+                        "text": reply,
+                        "approval_token": token,
+                        "granted": body.approved,
+                        "task_id": task_id,
+                        "task": task,
+                        "paths": [],
+                    }
+                )
+                res = {**res, "task": task, "reply": reply}
+            return res
         except KeyError:
             raise HTTPException(404, f"Approval {token} not found")
         except TimeoutError as e:
@@ -546,6 +625,187 @@ def create_v2_router(fallback=None) -> APIRouter:
                 latency_ms=(time.perf_counter() - t0) * 1000.0,
             )
             raise HTTPException(403 if e.category in ("paid_blocked", "secret_blocked", "privacy_blocked") else 400, str(e)) from e
+
+    # ---- P10.20 Scoped Filesystem Permissions & Security Audit ---------------------------------------
+    @router.get("/filesystem/permissions")
+    async def fs_list_permissions(status: str | None = None, a=Depends(get_a)):
+        fs = a.orchestrator.fs_access
+        return {
+            "permissions": await fs.list_permissions(status=status),
+            "pending_requests": await fs.list_requests(status="pending"),
+            "operation_groups": FS_OPERATION_GROUPS,
+            "all_operations": ALL_OPS,
+            "policy": a.settings.filesystem.model_dump(),
+        }
+
+    @router.post("/filesystem/permissions")
+    async def fs_grant_permission(body: FsPermissionCreateIn, a=Depends(get_a)):
+        try:
+            perm = await a.orchestrator.fs_access.grant_direct(
+                body.folder_path,
+                body.operations,
+                scope=body.scope,
+                granted_by=body.granted_by,
+                purpose=body.purpose,
+                expires_in_seconds=body.expires_in_seconds,
+            )
+            a.bus.publish({"type": "filesystem_permissions_changed"})
+            return {"ok": True, "permission": perm}
+        except FilesystemSecurityError as e:
+            raise HTTPException(403, str(e)) from e
+
+    @router.put("/filesystem/permissions/{permission_id}")
+    async def fs_update_permission(permission_id: str, body: FsPermissionUpdateIn, a=Depends(get_a)):
+        try:
+            perm = await a.orchestrator.fs_access.update_permission(
+                permission_id,
+                granted_operations=body.granted_operations,
+                scope=body.scope,
+                actor=body.actor,
+            )
+            a.bus.publish({"type": "filesystem_permissions_changed"})
+            return {"ok": True, "permission": perm}
+        except KeyError as e:
+            raise HTTPException(404, str(e)) from e
+        except FilesystemSecurityError as e:
+            raise HTTPException(403, str(e)) from e
+
+    @router.post("/filesystem/permissions/{permission_id}/revoke")
+    async def fs_revoke_permission(permission_id: str, actor: str = "owner", a=Depends(get_a)):
+        try:
+            perm = await a.orchestrator.fs_access.revoke_permission(permission_id, actor=actor)
+            a.bus.publish({"type": "filesystem_permissions_changed"})
+            return {"ok": True, "permission": perm}
+        except KeyError as e:
+            raise HTTPException(404, str(e)) from e
+
+    @router.get("/filesystem/requests")
+    async def fs_list_requests(status: str | None = None, a=Depends(get_a)):
+        return {"requests": await a.orchestrator.fs_access.list_requests(status=status)}
+
+    @router.post("/filesystem/requests/{request_id}/decide")
+    async def fs_decide_request(request_id: str, body: FsPermissionDecideIn, a=Depends(get_a)):
+        try:
+            res = await a.orchestrator.fs_access.decide_request(
+                request_id,
+                body.decision,
+                decided_by=body.decided_by,
+                duration_seconds=body.duration_seconds,
+                allowed_operations=body.allowed_operations,
+            )
+            a.bus.publish({"type": "filesystem_permissions_changed", "request_id": request_id})
+            if body.execute_deferred:
+                resumed = await a.resume_after_permission_decision(request_id, res)
+                return {**res, **resumed}
+            return res
+        except KeyError as e:
+            raise HTTPException(404, str(e)) from e
+        except FilesystemSecurityError as e:
+            raise HTTPException(403, str(e)) from e
+        except ValueError as e:
+            raise HTTPException(409, str(e)) from e
+
+    @router.post("/filesystem/pick-folder")
+    async def fs_pick_folder(a=Depends(get_a)):
+        return await asyncio.to_thread(a.orchestrator.fs_access.pick_folder_dialog)
+
+    @router.get("/filesystem/audit")
+    async def fs_audit_events(limit: int = Query(80, ge=1, le=500), a=Depends(get_a)):
+        return {"events": await a.orchestrator.fs_access.list_audit_events(limit=limit)}
+
+    @router.put("/filesystem/policy")
+    async def fs_update_policy(body: FsPolicyUpdateIn, a=Depends(get_a)):
+        patch = {k: v for k, v in body.model_dump().items() if v is not None}
+        try:
+            snap = apply_settings_patch(a, {"filesystem": patch}, allow_gateway_and_prefs=True)
+            return {"ok": True, "filesystem": snap["filesystem"]}
+        except ValueError as e:
+            raise HTTPException(422, str(e)) from e
+
+    # ---- P10.20 Centralized Assistant Tasks ----------------------------------------------------------
+    @router.get("/tasks")
+    async def list_assistant_tasks(
+        status: str | None = None,
+        active_only: bool = False,
+        limit: int = Query(40, ge=1, le=200),
+        a=Depends(get_a),
+    ):
+        return {"tasks": await a.orchestrator.tasks.list_tasks(status=status, active_only=active_only, limit=limit)}
+
+    @router.get("/tasks/{task_id}")
+    async def get_assistant_task(task_id: str, a=Depends(get_a)):
+        t = await a.orchestrator.tasks.get_task(task_id)
+        if t is None:
+            raise HTTPException(404, f"Task {task_id} not found")
+        return t
+
+    @router.post("/tasks/{task_id}/cancel")
+    async def cancel_assistant_task(task_id: str, reason: str = "Cancelled by owner", a=Depends(get_a)):
+        t = await a.orchestrator.tasks.cancel_task(task_id, reason=reason)
+        if t is None:
+            raise HTTPException(404, f"Task {task_id} not found")
+        await a.orchestrator.fs_access.consume_task_once_permissions(task_id)
+        return {"ok": True, "task": t}
+
+    # ---- P10.20 Consolidated Settings & Secure Provider Gateway --------------------------------------
+    @router.get("/settings")
+    async def get_consolidated_settings(a=Depends(get_a)):
+        return build_consolidated_settings(a)
+
+    @router.put("/settings")
+    async def put_consolidated_settings(request: Request, a=Depends(get_a)):
+        patch = await request.json()
+        try:
+            return {"ok": True, "settings": apply_settings_patch(a, patch, allow_gateway_and_prefs=True)}
+        except ValueError as e:
+            raise HTTPException(422, str(e)) from e
+        except Exception as e:
+            raise HTTPException(422, str(e)) from e
+
+    @router.get("/settings/devices")
+    async def get_settings_devices(a=Depends(get_a)):
+        return await asyncio.to_thread(list_settings_devices, a)
+
+    @router.post("/gateway/providers/{provider}/key")
+    async def save_provider_key(provider: str, body: ProviderKeyIn, a=Depends(get_a)):
+        prov = provider.strip().lower()
+        if prov not in PROVIDER_ENV_VARS:
+            raise HTTPException(404, f"Unsupported provider '{prov}'")
+        try:
+            set_provider_api_key(prov, body.api_key)
+        except ValueError as e:
+            raise HTTPException(422, str(e)) from e
+        a.bus.publish({"type": "config_updated", "keys": [f"provider_key:{prov}"]})
+        return {"ok": True, "provider": prov, "configured": has_provider_api_key(prov)}
+
+    @router.delete("/gateway/providers/{provider}/key")
+    async def remove_provider_key(provider: str, a=Depends(get_a)):
+        prov = provider.strip().lower()
+        if prov not in PROVIDER_ENV_VARS:
+            raise HTTPException(404, f"Unsupported provider '{prov}'")
+        delete_provider_api_key(prov)
+        a.bus.publish({"type": "config_updated", "keys": [f"provider_key:{prov}"]})
+        return {"ok": True, "provider": prov, "configured": has_provider_api_key(prov)}
+
+    @router.post("/gateway/providers/{provider}/health")
+    async def probe_provider_health(provider: str, a=Depends(get_a)):
+        gw = a.orchestrator.gateway
+        if gw is None:
+            raise HTTPException(503, "ModelGateway unavailable")
+        return await gw.health_check_provider(provider)
+
+    @router.post("/gateway/route-test")
+    async def gateway_route_test(body: RouteTestIn, a=Depends(get_a)):
+        gw = a.orchestrator.gateway
+        if gw is None:
+            raise HTTPException(503, "ModelGateway unavailable")
+        return await gw.test_route(
+            role=body.role,
+            require_tools=body.require_tools,
+            require_vision=body.require_vision,
+            json_mode=body.json_mode,
+            project_privacy_level=body.project_privacy_level,
+        )
 
     router.include_router(create_skills_subrouter(fallback))
     router.include_router(create_decision_subrouter(fallback))

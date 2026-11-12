@@ -32,6 +32,7 @@ PROVIDER_ENV_VARS = {
     "openrouter": "OPENROUTER_API_KEY",
     "gemini": "GEMINI_API_KEY",
     "huggingface": "HF_TOKEN",
+    "custom": "JARVIS_CUSTOM_LLM_API_KEY",
 }
 _LANG_RE = re.compile(r"^(auto|none|[a-z]{2,3}(?:-[A-Za-z]{2,4})?)$")
 
@@ -226,6 +227,10 @@ class FilesystemSpec(BaseModel):
     max_file_bytes: int = Field(512_000, ge=10_000, le=5_000_000)
     max_results: int = Field(40, ge=5, le=200)
     allow_write: bool = True
+    sensitive_file_policy: str = Field("always_ask", pattern="^(always_ask|block)$")
+    cloud_data_policy: str = Field("redact_and_confirm", pattern="^(local_only|redact_only|redact_and_confirm)$")
+    allowed_extensions: list[str] = Field(default_factory=list)
+    allow_always_read_only: bool = True
 
 
 class ActionsSpec(BaseModel):
@@ -247,6 +252,15 @@ class ProvidersSpec(BaseModel):
     allow_paid_models: bool = False  # Paid providers require explicit owner authorization
     prefer_free_cloud: bool = True
     paid_providers: list[str] = Field(default_factory=lambda: ["openai", "anthropic"])
+    active_provider: str = "ollama"
+    fast_model: str = "local"
+    advanced_model: str = "local_thinking"
+    coding_model: str = "local"
+    embedding_model: str = ""
+    fallback_provider: str = "ollama"
+    streaming: bool = True
+    custom_base_url: str = ""
+    custom_model: str = ""
     openai_base_url: str = "https://api.openai.com/v1"
     openai_model: str = "gpt-4o-mini"
     anthropic_base_url: str = "https://api.anthropic.com/v1"
@@ -417,6 +431,15 @@ class LearningSpec(BaseModel):
     remote_worker_url: str = ""
 
 
+class PreferencesSpec(BaseModel):
+    theme: str = Field("jarvis_cyan", pattern="^(jarvis_cyan|midnight|high_contrast|dark-hud|cyan-hud|midnight-obsidian)$")
+    compact_mode: bool = False
+    reduced_motion: bool = False
+    graph_detail: str = Field("standard", pattern="^(minimal|compact|standard|detailed|full)$")
+    stt_provider: str = "faster_whisper"
+    tts_provider: str = "piper"
+
+
 class Settings(BaseModel):
     model_config = ConfigDict(extra="allow")
     host: str = "127.0.0.1"
@@ -445,6 +468,7 @@ class Settings(BaseModel):
     workforce: WorkforceSpec = WorkforceSpec()
     recovery: RecoverySpec = RecoverySpec()
     skills: SkillsSpec = SkillsSpec()
+    preferences: PreferencesSpec = PreferencesSpec()
 
     @property
     def notes_path(self) -> Path:

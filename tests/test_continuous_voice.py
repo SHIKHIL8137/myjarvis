@@ -163,7 +163,7 @@ def test_continuous_full_two_turn_lifecycle_and_auto_restart(tmp_path, monkeypat
     a = Assistant(s, data_dir=tmp_path, brain=brain)
 
     captured_audios: list[np.ndarray] = []
-    stt_texts = iter(["turn off the lights", "check system status"])
+    stt_texts = iter(["turn off the lights", "explain quantization briefly"])
     monkeypatch.setattr(a.stt, "transcribe", lambda audio, **kw: (
         captured_audios.append(audio.copy()),
         {

@@ -1,12 +1,13 @@
 """Unified live knowledge graph (P10.15 / P10.18). Real entities and real relationships only.
 Every node has a stable id "<type>:<key>", so clients merge snapshots and bus deltas instead of rebuilding."""
 from datetime import datetime, timezone
+from pathlib import Path
 import re
 import time
 
 from sqlalchemy import select
 
-from .db.models import AgentStepRow, LLMUsageLogRow, SkillMetricRow
+from .db.models import AgentStepRow, AssistantTaskRow, LLMUsageLogRow, SkillMetricRow
 
 CONVERSATION = "conversation:current"
 
@@ -149,14 +150,16 @@ def conversation_node(a) -> dict:
 
 
 def _infer_department(event: str) -> str:
-    if event.startswith("agent.") or event.startswith("project.") or event.startswith("workforce."):
+    if event.startswith("agent.") or event.startswith("project.") or event.startswith("workforce.") or event.startswith("workflow."):
         return "dev"
     if event.startswith("memory.") or event.startswith("note.") or event.startswith("conversation."):
         return "memory"
     if event.startswith("voice.") or event.startswith("assistant."):
         return "assistant"
-    if event.startswith("skill.") or event.startswith("tool."):
+    if event.startswith("skill."):
         return "skills"
+    if event.startswith("tool."):
+        return "tools"
     return "system"
 
 
@@ -232,12 +235,8 @@ def conversation_used(a, hits, ctx: dict) -> None:
          links=[_link(CONVERSATION, i, "references") for i in ids], highlight=[CONVERSATION, *ids])
 
 
-def tool_used(a, tool_name: str, *, query: str = "", target_ids: list[str] | None = None) -> None:
-    """Record a real tool invocation in the current session and broadcast its graph delta."""
+def _build_tool_delta(a, tool_name: str, *, target_ids: list[str] | None = None) -> tuple[str, dict, list[dict], list[dict]]:
     clean_name = re.sub(r"[^a-zA-Z0-9_.-]+", "_", tool_name).strip("_") or "tool"
-    used = getattr(a, "used_tools", None)
-    if isinstance(used, set):
-        used.add(clean_name)
     tnode = tool_node(clean_name, source="assistant")
     nodes = [tnode]
     links = []
@@ -246,16 +245,219 @@ def tool_used(a, tool_name: str, *, query: str = "", target_ids: list[str] | Non
         links.append(_link(CONVERSATION, tnode["id"], "uses_tool"))
     for tid in target_ids or []:
         links.append(_link(tnode["id"], tid, "touches"))
+    return clean_name, tnode, nodes, links
+
+
+def tool_invoked(a, tool_name: str, *, query: str = "", target_ids: list[str] | None = None) -> None:
+    """Broadcast start of a generic tool invocation (`tool.invoked`), distinct from installed Skills."""
+    clean_name, tnode, nodes, links = _build_tool_delta(a, tool_name, target_ids=target_ids)
     emit(
         a.bus,
-        "skill.executed",
-        source_department="skills",
+        "tool.invoked",
+        source_department="tools",
         entity_id=tnode["id"],
         nodes=nodes,
         links=links,
         highlight=[tnode["id"], CONVERSATION, *(target_ids or [])],
         tool=clean_name,
+        status="running",
         query=sanitize_graph_text(query)[:140],
+    )
+
+
+def tool_used(
+    a,
+    tool_name: str,
+    *,
+    query: str = "",
+    target_ids: list[str] | None = None,
+    ok: bool = True,
+    duration_ms: float | None = None,
+) -> None:
+    """Record a completed generic tool invocation (`tool.executed`) and broadcast its graph delta."""
+    clean_name, tnode, nodes, links = _build_tool_delta(a, tool_name, target_ids=target_ids)
+    used = getattr(a, "used_tools", None)
+    if isinstance(used, set):
+        used.add(clean_name)
+    extra: dict = {
+        "tool": clean_name,
+        "ok": bool(ok),
+        "query": sanitize_graph_text(query)[:140],
+    }
+    if duration_ms is not None:
+        extra["duration_ms"] = round(float(duration_ms), 2)
+    emit(
+        a.bus,
+        "tool.executed",
+        source_department="tools",
+        entity_id=tnode["id"],
+        nodes=nodes,
+        links=links,
+        highlight=[tnode["id"], CONVERSATION, *(target_ids or [])],
+        **extra,
+    )
+
+
+def task_delta(task: dict) -> tuple[list[dict], list[dict]]:
+    """Build real knowledge graph nodes/links for an AssistantTaskRow."""
+    tid = str(task.get("task_id") or "")
+    if not tid:
+        return [], []
+    label = sanitize_graph_text(str(task.get("user_request") or task.get("intent") or tid))[:60]
+    tnode = _node(
+        "task",
+        tid,
+        label,
+        status=task.get("status"),
+        intent=task.get("intent"),
+        source=task.get("source"),
+        step=task.get("current_step"),
+        created_at=task.get("created_at"),
+        updated_at=task.get("updated_at"),
+    )
+    nodes = [tnode]
+    links: list[dict] = [_link(CONVERSATION, tnode["id"], "triggered")]
+    for ag in task.get("selected_agents") or []:
+        if ag:
+            anode = _node("agent", str(ag), str(ag))
+            nodes.append(anode)
+            links.append(_link(tnode["id"], anode["id"], "assigned_to"))
+    for tool_name in task.get("tools_used") or []:
+        if tool_name:
+            t_node = tool_node(str(tool_name), source="assistant")
+            nodes.append(t_node)
+            links.append(_link(tnode["id"], t_node["id"], "uses_tool"))
+    for fitem in task.get("generated_files") or []:
+        fpath = fitem.get("path") if isinstance(fitem, dict) else str(fitem)
+        fname = fitem.get("name") if isinstance(fitem, dict) else (Path(fpath).name if fpath else "")
+        if fpath and fname:
+            dnode = _node("document", f"fs_{abs(hash(fpath)) % 10**9}", fname, source=fpath)
+            nodes.append(dnode)
+            links.append(_link(tnode["id"], dnode["id"], "produced"))
+    return nodes, links
+
+
+def filesystem_activity(
+    a,
+    *,
+    task_id: str | None = None,
+    folder_path: str = "",
+    files: list[dict] | None = None,
+    operation: str = "search_files",
+) -> None:
+    """Emit real filesystem discovery nodes/highlights ONLY after verified execution."""
+    nodes: list[dict] = []
+    links: list[dict] = []
+    hl: list[str] = [CONVERSATION]
+    if task_id:
+        tnode = _node("task", task_id, task_id[:16], status="running")
+        nodes.append(tnode)
+        hl.append(tnode["id"])
+    f_tool = tool_node("filesystem_access", source="filesystem")
+    nodes.append(f_tool)
+    hl.append(f_tool["id"])
+    for item in (files or [])[:12]:
+        fpath = str(item.get("path") or "")
+        fname = str(item.get("name") or "")
+        if not fpath or not fname:
+            continue
+        fid = f"fs_{abs(hash(fpath)) % 10**9}"
+        dnode = _node("document", fid, fname, source=fpath, bytes=item.get("size_bytes"), updated_at=item.get("modified_at"))
+        nodes.append(dnode)
+        hl.append(dnode["id"])
+        if task_id:
+            links.append(_link(f"task:{task_id}", dnode["id"], f"fs_{operation}"))
+    emit(
+        a.bus,
+        "filesystem.executed",
+        source_department="assistant",
+        entity_id=f_tool["id"],
+        nodes=nodes,
+        links=links,
+        highlight=hl,
+        operation=operation,
+        folder=sanitize_graph_text(folder_path)[:160],
+        count=len(files or []),
+    )
+
+
+def skill_executed(
+    bus,
+    *,
+    skill_id: str,
+    skill_name: str = "",
+    agent_role: str = "assistant_coordinator",
+    run_id: str | None = None,
+    project_id: str | None = None,
+    ok: bool = True,
+    task_kind: str = "",
+) -> None:
+    """Emit genuine `skill.executed` event ONLY when an installed SkillRegistry skill runs."""
+    sid = f"skill:{skill_id}"
+    aid = f"agent:{agent_role}"
+    snode = _node(
+        "skill",
+        skill_id,
+        skill_name or skill_id,
+        category=task_kind,
+        role=agent_role,
+        status="completed" if ok else "failed",
+    )
+    anode = _node("agent", agent_role, agent_role)
+    links = [_link(aid, sid, "uses_skill")]
+    if run_id:
+        links.append(_link(f"task:{run_id}", sid, "used_skill"))
+    if project_id:
+        links.append(_link(sid, f"project:{project_id}", "applies_to"))
+    emit(
+        bus,
+        "skill.executed",
+        source_department="skills",
+        entity_id=sid,
+        nodes=[snode, anode],
+        links=links,
+        highlight=[sid, aid],
+        skill_id=skill_id,
+        agent_role=agent_role,
+        run_id=run_id,
+        ok=bool(ok),
+        task_kind=task_kind,
+    )
+
+
+def workflow_event(
+    bus,
+    event_name: str,
+    *,
+    run_id: str,
+    workflow_name: str,
+    agent_role: str = "assistant_coordinator",
+    department: str = "assistant",
+    project_id: str | None = None,
+    state: str = "running",
+    step: str | None = None,
+    detail: str = "",
+) -> None:
+    """Emit structured `workflow.started` / `workflow.completed` / `workflow.failed` lifecycle event."""
+    wf_node = workflow_node(workflow_name)
+    anode = _node("agent", agent_role, agent_role)
+    links = [_link(f"agent:{agent_role}", wf_node["id"], "executes_workflow")]
+    if project_id:
+        links.append(_link(wf_node["id"], f"project:{project_id}", "targets"))
+    active = state in ("running", "awaiting_approval", "cancelling")
+    emit(
+        bus,
+        event_name,
+        source_department=department,
+        entity_id=wf_node["id"],
+        nodes=[wf_node, anode],
+        links=links,
+        highlight=[wf_node["id"], f"task:{run_id}"] if active else [],
+        run_id=run_id,
+        workflow=workflow_name,
+        state=state,
+        step=step,
+        detail=sanitize_graph_text(detail)[:240],
     )
 
 
@@ -350,6 +552,26 @@ def build_graph(a, types: set[str] | None = None, limit: int = 300) -> dict:
                     if isinstance(tname, str) and tname:
                         add(tool_node(tname, source="agent"))
                         links.append(_link(f"task:{st.run_id}", f"tool:{tname}", "uses_tool"))
+        with o.db.sync_session() as s:
+            atasks = s.scalars(select(AssistantTaskRow).order_by(AssistantTaskRow.created_at.desc()).limit(limit)).all()
+            for t in atasks:
+                td = {
+                    "task_id": t.task_id,
+                    "user_request": t.user_request,
+                    "source": t.source,
+                    "intent": t.intent,
+                    "status": t.status,
+                    "selected_agents": list(t.selected_agents or []),
+                    "tools_used": list(t.tools_used or []),
+                    "generated_files": list(t.generated_files or []),
+                    "current_step": t.current_step,
+                    "created_at": t.created_at,
+                    "updated_at": t.updated_at,
+                }
+                tns, tls = task_delta(td)
+                for n in tns:
+                    add(n)
+                links += tls
 
     if want("tool"):
         for tname in sorted(getattr(a, "used_tools", set()) or set()):

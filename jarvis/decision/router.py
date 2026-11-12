@@ -157,13 +157,32 @@ class DecisionEngine:
 
         if env.department == "assistant" or env.needs_live_web:
             chain = [local_think if env.complexity == "complex_reasoning" else local_default] + cloud
+            role = (
+                "document_producer"
+                if env.intent == "document_export"
+                else (
+                    "filesystem_agent"
+                    if env.intent == "filesystem_ops"
+                    else ("memory_agent" if env.intent == "memory_manage" else ("research_agent" if env.needs_live_web else "assistant_coordinator"))
+                )
+            )
             return RoutingPlan(
                 decision=env,
                 workflow="assistant_graph",
                 primary_model=chain[0],
                 fallback_models=chain[1:] + ([local_default] if chain[0] != local_default else []),
-                agent_role="document_producer" if env.intent == "document_export" else ("research_agent" if env.needs_live_web else "assistant_coordinator"),
-                allowed_tools=["memory_search", "doc_export", "reminders", "web_search"],
+                agent_role=role,
+                allowed_tools=["memory_search", "doc_export", "reminders", "web_search", "filesystem_search"],
+            )
+
+        if env.department == "system":
+            return RoutingPlan(
+                decision=env,
+                workflow="assistant_graph",
+                primary_model=local_default,
+                fallback_models=[],
+                agent_role="system_operator",
+                allowed_tools=["system_status", "docker_inspect", "recovery_inspect"],
             )
 
         return RoutingPlan(

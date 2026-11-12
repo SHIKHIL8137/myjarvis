@@ -459,3 +459,62 @@ class SkillMetricRow(Base):
     user_corrected: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[float] = mapped_column(Float, default=_now, index=True)
 
+
+# ---- 5. P10.20 Scoped Filesystem Permissions & Centralized Assistant Tasks ------------------------
+class FilesystemPermissionRow(Base):
+    __tablename__ = "filesystem_permissions"
+    permission_id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    canonical_folder_path: Mapped[str] = mapped_column(String(800), index=True)
+    granted_operations: Mapped[list] = mapped_column(JSON, default=list)
+    scope: Mapped[str] = mapped_column(String(24), default="once", index=True)  # "once" | "session" | "persistent"
+    granted_at: Mapped[float] = mapped_column(Float, default=_now, index=True)
+    expires_at: Mapped[float | None] = mapped_column(Float, nullable=True, index=True)
+    granted_by: Mapped[str] = mapped_column(String(64), default="owner")
+    revoked_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    status: Mapped[str] = mapped_column(String(24), default="active", index=True)  # "active" | "revoked" | "expired" | "consumed"
+    purpose: Mapped[str] = mapped_column(String(400), default="")
+    session_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    task_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+
+
+class FilesystemPermissionRequestRow(Base):
+    __tablename__ = "filesystem_permission_requests"
+    request_id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    task_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    requested_path: Mapped[str] = mapped_column(String(800))
+    canonical_path: Mapped[str] = mapped_column(String(800), index=True)
+    requested_operations: Mapped[list] = mapped_column(JSON, default=list)
+    not_requested_operations: Mapped[list] = mapped_column(JSON, default=list)
+    sensitive_flags: Mapped[list] = mapped_column(JSON, default=list)
+    reason: Mapped[str] = mapped_column(String(500), default="")
+    access_duration: Mapped[str] = mapped_column(String(24), default="once")  # "once" | "session" | "persistent"
+    status: Mapped[str] = mapped_column(String(24), default="pending", index=True)  # "pending" | "approved" | "denied" | "expired" | "consumed"
+    permission_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    deferred_action: Mapped[dict] = mapped_column(JSON, default=dict)
+    decided_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[float] = mapped_column(Float, default=_now, index=True)
+    expires_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    decided_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+
+class AssistantTaskRow(Base):
+    __tablename__ = "assistant_tasks"
+    task_id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    user_request: Mapped[str] = mapped_column(Text, default="")
+    source: Mapped[str] = mapped_column(String(24), default="text")
+    intent: Mapped[str] = mapped_column(String(64), default="general_chat", index=True)
+    status: Mapped[str] = mapped_column(String(32), default="queued", index=True)
+    plan: Mapped[list] = mapped_column(JSON, default=list)
+    selected_capabilities: Mapped[list] = mapped_column(JSON, default=list)
+    selected_agents: Mapped[list] = mapped_column(JSON, default=list)
+    tools_used: Mapped[list] = mapped_column(JSON, default=list)
+    permissions_requested: Mapped[list] = mapped_column(JSON, default=list)
+    current_step: Mapped[str] = mapped_column(String(200), default="")
+    result: Mapped[str] = mapped_column(Text, default="")
+    generated_files: Mapped[list] = mapped_column(JSON, default=list)
+    error_info: Mapped[str] = mapped_column(Text, default="")
+    meta: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[float] = mapped_column(Float, default=_now, index=True)
+    updated_at: Mapped[float] = mapped_column(Float, default=_now)
+    completed_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+

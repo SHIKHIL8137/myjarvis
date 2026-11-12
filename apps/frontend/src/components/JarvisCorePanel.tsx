@@ -42,6 +42,7 @@ interface JarvisCorePanelProps extends ShellProps {
   overview: SystemOverview | null;
   backendDown: boolean;
   live: ConnState;
+  onOpenDrawer?: (drawer: "approvals" | "workforce" | "memory" | "system" | "learning" | "voice") => void;
 }
 
 export const JarvisCorePanel: React.FC<JarvisCorePanelProps> = ({
@@ -57,6 +58,7 @@ export const JarvisCorePanel: React.FC<JarvisCorePanelProps> = ({
   onNotify,
   onNavigate,
   onInspect,
+  onOpenDrawer,
 }) => {
   const [mode, setMode] = useState<CoreMode>(() => {
     const saved = localStorage.getItem(CORE_MODE_KEY);
@@ -84,7 +86,9 @@ export const JarvisCorePanel: React.FC<JarvisCorePanelProps> = ({
   const pendingApprovals = overview?.pending_approvals || [];
   const sys = status?.system;
   const duplex = (status?.voice as unknown as { duplex?: { effective?: string } })?.duplex?.effective || "half_duplex";
-  const voiceMode = (status?.voice as unknown as { mode?: string })?.mode || "continuous";
+  const voiceMode = status?.voice?.mode || "continuous";
+  const wakeReady = Boolean(status?.ready?.wake);
+  const voiceErr = status?.voice?.error;
 
   if (!open) {
     return (
@@ -169,20 +173,44 @@ export const JarvisCorePanel: React.FC<JarvisCorePanelProps> = ({
             >
               <option value="continuous">Continuous</option>
               <option value="ptt">PTT</option>
-              <option value="wake_word">Wake Word</option>
+              <option value="wake_word" disabled={!wakeReady}>{wakeReady ? "Wake Word" : "Wake Word (Unavailable)"}</option>
             </select>
           </div>
+          {!wakeReady && (
+            <div className="dim mono" style={{ marginTop: 4, fontSize: 10.5 }}>
+              Wake-word detection offline (model not loaded)
+            </div>
+          )}
           <div className="row between dim mono" style={{ marginTop: 4 }}>
             <span>Audio Policy</span>
             <span>{duplex}</span>
           </div>
+          {voiceErr && (
+            <div className="alert-card" style={{ marginTop: 8, padding: 6 }}>
+              <div className="err-text" style={{ fontSize: 11 }}>{voiceErr}</div>
+              <button
+                className="ghost"
+                style={{ marginTop: 4, fontSize: 11 }}
+                onClick={async () => {
+                  try {
+                    const r = await apiFetch<{ error?: string; state?: string }>("/voice/session", { method: "POST", body: { action: "recover" } });
+                    onNotify(r.error ? r.error : `Microphone recovered (${r.state || "ready"})`);
+                  } catch (err) {
+                    onNotify((err as Error).message);
+                  }
+                }}
+              >
+                Recover Mic
+              </button>
+            </div>
+          )}
         </section>
 
         {pendingApprovals.length > 0 && (
           <section className="hud-section alert-card">
             <div className="row between">
               <strong style={{ color: "var(--warn)", fontSize: 12 }}>Approvals Pending ({pendingApprovals.length})</strong>
-              <button className="ghost" onClick={() => onNavigate?.("workforce")}>Review</button>
+              <button className="ghost" onClick={() => (onOpenDrawer ? onOpenDrawer("approvals") : onNavigate?.("workforce"))}>Review</button>
             </div>
             <p className="dim" style={{ marginTop: 4 }}>{pendingApprovals[0].action_type}: {pendingApprovals[0].target_resource.slice(0, 60)}</p>
           </section>

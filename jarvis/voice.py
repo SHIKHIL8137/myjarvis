@@ -61,7 +61,7 @@ _ASSISTANT_OS_STATE = {
     VoiceState.GENERATING: "Thinking",
     VoiceState.SPEAKING: "Speaking",
     VoiceState.INTERRUPTED: "Speech detected",
-    VoiceState.RESUMING: "Listening",
+    VoiceState.RESUMING: "Resuming",
     VoiceState.PAUSED: "Idle",
     VoiceState.ERROR: "Error",
 }
@@ -150,6 +150,9 @@ class VoiceLoop:
         self._run = threading.Event()
         self._turn_gate = threading.Event()  # set = mic suspended during half-duplex turn
         self._turn_wake = threading.Event()  # wakes paused/suspended loop promptly
+        self._stream_open_ev = threading.Event()  # set strictly while hardware stream is open & ready
+        self._stream_closed_ev = threading.Event()
+        self._stream_closed_ev.set()
         self._ptt_trigger = threading.Event()
         self._one_shot_ptt = False
 
@@ -207,6 +210,17 @@ class VoiceLoop:
     def _is_half_duplex(self) -> bool:
         return self.duplex_info()["effective"] == "half_duplex"
 
+    @property
+    def mic_active(self) -> bool:
+        """True ONLY when the host input microphone stream is open and actively reading frames."""
+        return bool(
+            self._run.is_set()
+            and not self.paused
+            and not self.mic_suspended
+            and self.last_error is None
+            and self.audio_state in (VoiceState.LISTENING, VoiceState.WAKE_WORD, VoiceState.SPEECH_DETECTED, VoiceState.INTERRUPTED)
+        )
+
     # ---- state helpers -------------------------------------------------------------------------------
     def _transition(self, new_state: VoiceState, reason: str = ""):
         with self._state_lock:
@@ -215,14 +229,24 @@ class VoiceLoop:
             self.state = _LEGACY_STATE[new_state]
             if changed or reason:
                 d = self.duplex_info()
+                raw_os = _ASSISTANT_OS_STATE.get(self.audio_state, "Idle")
+                # Never advertise Listening unless host mic stream is genuinely active (or stream_opened just transitioned)
+                active_now = bool(
+                    self._run.is_set()
+                    and not self.paused
+                    and not self.mic_suspended
+                    and self.audio_state in (VoiceState.LISTENING, VoiceState.WAKE_WORD, VoiceState.SPEECH_DETECTED, VoiceState.INTERRUPTED)
+                )
+                os_label = "Idle" if (raw_os == "Listening" and not active_now) else raw_os
                 self.emit({
                     "type": "voice_state",
                     "state": self.state,
                     "audio_state": self.audio_state.value,
-                    "assistant_state": _ASSISTANT_OS_STATE.get(self.audio_state, "Idle"),
+                    "assistant_state": os_label,
                     "mode": self.mode,
                     "paused": self.paused,
                     "mic_suspended": self.mic_suspended,
+                    "mic_active": active_now,
                     "duplex_effective": d["effective"],
                     "barge_in_available": d["barge_in_available"],
                     "aec_verified": d["aec_verified"],
@@ -256,6 +280,7 @@ class VoiceLoop:
                     self._transition(self._entry_state(), reason="mode_change")
 
     def enable(self, mode: str | None = None, *, one_shot_ptt: bool = False):
+        resume_existing = False
         with self._ctl_lock:
             if mode is not None:
                 self.set_mode(mode)
@@ -269,23 +294,38 @@ class VoiceLoop:
             if self._thread and self._thread.is_alive():
                 if one_shot_ptt:
                     self._one_shot_ptt = True
-                if self.audio_state == VoiceState.PAUSED:
-                    self._transition(self._entry_state(), reason="resumed")
+                if self.audio_state == VoiceState.PAUSED or not self._stream_open_ev.is_set():
+                    resume_existing = True
+                else:
+                    return
+        if resume_existing:
+            self.resume()
+            return
+        with self._ctl_lock:
+            if self._thread and self._thread.is_alive():
                 return
+            self._stream_open_ev.clear()
             self._one_shot_ptt = bool(one_shot_ptt or self.mode == "ptt")
             self._drain_queue()
             self._run.set()
             self._thread = threading.Thread(target=self._loop, name="voice-loop", daemon=True)
             self._thread.start()
 
+    def recover(self, mode: str | None = None):
+        """Cleanly reset ERROR/stale state and reopen the host microphone stream."""
+        self.disable(join=True)
+        self.enable(mode=mode or self.mode)
+
     def start_session(self, mode: str | None = None):
         self.enable(mode=mode)
 
     def pause(self):
+        wait_close = False
         with self._ctl_lock:
             if not (self._thread and self._thread.is_alive()):
                 return
             self.paused = True
+            self._stream_open_ev.clear()
             self._turn_gate.clear()
             self._turn_wake.set()
             self.speaker.stop()
@@ -295,19 +335,29 @@ class VoiceLoop:
                 except Exception:
                     log.exception("on_interrupt during pause")
             self._transition(VoiceState.PAUSED, reason="user_paused")
+            wait_close = True
+        if wait_close:
+            self._stream_closed_ev.wait(timeout=0.5)
 
     def resume(self):
         with self._ctl_lock:
             if not (self._thread and self._thread.is_alive()):
                 self.enable(mode=self.mode)
-                return
-            self.paused = False
-            self.mic_suspended = False
-            self._turn_gate.clear()
-            if self._vad:
-                self._vad.reset()
-            self._transition(self._entry_state(), reason="user_resumed")
-            self._turn_wake.set()
+            else:
+                self._stream_open_ev.clear()
+                self.paused = False
+                self.mic_suspended = False
+                self._turn_gate.clear()
+                if self._vad:
+                    self._vad.reset()
+                self._turn_wake.set()
+        # Wait until _loop actually reopens the audio stream and emits LISTENING/WAKE_WORD
+        deadline = time.monotonic() + 1.5
+        while time.monotonic() < deadline:
+            if self._stream_open_ev.wait(timeout=0.05):
+                break
+            if not self._run.is_set() or self.paused or self.audio_state == VoiceState.ERROR:
+                break
 
     def interrupt(self, barge_frames: list[np.ndarray] | None = None, reason: str = "barge_in"):
         """Immediately stop TTS & active generation. Preserves barge-in frames in verified full-duplex."""
@@ -332,6 +382,7 @@ class VoiceLoop:
     def disable(self, join: bool = True):
         with self._ctl_lock:
             self._run.clear()
+            self._stream_open_ev.clear()
             self.paused = False
             self.mic_suspended = False
             self._turn_gate.clear()
@@ -540,6 +591,8 @@ class VoiceLoop:
                 self.wake.load()
             except Exception as e:
                 if self.mode == "wake_word":
+                    self._run.clear()
+                    self.mic_suspended = False
                     self.last_error = f"wake word model unavailable: {e}"
                     self.emit({"type": "error", "message": self.last_error})
                     self._transition(VoiceState.ERROR, reason="wake_load_failed")
@@ -574,6 +627,8 @@ class VoiceLoop:
                 try:
                     stream, cap_sr, blocksize = self._open_stream(sd)
                 except Exception as e:
+                    self._run.clear()
+                    self.mic_suspended = False
                     self.last_error = f"cannot open microphone: {e}"
                     log.error(self.last_error)
                     self.emit({"type": "error", "message": self.last_error})
@@ -598,6 +653,7 @@ class VoiceLoop:
                 empty_reads = 0
                 has_voiced_in_rec = True
 
+                self._stream_closed_ev.clear()
                 with stream:
                     # Enter active listening (with follow-up window if returning from wake-word turn)
                     if wake_followup_after_turn and self.mode == "wake_word":
@@ -610,6 +666,7 @@ class VoiceLoop:
                             self._transition(VoiceState.WAKE_WORD, reason="turn_complete")
                     else:
                         self._transition(self._entry_state(), reason="stream_opened")
+                    self._stream_open_ev.set()
 
                     while self._run.is_set() and not self.paused and not (self._turn_gate.is_set() and self._is_half_duplex):
                         a = self.s.audio
@@ -836,12 +893,17 @@ class VoiceLoop:
                                     # Half-duplex: exit `with stream:` immediately to release hardware mic
                                     break
                             continue
+                self._stream_open_ev.clear()
+                self._stream_closed_ev.set()
         except Exception as e:
+            self._run.clear()
             self.last_error = f"voice loop stopped: {e}"
             log.exception("voice loop")
             self.emit({"type": "error", "message": self.last_error})
             self._transition(VoiceState.ERROR, reason="loop_error")
         finally:
+            self._stream_open_ev.clear()
+            self._stream_closed_ev.set()
             self.mic_suspended = False
             if self.audio_state != VoiceState.ERROR:
                 self._transition(VoiceState.IDLE, reason="stream_closed")

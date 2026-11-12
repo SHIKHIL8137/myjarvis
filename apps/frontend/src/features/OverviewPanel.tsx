@@ -17,7 +17,16 @@ export interface SystemOverview {
 export interface SystemStatus {
   ollama: { up: boolean; version?: string; loaded?: string[] };
   brain: { model: string; provider: string };
-  voice: { state: string; audio_state: string; error?: string | null };
+  voice: {
+    state: string;
+    audio_state: string;
+    mode?: string;
+    paused?: boolean;
+    mic_suspended?: boolean;
+    mic_active?: boolean;
+    wake_ready?: boolean;
+    error?: string | null;
+  };
   ready: { tts: boolean; stt: boolean; wake: boolean };
   system: { ram: { total_gb: number; free_gb: number }; gpu: { name: string; total_gb: number; used_gb: number; util_pct: number } | null; cpu_pct: number | null };
   mode: string;

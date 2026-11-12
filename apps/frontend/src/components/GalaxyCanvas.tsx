@@ -319,6 +319,9 @@ export const GalaxyCanvas = React.memo(
         })
         .onBackgroundClick(() => cb.current.onSelect(null));
 
+      const initW = el.clientWidth > 40 ? el.clientWidth : 640;
+      const initH = el.clientHeight > 40 ? el.clientHeight : 480;
+      g.width(initW).height(initH);
       g.d3Force("charge").distanceMax(260);
       fg.current = g;
 
@@ -337,7 +340,13 @@ export const GalaxyCanvas = React.memo(
       };
       fRaf = requestAnimationFrame(trackFps);
 
-      const ro = new ResizeObserver(() => g.width(el.clientWidth).height(el.clientHeight));
+      const ro = new ResizeObserver(() => {
+        const w = el.clientWidth;
+        const h = el.clientHeight;
+        if (w > 40 && h > 40) {
+          g.width(w).height(h);
+        }
+      });
       ro.observe(el);
       const onVis = () => (document.hidden ? g.pauseAnimation() : !calm && g.resumeAnimation());
       document.addEventListener("visibilitychange", onVis);
@@ -441,7 +450,7 @@ export const GalaxyCanvas = React.memo(
         g.graphData({ nodes, links });
         if (!fitted.current && nodes.length) {
           fitted.current = true;
-          setTimeout(() => fg.current?.zoomToFit(700, 60), 1000);
+          setTimeout(() => fg.current?.zoomToFit(550, 32), 700);
         }
       } else refresh();
     }, [version, hidden]);

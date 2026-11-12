@@ -13,6 +13,7 @@ OPENAI_COMPAT_PROVIDERS = {
     "openai": ("openai_base_url", "openai_model"),
     "openrouter": ("openrouter_base_url", "openrouter_model"),
     "huggingface": ("huggingface_base_url", "huggingface_model"),
+    "custom": ("custom_base_url", "custom_model"),
 }
 
 
@@ -28,7 +29,7 @@ class CloudGatewayError(RuntimeError):
 def parse_model_key(model_key: str, settings: Settings) -> tuple[str, str]:
     """Return (provider_name, model_id) from qualified key or local brain config."""
     k = (model_key or settings.boot_brain).strip()
-    for prov in ("openrouter", "huggingface", "gemini", "openai", "anthropic", "opencode"):
+    for prov in ("openrouter", "huggingface", "gemini", "openai", "anthropic", "custom", "opencode"):
         if k.startswith(prov + ":"):
             return prov, k.split(":", 1)[1]
     if k in settings.brains:
@@ -392,7 +393,24 @@ class AnthropicAdapter:
     async def health_check(self, api_key: str | None = None, transport_factory=None) -> dict:
         if not api_key:
             return {"ok": False, "provider": "anthropic", "error": "missing API key"}
-        return {"ok": True, "provider": "anthropic", "note": "key configured"}
+        url = self.base_url + "/models"
+        host = (urlsplit(url).hostname or "").lower()
+        allow = self.allowed_hosts or ({host} if host else set())
+        t0 = time.perf_counter()
+        res = await safe_request(
+            "GET",
+            url,
+            InternetSpec(enabled=True, timeout_s=8.0),
+            allowed_hosts=allow,
+            headers={"x-api-key": api_key, "anthropic-version": "2023-06-01"},
+            transport_factory=transport_factory,
+        )
+        return {
+            "ok": res.status_code < 400,
+            "provider": "anthropic",
+            "status": res.status_code,
+            "latency_ms": round((time.perf_counter() - t0) * 1000.0, 1),
+        }
 
     async def complete(
         self,
@@ -408,18 +426,38 @@ class AnthropicAdapter:
         allow = self.allowed_hosts or ({host} if host else set())
         sys_msg = "\n".join(m.get("content", "") for m in req.messages if m.get("role") == "system")
         chat_msgs = [{"role": m["role"], "content": m["content"]} for m in req.messages if m.get("role") != "system"]
+        json_body: dict = {
+            "model": model_id,
+            "system": sys_msg,
+            "messages": chat_msgs,
+            "max_tokens": req.max_tokens,
+            "stream": True,
+        }
+        if req.tools:
+            anth_tools = []
+            for t in req.tools:
+                fn = t.get("function", t)
+                anth_tools.append(
+                    {
+                        "name": fn.get("name", ""),
+                        "description": fn.get("description", ""),
+                        "input_schema": fn.get("parameters", {"type": "object", "properties": {}}),
+                    }
+                )
+            json_body["tools"] = anth_tools
         net_spec = InternetSpec(enabled=True, timeout_s=float(req.timeout_s or 30.0), max_fetch_bytes=max_fetch_bytes)
         t0 = time.perf_counter()
         prompt_tok = 0
         comp_tok = 0
         saw_text = ""
+        calls: list[dict] = []
         try:
             async for raw_ln in safe_stream_lines(
                 "POST",
                 url,
                 net_spec,
                 allowed_hosts=allow,
-                json_body={"model": model_id, "system": sys_msg, "messages": chat_msgs, "max_tokens": req.max_tokens, "stream": True},
+                json_body=json_body,
                 headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "Accept": "text/event-stream"},
                 transport_factory=transport_factory,
             ):
@@ -430,10 +468,12 @@ class AnthropicAdapter:
                     continue
                 if ln.startswith("{"):
                     data = json.loads(ln)
-                    txt = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
-                    if txt:
-                        saw_text += txt
-                        yield GatewayEvent(type="token", text=txt)
+                    for b in data.get("content", []):
+                        if b.get("type") == "text" and b.get("text"):
+                            saw_text += b["text"]
+                            yield GatewayEvent(type="token", text=b["text"])
+                        elif b.get("type") == "tool_use":
+                            calls.append({"id": b.get("id", f"anth_{len(calls)}"), "name": b.get("name", ""), "arguments": b.get("input") or {}})
                     usage = data.get("usage") or {}
                     prompt_tok = int(usage.get("input_tokens") or 0)
                     comp_tok = int(usage.get("output_tokens") or len(saw_text.split()))
@@ -442,7 +482,11 @@ class AnthropicAdapter:
                     continue
                 ev = json.loads(ln[5:].strip())
                 etype = ev.get("type")
-                if etype == "content_block_delta":
+                if etype == "content_block_start":
+                    cb = ev.get("content_block") or {}
+                    if cb.get("type") == "tool_use":
+                        calls.append({"id": cb.get("id", f"anth_{len(calls)}"), "name": cb.get("name", ""), "arguments": cb.get("input") or {}})
+                elif etype == "content_block_delta":
                     d = ev.get("delta") or {}
                     if d.get("type") == "text_delta" and d.get("text"):
                         saw_text += d["text"]
@@ -460,6 +504,8 @@ class AnthropicAdapter:
             retryable = any(code in msg_e for code in ("429", "502", "503", "504", "Timeout"))
             raise CloudGatewayError(f"anthropic failed: {e}", category="upstream_transient" if retryable else "upstream", retryable=retryable) from e
 
+        if calls:
+            yield GatewayEvent(type="tool_calls", calls=calls)
         yield GatewayEvent(
             type="done",
             usage={

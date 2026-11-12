@@ -193,4 +193,4 @@ def mark() -> float:
 
 def since(t: float, only_remote: bool = False) -> list[dict]:
     with _lock:
-        return [e for e in _events if e["t"] >= t and not (only_remote and e["local"])]
+        return [e for e in _events if e.get("t", 0.0) >= t and not (only_remote and e.get("local", True))]

@@ -26,10 +26,22 @@ class ToolsUnsupportedError(BrainError):
 
 
 class ThinkFilter:
-    """Streaming remover of <think>...</think> blocks (tags may be split across chunks)."""
+    """Streaming remover of <think>...</think> blocks, including unpaired </think> prefixes."""
 
-    def __init__(self):
+    def __init__(self, *, defer_unopened: bool = False):
         self.buf, self.inside = "", False
+        self._defer = bool(defer_unopened)
+
+    @property
+    def deferred(self) -> bool:
+        return self._defer
+
+    def note_separate_thinking(self) -> str:
+        """Called when the backend emits an explicit `message.thinking` field, proving content isn't raw reasoning."""
+        if not self._defer:
+            return ""
+        self._defer = False
+        return self.feed("")
 
     def feed(self, s: str) -> str:
         self.buf += s
@@ -40,19 +52,39 @@ class ThinkFilter:
                 if i < 0:
                     self.buf = self.buf[-8:]  # keep a possible partial closing tag
                     return out
-                self.buf, self.inside = self.buf[i + 8:], False
+                self.buf, self.inside = self.buf[i + 8 :], False
             else:
-                i = self.buf.find("<think>")
-                if i >= 0:
-                    out, self.buf, self.inside = out + self.buf[:i], self.buf[i + 7:], True
+                open_idx = self.buf.find("<think>")
+                close_idx = self.buf.find("</think>")
+                if close_idx >= 0 and (open_idx < 0 or close_idx < open_idx):
+                    # Unpaired closing tag (e.g., model prompt template started inside <think>)
+                    self.buf = self.buf[close_idx + 8 :]
+                    self._defer = False
+                    out = ""
                     continue
-                keep = max((k for k in range(1, 7) if "<think>".startswith(self.buf[-k:])), default=0)
-                out += self.buf[:len(self.buf) - keep]
-                self.buf = self.buf[len(self.buf) - keep:]
+                if open_idx >= 0:
+                    if not self._defer:
+                        out += self.buf[:open_idx]
+                    elif self.buf[:open_idx]:
+                        out += self.buf[:open_idx]
+                    self._defer = False
+                    self.buf, self.inside = self.buf[open_idx + 7 :], True
+                    continue
+                if self._defer:
+                    return out
+                keep_open = max((k for k in range(1, 7) if "<think>".startswith(self.buf[-k:])), default=0)
+                keep_close = max((k for k in range(1, 8) if "</think>".startswith(self.buf[-k:])), default=0)
+                keep = max(keep_open, keep_close)
+                out += self.buf[: len(self.buf) - keep]
+                self.buf = self.buf[len(self.buf) - keep :]
                 return out
 
     def flush(self) -> str:
-        out = "" if self.inside else self.buf
+        if self.inside:
+            self.buf = ""
+            return ""
+        self._defer = False
+        out = self.buf
         self.buf = ""
         return out
 
@@ -266,11 +298,12 @@ class Brain:
         net_spec = InternetSpec(enabled=True, timeout_s=30.0, max_fetch_bytes=self.settings.internet.max_fetch_bytes)
         t0 = time.time()
         try:
-            if prov in ("openai", "openrouter", "huggingface"):
+            if prov in ("openai", "openrouter", "huggingface", "custom"):
                 base_map = {
                     "openai": self.settings.providers.openai_base_url,
                     "openrouter": self.settings.providers.openrouter_base_url,
                     "huggingface": self.settings.providers.huggingface_base_url,
+                    "custom": self.settings.providers.custom_base_url,
                 }
                 url = base_map[prov].rstrip("/") + "/chat/completions"
                 host = (urlsplit(url).hostname or "").lower()
@@ -329,13 +362,15 @@ class Brain:
 
     async def stream_events(self, messages: list[dict], tools: list[dict] | None = None, *, _allow_think_fallback: bool = True) -> AsyncIterator[dict]:
         """Stream `/api/chat` (or gated cloud provider) yielding {"type": "token", "text"} and {"type": "tool_calls", "calls"}."""
-        if self.provider in ("openai", "anthropic", "openrouter", "gemini", "huggingface"):
+        if self.provider in ("openai", "anthropic", "openrouter", "gemini", "huggingface", "custom"):
             async for ev in self._cloud_complete(self.provider, messages):
                 yield ev
             return
-        flt, t0, first = ThinkFilter(), time.time(), None
+        flt = ThinkFilter(defer_unopened=bool(self.spec.thinking and _allow_think_fallback))
+        t0, first = time.time(), None
         collected_calls: list[dict] = []
         saw_visible = False
+        saw_separate_thinking = False
         body = self._body(messages, True, tools=tools)
         if not _allow_think_fallback:
             body["think"] = False
@@ -357,6 +392,13 @@ class Brain:
                             raise ToolsUnsupportedError(c["error"])
                         raise BrainError(c["error"])
                     msg = c.get("message") or {}
+                    if msg.get("thinking"):
+                        saw_separate_thinking = True
+                        released = flt.note_separate_thinking()
+                        if released:
+                            saw_visible = True
+                            first = first or time.time() - t0
+                            yield {"type": "token", "text": released}
                     if msg.get("tool_calls"):
                         for tc in msg["tool_calls"]:
                             fn = tc.get("function") or {}
@@ -392,6 +434,11 @@ class Brain:
                         }
         except httpx.HTTPError as e:
             raise BrainError(f"Ollama request failed ({type(e).__name__}). Is Ollama running?") from e
+        if flt.deferred and self.last_stats.get("truncated") and not saw_separate_thinking and _allow_think_fallback:
+            # Thinking model hit max_tokens inside unopened content reasoning; retry once cleanly without thinking
+            async for ev in self.stream_events(messages, tools=tools, _allow_think_fallback=False):
+                yield ev
+            return
         tail = flt.flush()
         if tail:
             saw_visible = True

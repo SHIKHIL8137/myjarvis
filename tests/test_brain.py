@@ -114,3 +114,43 @@ def test_stream_events_parses_tool_calls_and_handles_unsupported(settings):
 async def collect_bad(b):
     async for _ in b.stream_events([{"role": "user", "content": "hi"}], tools=[{"type": "function", "function": {"name": "web_search"}}]):
         pass
+
+
+def test_unpaired_closing_think_and_truncated_fallback_never_leak(settings):
+    """If a thinking model omits opening <think> and emits </think> (or truncates mid-thought), never expose reasoning."""
+    # Case 1: Unpaired </think> split across chunks in local_thinking stream
+    def h_unpaired(req):
+        body = json.loads(req.content)
+        assert body["think"] is True
+        return httpx.Response(200, content=ndjson(
+            {"message": {"content": "Okay, the user wants me to say hello cleanly. "}},
+            {"message": {"content": "I will answer briefly.</th"}},
+            {"message": {"content": "ink>\nHello, sir."}},
+            {"done": True, "eval_count": 12, "eval_duration": 1_000_000_000, "done_reason": "stop"},
+        ))
+
+    b = make(settings, h_unpaired)
+    b.current = "local_thinking"
+    out = run(b.complete([{"role": "user", "content": "Say hello"}]))
+    assert out == "Hello, sir." and "user wants" not in out
+
+    # Case 2: Hit token limit inside unopened reasoning -> automatically retries once with think=False
+    calls = []
+
+    def h_trunc(req):
+        body = json.loads(req.content)
+        calls.append(body["think"])
+        if body["think"]:
+            return httpx.Response(200, content=ndjson(
+                {"message": {"content": "Very long unopened reasoning without closing tag..."}},
+                {"done": True, "eval_count": 512, "eval_duration": 1_000_000_000, "done_reason": "length"},
+            ))
+        return httpx.Response(200, content=ndjson(
+            {"message": {"content": "Good day, sir."}},
+            {"done": True, "eval_count": 4, "eval_duration": 1_000_000_000, "done_reason": "stop"},
+        ))
+
+    b2 = make(settings, h_trunc)
+    b2.current = "local_thinking"
+    out2 = run(b2.complete([{"role": "user", "content": "Say hello"}]))
+    assert calls == [True, False] and out2 == "Good day, sir."

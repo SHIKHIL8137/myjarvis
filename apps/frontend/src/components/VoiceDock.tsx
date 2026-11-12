@@ -1,7 +1,14 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { apiFetch, streamChat } from "../api/client";
 import { graph } from "../graphStore";
-import { onEvent, type LiveEvent } from "../live";
+import type {
+  AssistantTaskItem,
+  ChatFeedItem,
+  FsPermissionRequest,
+  OwnerApprovalRequest,
+} from "../features/AssistantHome";
+import type { LiveEvent } from "../live";
+import { onEvent } from "../live";
 import type { ShellProps } from "../shell";
 import { Markdown } from "./Markdown";
 
@@ -21,12 +28,22 @@ interface ReplyCard {
   stats?: string;
 }
 
+export interface UiDirective {
+  open_drawer?: string | null;
+  focus?: string;
+  open?: string;
+}
+
 interface VoiceDockProps extends ShellProps {
   assistantState: string;
   stateDetail: string;
-  voiceLoopState: { state: string; mic: boolean; mode?: string };
+  voiceLoopState: { state: string; mic: boolean; mode?: string; error?: string | null };
   audioLevel: number;
+  inAssistantView?: boolean;
+  onFeedChange?: React.Dispatch<React.SetStateAction<ChatFeedItem[]>>;
   onAudioLevel?: (level: number) => void;
+  onBrowserRecChange?: (active: boolean) => void;
+  onUiAction?: (ui: UiDirective | null | undefined) => void;
   onHighlightNodes?: (ids: string[]) => void;
 }
 
@@ -78,7 +95,11 @@ export const VoiceDock: React.FC<VoiceDockProps> = ({
   stateDetail,
   voiceLoopState,
   audioLevel,
+  inAssistantView = true,
+  onFeedChange,
   onAudioLevel,
+  onBrowserRecChange,
+  onUiAction,
 }) => {
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
@@ -92,6 +113,7 @@ export const VoiceDock: React.FC<VoiceDockProps> = ({
   const abort = useRef<AbortController | null>(null);
   const pendingTokens = useRef("");
   const rafRef = useRef(0);
+  const activeFeedMsgId = useRef<string | null>(null);
   const waveCanvas = useRef<HTMLCanvasElement | null>(null);
   const waveHistory = useRef<number[]>(new Array(44).fill(0));
   const voiceTurn = useRef(false);
@@ -104,6 +126,10 @@ export const VoiceDock: React.FC<VoiceDockProps> = ({
     pendingTokens.current = "";
     if (chunk) {
       setCard((c) => (c ? { ...c, answer: c.answer + chunk } : c));
+      const fid = activeFeedMsgId.current;
+      if (fid && onFeedChange) {
+        onFeedChange((prev) => prev.map((m) => (m.id === fid ? { ...m, text: m.text + chunk } : m)));
+      }
     }
   };
 
@@ -115,6 +141,12 @@ export const VoiceDock: React.FC<VoiceDockProps> = ({
     }
     cancelAnimationFrame(rafRef.current);
     flushTokens();
+    const fid = activeFeedMsgId.current;
+    const updateActiveFeed = (fn: (m: ChatFeedItem) => ChatFeedItem) => {
+      if (fid && onFeedChange) {
+        onFeedChange((prev) => prev.map((m) => (m.id === fid ? fn(m) : m)));
+      }
+    };
     if (ev.type === "meta") {
       if (ev.decision) {
         const d = ev.decision;
@@ -131,15 +163,31 @@ export const VoiceDock: React.FC<VoiceDockProps> = ({
             }
           : c
       );
+      updateActiveFeed((m) => ({
+        ...m,
+        decision: ev.decision as ChatFeedItem["decision"],
+        sources: (ev.sources as string[]) || [],
+        memories: ev.memory_ids?.length || 0,
+        permissionRequest: (ev.permission_request as FsPermissionRequest) || m.permissionRequest,
+        approvalRequest: (ev.approval as OwnerApprovalRequest) || m.approvalRequest,
+        task: (ev.task as AssistantTaskItem) || m.task,
+      }));
     } else if (ev.type === "tool") {
-      setCard((c) => (c ? { ...c, tools: [...c.tools, `${ev.name}${ev.query ? `: ${ev.query}` : ""}`] } : c));
+      const tline = `${ev.name}${ev.query ? `: ${ev.query}` : ""}`;
+      setCard((c) => (c ? { ...c, tools: [...c.tools, tline] } : c));
+      updateActiveFeed((m) => ({ ...m, tools: [...(m.tools || []), tline] }));
     } else if (ev.type === "reset_answer") {
       setCard((c) => (c ? { ...c, answer: "" } : c));
+      updateActiveFeed((m) => ({ ...m, text: "" }));
     } else if (ev.type === "interrupted") {
       setCard((c) => (c ? { ...c, streaming: false, stopped: true } : c));
+      updateActiveFeed((m) => ({ ...m, streaming: false, stopped: true }));
     } else if (ev.type === "error") {
       setCard((c) => (c ? { ...c, error: ev.message, streaming: false } : c));
+      updateActiveFeed((m) => ({ ...m, error: String(ev.message), streaming: false }));
     } else if (ev.type === "done") {
+      if (ev.ui) onUiAction?.(ev.ui as UiDirective);
+      const statsStr = [ev.command ? `command: ${ev.command}` : ev.model, `${ev.seconds}s`, ev.tps ? `${ev.tps} tok/s` : ""].filter(Boolean).join(" · ");
       setCard((c) =>
         c
           ? {
@@ -147,25 +195,55 @@ export const VoiceDock: React.FC<VoiceDockProps> = ({
               answer: ev.answer || c.answer,
               streaming: false,
               web: (ev.web_sources || []).filter((s: { url?: string }) => typeof s.url === "string" && s.url.startsWith("https://")),
-              stats: [ev.command ? `command: ${ev.command}` : ev.model, `${ev.seconds}s`, ev.tps ? `${ev.tps} tok/s` : ""].filter(Boolean).join(" · "),
+              stats: statsStr,
             }
           : c
       );
+      updateActiveFeed((m) => ({
+        ...m,
+        text: String(ev.answer || m.text),
+        streaming: false,
+        command: (ev.command as string) || m.command,
+        paths: Array.isArray(ev.paths) ? (ev.paths as string[]) : m.paths,
+        web: ((ev.web_sources as Array<{ title?: string; url: string }>) || []).filter(
+          (s) => typeof s.url === "string" && s.url.startsWith("https://")
+        ),
+        permissionRequest: (ev.permission_request as FsPermissionRequest) || m.permissionRequest,
+        approvalRequest: (ev.approval as OwnerApprovalRequest) || m.approvalRequest,
+        task: (ev.task as AssistantTaskItem) || m.task,
+        stats: statsStr,
+      }));
     }
-  }, []);
+  }, [onFeedChange, onUiAction]);
 
   useEffect(() => {
     return onEvent((ev) => {
       if (ev.type === "decision" && ev.intent) {
         setDecisionBadge(`${ev.department || "assistant"} · ${ev.intent} · ${ev.workflow || "direct"}`);
-      } else if (ev.type === "transcript" || ev.type === "transcript_record" || ev.type === "transcript_final") {
-        const txt = String(ev.text || ev.corrected_transcript || "").trim();
+      } else if (ev.type === "transcript_partial" || ev.event_type === "assistant.transcript.partial") {
+        const txt = String(ev.text || ev.payload?.text || "").trim();
+        if (txt) setLiveTranscript(`${txt} …`);
+      } else if (
+        ev.type === "transcript" ||
+        ev.type === "transcript_record" ||
+        ev.type === "transcript_final" ||
+        ev.event_type === "assistant.transcript.final"
+      ) {
+        const txt = String(ev.text || ev.payload?.text || ev.corrected_transcript || "").trim();
         if (txt) setLiveTranscript(txt);
       } else if (ev.type === "user" && ev.text) {
         voiceTurn.current = true;
         setLiveTranscript(ev.text);
+        const turnId = ++replySeq;
+        const asstMsgId = `voice-a-${turnId}`;
+        activeFeedMsgId.current = asstMsgId;
+        onFeedChange?.((prev) => [
+          ...prev,
+          { id: `voice-u-${turnId}`, role: "user", text: String(ev.text) },
+          { id: asstMsgId, role: "assistant", text: "", streaming: true, tools: [] },
+        ]);
         setCard({
-          id: ++replySeq,
+          id: turnId,
           user: ev.text,
           answer: "",
           streaming: true,
@@ -175,7 +253,7 @@ export const VoiceDock: React.FC<VoiceDockProps> = ({
           knowledge: [],
           web: [],
         });
-        setCardOpen(true);
+        setCardOpen(!inAssistantView);
       } else if (voiceTurn.current && ["meta", "tool", "reset_answer", "token", "done", "error", "interrupted"].includes(ev.type)) {
         handleTurnEvent(ev);
         if (["done", "error", "interrupted"].includes(ev.type)) voiceTurn.current = false;
@@ -224,8 +302,16 @@ export const VoiceDock: React.FC<VoiceDockProps> = ({
     setInput("");
     setBusy(true);
     setLiveTranscript(q);
+    const turnId = ++replySeq;
+    const asstId = `chat-a-${turnId}`;
+    activeFeedMsgId.current = asstId;
+    onFeedChange?.((prev) => [
+      ...prev,
+      { id: `chat-u-${turnId}`, role: "user", text: q },
+      { id: asstId, role: "assistant", text: "", streaming: true, tools: [] },
+    ]);
     setCard({
-      id: ++replySeq,
+      id: turnId,
       user: q,
       answer: "",
       streaming: true,
@@ -235,7 +321,7 @@ export const VoiceDock: React.FC<VoiceDockProps> = ({
       knowledge: [],
       web: [],
     });
-    setCardOpen(true);
+    setCardOpen(!inAssistantView);
     abort.current = new AbortController();
     try {
       await streamChat(q, speak, handleTurnEvent, abort.current.signal);
@@ -246,13 +332,28 @@ export const VoiceDock: React.FC<VoiceDockProps> = ({
       abort.current = null;
       setBusy(false);
       setCard((c) => (c && c.streaming ? { ...c, streaming: false, stopped: true } : c));
+      onFeedChange?.((prev) => prev.map((m) => (m.id === asstId && m.streaming ? { ...m, streaming: false } : m)));
     }
   };
 
   const stopAll = async () => {
     abort.current?.abort();
+    setBusy(false);
     await apiFetch("/voice/interrupt", { method: "POST" }).catch(() => {});
     await apiFetch("/speak/stop", { method: "POST" }).catch(() => {});
+  };
+
+  const recoverMic = async () => {
+    try {
+      const r = await apiFetch<{ error?: string; state?: string }>("/voice/session", {
+        method: "POST",
+        body: { action: "recover" },
+      });
+      if (r.error) onNotify(r.error);
+      else onNotify(`Microphone recovered (${r.state || "ready"})`);
+    } catch (e) {
+      onNotify((e as Error).message);
+    }
   };
 
   const toggleHostMic = async () => {
@@ -272,6 +373,7 @@ export const VoiceDock: React.FC<VoiceDockProps> = ({
       const rec = webMicRef.current;
       webMicRef.current = null;
       setBrowserRec(false);
+      onBrowserRecChange?.(false);
       onAudioLevel?.(0);
       rec.stream.getTracks().forEach((t) => t.stop());
       await rec.ctx.close().catch(() => {});
@@ -297,8 +399,27 @@ export const VoiceDock: React.FC<VoiceDockProps> = ({
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
         if (data.prompt) setLiveTranscript(data.prompt);
+        if (data.ui) onUiAction?.(data.ui as UiDirective);
+        const turnId = ++replySeq;
+        const statsStr = [data.command ? `command: ${data.command}` : "", data.seconds ? `${data.seconds}s` : ""].filter(Boolean).join(" · ") || undefined;
+        onFeedChange?.((prev) => [
+          ...prev,
+          { id: `bmic-u-${turnId}`, role: "user", text: data.prompt || "(voice utterance)" },
+          {
+            id: `bmic-a-${turnId}`,
+            role: "assistant",
+            text: data.answer || "(no spoken reply)",
+            command: data.command,
+            paths: data.paths || [],
+            decision: data.decision,
+            permissionRequest: data.permission_request,
+            approvalRequest: data.approval,
+            task: data.task,
+            stats: statsStr,
+          },
+        ]);
         setCard({
-          id: ++replySeq,
+          id: turnId,
           user: data.prompt || "(voice utterance)",
           answer: data.answer || "(no spoken reply)",
           streaming: false,
@@ -308,9 +429,9 @@ export const VoiceDock: React.FC<VoiceDockProps> = ({
           knowledge: (data.knowledge_sources || []).map((k: { title: string }) => k.title),
           web: data.web_sources || [],
           decision: data.decision,
-          stats: data.seconds ? `${data.seconds}s` : undefined,
+          stats: statsStr,
         });
-        setCardOpen(true);
+        setCardOpen(!inAssistantView);
       } catch (e) {
         onNotify((e as Error).message);
       } finally {
@@ -336,10 +457,24 @@ export const VoiceDock: React.FC<VoiceDockProps> = ({
         for (let i = 0; i < inp.length; i++) sum += inp[i] * inp[i];
         onAudioLevel?.(Math.min(1, Math.sqrt(sum / inp.length) * 4.5));
       };
+      const [track] = stream.getAudioTracks();
+      if (track) {
+        track.onended = () => {
+          if (webMicRef.current?.stream === stream) {
+            webMicRef.current = null;
+            setBrowserRec(false);
+            onBrowserRecChange?.(false);
+            onAudioLevel?.(0);
+            ctx.close().catch(() => {});
+            onNotify("Microphone disconnected.");
+          }
+        };
+      }
       src.connect(proc);
       proc.connect(ctx.destination);
       webMicRef.current = { stream, ctx, chunks, rate: ctx.sampleRate };
       setBrowserRec(true);
+      onBrowserRecChange?.(true);
     } catch (e) {
       onNotify(`Mic access denied: ${(e as Error).message}`);
     }
@@ -353,7 +488,7 @@ export const VoiceDock: React.FC<VoiceDockProps> = ({
 
   return (
     <div className="voice-dock-wrap">
-      {card && cardOpen && (
+      {card && cardOpen && !inAssistantView && (
         <section className="dock-response card" aria-label="Latest Jarvis response">
           <div className="row between">
             <div className="row wrap">
@@ -362,7 +497,7 @@ export const VoiceDock: React.FC<VoiceDockProps> = ({
               {card.streaming && <span className="status info"><i className="dot" /> {assistantState}</span>}
             </div>
             <div className="row">
-              <button className="ghost" onClick={() => onNavigate?.("chat")}>Full Thread</button>
+              <button className="ghost" onClick={() => onNavigate?.("assistant")}>Open Assistant</button>
               <button className="ghost icon" aria-label="Collapse response card" onClick={() => setCardOpen(false)}>✕</button>
             </div>
           </div>
@@ -436,6 +571,11 @@ export const VoiceDock: React.FC<VoiceDockProps> = ({
           >
             {voiceLoopState.mic ? "Host Mic On" : "Host Mic"}
           </button>
+          {(voiceLoopState.state === "ERROR" || voiceLoopState.error) && (
+            <button type="button" className="warn ghost" onClick={recoverMic} title="Recover failed microphone stream">
+              Recover Mic
+            </button>
+          )}
           <button
             type="button"
             className={browserRec ? "danger" : "ghost"}
@@ -465,7 +605,7 @@ export const VoiceDock: React.FC<VoiceDockProps> = ({
           >
             TTS {speak ? "On" : "Off"}
           </button>
-          {busy || assistantState === "Speaking" ? (
+          {busy || ["Speaking", "Executing", "Thinking", "Planning", "Transcribing"].includes(assistantState) ? (
             <button type="button" className="danger" onClick={stopAll}>Interrupt</button>
           ) : (
             <button type="submit" disabled={!input.trim()}>Send</button>
