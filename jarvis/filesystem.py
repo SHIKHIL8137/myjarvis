@@ -217,8 +217,11 @@ class SafeFilesystem:
         fp.parent.mkdir(parents=True, exist_ok=True)
         tmp = fp.with_suffix(fp.suffix + ".tmp")
         tmp.write_text(content, encoding="utf-8")
+        import hashlib
+
+        written_sha = hashlib.sha256(tmp.read_bytes()).hexdigest()
         os.replace(tmp, fp)
-        return {"path": str(fp), "created": not existed, "bytes": fp.stat().st_size}
+        return {"path": str(fp), "created": not existed, "bytes": fp.stat().st_size, "sha256": written_sha}
 
     def move_file(self, src_raw: str, dst_raw: str) -> dict:
         if not self.spec.allow_write:

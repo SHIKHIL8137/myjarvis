@@ -117,7 +117,8 @@ class DatabaseManager:
     """Lifecycle owner for SQLAlchemy async + sync engines, migrations, and health status."""
 
     def __init__(self, configured_url: str = "", data_dir: Path | None = None, echo: bool = False):
-        self.async_url, self.sync_url = resolve_database_urls(configured_url, data_dir=data_dir)
+        self.data_dir = Path(data_dir) if data_dir else DATA
+        self.async_url, self.sync_url = resolve_database_urls(configured_url, data_dir=self.data_dir)
         self.is_postgres = self.sync_url.startswith("postgresql")
         self.pgvector_available = False
         self.pgvector_version = ""

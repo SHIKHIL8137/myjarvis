@@ -111,9 +111,18 @@ def test_full_deep_research_snapshots_quotes_untrusted_boundary_and_export(tmp_p
     assert res["ok"] is True
     assert res["mode"] == "online"
     assert len(res["plan"]["subqueries"]) <= MAX_SUBQUERIES
-    assert res["verification"]["passed"] is True
-    assert res["verification"]["verified_claim_count"] == 2
-    assert len(res["verification"]["contradictions_found"]) >= 1  # "enabled by default" vs "not supported" overlap or detected divergence checked below
+    # Contradiction between S1 ("enabled by default") and S2 ("disabled by default") must influence overall status and mark claim 1 disputed.
+    assert res["verification"]["passed"] is False
+    assert res["verification"]["overall_status"] == "disputed"
+    assert res["verification"]["disputed_claim_count"] == 1
+    assert res["verification"]["reported_claim_count"] == 1
+    assert res["verification"]["verified_claim_count"] == 0
+    assert len(res["verification"]["contradictions_found"]) >= 1
+    assert res["claims"][0]["quote_verified"] is True
+    assert res["claims"][0]["evidence_contradicts_claim"] is True
+    assert res["claims"][0]["kind"] == "disputed"
+    assert res["claims"][1]["quote_verified"] is True
+    assert res["claims"][1]["evidence_supports_claim"] is True
 
     # Confirm full text > 2500 chars was stored in snapshot under data/tasks/{task_id}/pages/{sha256}.txt
     s1 = res["sources"][0]
@@ -136,6 +145,7 @@ def test_full_deep_research_snapshots_quotes_untrusted_boundary_and_export(tmp_p
     assert md_path.exists()
     md_txt = md_path.read_text(encoding="utf-8")
     assert "Verified Claims" in md_txt
+    assert "Disputed & Contradicted Claims" in md_txt
     assert "Bibliography & Snapshot Hashes" in md_txt
 
 
@@ -154,7 +164,7 @@ def test_verification_rejects_bad_citations_and_quotes_within_bounded_cycles(tmp
         )
     }
     claims = [
-        ResearchClaim(statement="Valid grounded claim", kind="verified_fact", citations=["S1"], quote="42 requests per second"),
+        ResearchClaim(statement="Benchmark result is 42 requests per second", kind="verified_fact", citations=["S1"], quote="42 requests per second"),
         ResearchClaim(statement="Hallucinated source ID", kind="verified_fact", citations=["S99"], quote="anything"),
         ResearchClaim(statement="Wrong quote mismatch", kind="reported_claim", citations=["S1"], quote="9999 requests per second"),
         ResearchClaim(statement="Uncited claim", kind="verified_fact", citations=[]),
@@ -175,7 +185,7 @@ def test_verification_rejects_bad_citations_and_quotes_within_bounded_cycles(tmp
         synthesizer_fn=lambda q, ws, st: {
             "summary": "Mixed claims",
             "claims": [
-                {"statement": "Real", "kind": "verified_fact", "citations": ["S1"], "quote": "42 requests per second"},
+                {"statement": "Benchmark result is 42 requests per second", "kind": "verified_fact", "citations": ["S1"], "quote": "42 requests per second"},
                 {"statement": "Fake quote", "kind": "verified_fact", "citations": ["S1"], "quote": "does not exist in text"},
                 {"statement": "Missing cit", "kind": "verified_fact", "citations": ["S99"], "quote": "nope"},
             ],

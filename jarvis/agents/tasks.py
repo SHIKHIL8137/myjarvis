@@ -1,14 +1,17 @@
 """P10.20 / P10.22 Centralized Assistant Task Lifecycle Service (backed by AssistantTaskRow)."""
 from __future__ import annotations
 
+from pathlib import Path
 import random
 import time
 from typing import Any, Callable, Iterable
 
 from sqlalchemy import and_, or_, select, update
 
+from ..config import DATA
 from ..db.engine import DatabaseManager
 from ..db.models import ApprovalRequestRow, AssistantTaskRow, FilesystemPermissionRequestRow, FilesystemPermissionRow
+from ..security.outcomes import ToolOutcome, ToolStatus, VerificationCheck
 
 TASK_STATUSES: tuple[str, ...] = (
     "queued",
@@ -19,10 +22,12 @@ TASK_STATUSES: tuple[str, ...] = (
     "paused",
     "waiting_quota",
     "completed",
+    "unverified",
+    "started",
     "failed",
     "cancelled",
 )
-TERMINAL_TASK_STATUSES: frozenset[str] = frozenset({"completed", "failed", "cancelled"})
+TERMINAL_TASK_STATUSES: frozenset[str] = frozenset({"completed", "unverified", "started", "failed", "cancelled"})
 ACTIVE_TASK_STATUSES: tuple[str, ...] = (
     "queued",
     "planning",
@@ -61,8 +66,15 @@ SAFE_RESUMABLE_WORKER_KINDS: frozenset[str] = frozenset(
 class AssistantTaskService:
     """Manages persistent end-to-end tasks routed through the central Jarvis assistant."""
 
-    def __init__(self, db: DatabaseManager, event_publisher: Callable[[dict[str, Any]], None] | None = None):
+    def __init__(
+        self,
+        db: DatabaseManager,
+        event_publisher: Callable[[dict[str, Any]], None] | None = None,
+        *,
+        data_dir: Path | None = None,
+    ):
         self.db = db
+        self.data_dir = Path(data_dir) if data_dir is not None else Path(getattr(db, "data_dir", DATA))
         self._publish = event_publisher
 
     def set_publisher(self, publisher: Callable[[dict[str, Any]], None] | None) -> None:
@@ -283,12 +295,20 @@ class AssistantTaskService:
             return [self._to_dict(r) for r in rows]
 
     async def cancel_task(self, task_id: str, *, reason: str = "Cancelled by owner") -> dict[str, Any] | None:
+        cancelled_out = ToolOutcome(
+            tool_name="assistant_task",
+            status=ToolStatus.CANCELLED.value,
+            summary=reason or "Cancelled by owner",
+            checks=[],
+            error=reason or "Cancelled by owner",
+        ).to_dict()
         return await self.update_task(
             task_id,
             status="cancelled",
             current_step=reason,
             error_info=reason,
             clear_claim=True,
+            meta_patch={"outcome": cancelled_out, "outcome_status": ToolStatus.CANCELLED.value, "verified": False},
         )
 
     async def claim_next_task(
@@ -407,13 +427,25 @@ class AssistantTaskService:
             attempts = int(row.attempts or 0)
             max_att = max(1, int(row.max_attempts or 3))
             if attempts >= max_att:
+                err_msg = f"Retry budget exhausted ({attempts}/{max_att}): {error_info}"
                 row.status = "failed"
-                row.error_info = f"Retry budget exhausted ({attempts}/{max_att}): {error_info}"
+                row.error_info = err_msg
                 row.current_step = "Failed after retries"
                 row.claimed_by = None
                 row.claimed_at = None
                 row.completed_at = now
                 row.updated_at = now
+                meta = dict(row.meta or {})
+                failed_out = ToolOutcome(
+                    tool_name=str(row.worker_kind or "assistant"),
+                    status=ToolStatus.FAILED.value,
+                    summary="Failed after retries",
+                    target=row.task_id,
+                    checks=[VerificationCheck("handler_execution", False, str(error_info)[:160]).to_dict()],
+                    error=err_msg,
+                ).to_dict()
+                meta.update({"outcome": failed_out, "outcome_status": ToolStatus.FAILED.value, "verified": False})
+                row.meta = meta
             else:
                 raw_delay = min(backoff_max_s, backoff_base_s * (2 ** max(0, attempts - 1)))
                 rand_jit = jitter_fn(0.0, raw_delay * 0.25) if jitter_fn else random.uniform(0.0, raw_delay * 0.25)  # noqa: S311
@@ -489,10 +521,69 @@ class AssistantTaskService:
         self._emit(data)
         return data
 
+    async def preserve_on_shutdown(
+        self,
+        task_id: str,
+        *,
+        reason: str = "Interrupted by application shutdown; checkpoint preserved",
+    ) -> dict[str, Any] | None:
+        """Preserve in-flight task progress and release worker claim on shutdown without cancelling."""
+        now = time.time()
+        async with self.db.async_session() as s:
+            row = await s.get(AssistantTaskRow, task_id)
+            if row is None:
+                return None
+            if row.status in TERMINAL_TASK_STATUSES:
+                row.claimed_by = None
+                row.claimed_at = None
+                row.updated_at = now
+            else:
+                # Keep recoverable or gated status; never mark owner-cancelled or discard checkpoints.
+                if row.status not in ("awaiting_permission", "awaiting_approval", "paused", "waiting_quota", "queued"):
+                    row.status = "running"
+                    row.current_step = str(reason or "Interrupted by shutdown")[:200]
+                row.claimed_by = None
+                row.claimed_at = None
+                meta = dict(row.meta or {})
+                meta["shutdown_interrupted"] = True
+                meta["shutdown_ts"] = round(now, 3)
+                row.meta = meta
+                row.updated_at = now
+            await s.commit()
+            await s.refresh(row)
+        data = self._to_dict(row)
+        self._emit(data)
+        return data
+
+    async def release_worker_claims_on_shutdown(self, worker_id: str) -> list[str]:
+        """Ensure any non-terminal tasks still held by `worker_id` release claims cleanly during shutdown."""
+        async with self.db.async_session() as s:
+            rows = (
+                await s.execute(
+                    select(AssistantTaskRow).where(
+                        AssistantTaskRow.claimed_by == worker_id[:64],
+                    )
+                )
+            ).scalars().all()
+            task_ids = [r.task_id for r in rows]
+        touched: list[str] = []
+        for tid in task_ids:
+            if await self.preserve_on_shutdown(tid) is not None:
+                touched.append(tid)
+        return touched
+
     async def recover_interrupted_on_boot(self) -> dict[str, list[str]]:
         """Classify active interrupted tasks safely on startup without auto-resuming unsafe/unapproved actions."""
+        from .research import verify_checkpoint_snapshots
+
         now = time.time()
-        report: dict[str, list[str]] = {"requeued": [], "paused_unsafe": [], "halted_approval": [], "expired": []}
+        report: dict[str, list[str]] = {
+            "requeued": [],
+            "paused_unsafe": [],
+            "halted_approval": [],
+            "expired": [],
+            "snapshot_integrity_warnings": [],
+        }
         async with self.db.async_session() as s:
             rows = (
                 await s.execute(select(AssistantTaskRow).where(AssistantTaskRow.status.in_(ACTIVE_TASK_STATUSES)))
@@ -511,28 +602,66 @@ class AssistantTaskService:
                     report["expired"].append(row.task_id)
                     continue
 
-                # 2) Never auto-resume permission/approval gated or expired approval tasks.
-                if row.status in ("awaiting_permission", "awaiting_approval", "paused"):
-                    meta = dict(row.meta or {})
-                    # Check associated FS permission requests or approval requests for expiry
-                    fs_reqs = (
-                        await s.execute(
-                            select(FilesystemPermissionRequestRow).where(FilesystemPermissionRequestRow.task_id == row.task_id)
-                        )
-                    ).scalars().all()
-                    expired_grant = any(r.status == "expired" or (r.expires_at and r.expires_at <= now) for r in fs_reqs)
-                    fs_perms = (
-                        await s.execute(
-                            select(FilesystemPermissionRow).where(FilesystemPermissionRow.task_id == row.task_id)
-                        )
-                    ).scalars().all()
-                    if any(p.status in ("expired", "revoked") or (p.expires_at and p.expires_at <= now) for p in fs_perms):
-                        expired_grant = True
-                    app_tok = meta.get("approval_token")
-                    if app_tok:
-                        ap_row = await s.get(ApprovalRequestRow, str(app_tok))
-                        if ap_row and (ap_row.status in ("expired", "rejected", "cancelled") or (ap_row.expires_at and ap_row.expires_at <= now)):
+                # Check associated FS permission requests, active grants, and approval tokens across active tasks.
+                meta = dict(row.meta or {})
+                fs_reqs = (
+                    await s.execute(
+                        select(FilesystemPermissionRequestRow).where(FilesystemPermissionRequestRow.task_id == row.task_id)
+                    )
+                ).scalars().all()
+                expired_grant = any(r.status == "expired" or (r.expires_at and r.expires_at <= now) for r in fs_reqs)
+                pending_perm_req = any(r.status == "pending" for r in fs_reqs)
+                fs_perms = (
+                    await s.execute(
+                        select(FilesystemPermissionRow).where(FilesystemPermissionRow.task_id == row.task_id)
+                    )
+                ).scalars().all()
+                if any(p.status in ("expired", "revoked") or (p.expires_at and p.expires_at <= now) for p in fs_perms):
+                    expired_grant = True
+                app_tok = meta.get("approval_token")
+                pending_approval = False
+                if app_tok:
+                    ap_row = await s.get(ApprovalRequestRow, str(app_tok))
+                    if ap_row:
+                        if ap_row.status in ("expired", "rejected", "cancelled") or (ap_row.expires_at and ap_row.expires_at <= now):
                             expired_grant = True
+                        elif ap_row.status == "pending":
+                            pending_approval = True
+
+                # Reverify persisted research snapshots against stored SHA-256 on startup recovery.
+                cp = dict(row.checkpoint_json or {})
+                if cp.get("snapshots"):
+                    valid_snaps, rejected_snaps, int_warnings = verify_checkpoint_snapshots(
+                        row.task_id,
+                        cp,
+                        data_dir=self.data_dir,
+                    )
+                    if int_warnings:
+                        cp_warnings = list(cp.get("integrity_warnings") or [])
+                        for w in int_warnings:
+                            if w not in cp_warnings:
+                                cp_warnings.append(w)
+                        cp["integrity_warnings"] = cp_warnings
+                        cp["rejected_snapshots"] = rejected_snaps
+                        row.checkpoint_json = cp
+                        meta["snapshot_integrity"] = {
+                            "valid_count": len(valid_snaps),
+                            "rejected": rejected_snaps,
+                            "warnings": int_warnings,
+                        }
+                        meta["integrity_warnings"] = list(dict.fromkeys([*(meta.get("integrity_warnings") or []), *int_warnings]))
+                        row.meta = meta
+                        report["snapshot_integrity_warnings"].append(row.task_id)
+
+                # 2) Never auto-resume permission/approval gated or expired approval tasks.
+                if (
+                    row.status in ("awaiting_permission", "awaiting_approval", "paused")
+                    or expired_grant
+                    or pending_perm_req
+                    or pending_approval
+                ):
+                    if row.status in ("queued", "waiting_quota", "running", "planning"):
+                        row.status = "awaiting_approval" if (pending_approval or app_tok) else "awaiting_permission"
                     if expired_grant:
                         meta["approval_expired"] = True
                         row.meta = meta
@@ -546,16 +675,23 @@ class AssistantTaskService:
                     report["halted_approval"].append(row.task_id)
                     continue
 
-                # 3) Running/planning tasks interrupted mid-flight: inspect safety strictly.
+                # 3) Release any stale worker claim on waiting_quota tasks cleanly.
+                if row.status == "waiting_quota":
+                    row.claimed_by = None
+                    row.claimed_at = None
+                    row.updated_at = now
+                    continue
+
+                # 4) Running/planning (or shutdown-preserved) tasks: inspect safety strictly before re-queueing.
                 if row.status in ("running", "planning"):
-                    meta = dict(row.meta or {})
                     unsafe = (
                         row.intent in UNSAFE_AUTO_RESUME_INTENTS
                         or bool(meta.get("requires_explicit_approval"))
                         or bool(row.permissions_requested)
                         or (row.worker_kind not in SAFE_RESUMABLE_WORKER_KINDS and not meta.get("safe_resumable"))
                     )
-                    if unsafe or (int(row.attempts or 0) >= int(row.max_attempts or 3)):
+                    exhausted = int(row.attempts or 0) >= int(row.max_attempts or 3) and not meta.get("shutdown_interrupted")
+                    if unsafe or exhausted:
                         row.status = "paused" if unsafe else "failed"
                         if unsafe:
                             row.current_step = "Interrupted on shutdown — manual confirmation required before resuming"
@@ -576,9 +712,15 @@ class AssistantTaskService:
                         row.claimed_at = None
                         row.current_step = "Recovered after restart — queued to resume from last checkpoint"
                         meta["recovered_from_boot"] = True
+                        meta.pop("shutdown_interrupted", None)
                         row.meta = meta
                         row.updated_at = now
                         report["requeued"].append(row.task_id)
+                elif row.status == "queued":
+                    # Even a previously queued task must not retain stale claims or run if unsafe with approvals requested.
+                    row.claimed_by = None
+                    row.claimed_at = None
+                    row.updated_at = now
 
             await s.commit()
         return report

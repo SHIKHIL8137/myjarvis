@@ -258,8 +258,8 @@ class Assistant:
         self.speaker.stop()
         try:
             await self.orchestrator.task_runner.stop()
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("Background task runner shutdown error ignored cleanly: %s", exc)
         for t in self._bg:
             t.cancel()
         await self.brain.client.aclose()
@@ -1627,13 +1627,22 @@ class Assistant:
             dur_ms = (time.perf_counter() - t_start) * 1000.0
             graph_live.tool_used(self, "deep_research", query=text[:80], ok=bool(res.get("ok")), duration_ms=dur_ms)
             if task_id:
+                art_out = res.get("outcome")
+                export_ok = bool(res.get("export_ok", True))
                 await self.orchestrator.tasks.update_task(
                     task_id,
                     status="completed",
                     append_tool="deep_research",
                     generated_files=res.get("generated_files") or [],
                     result=res.get("markdown") or res.get("summary") or "",
-                    current_step="Verified deep research report ready",
+                    error_info=(f"Artifact generation failed: {res.get('export_error')}" if not export_ok else None),
+                    current_step=("Verified deep research ready [artifact export failed]" if not export_ok else "Verified deep research report ready"),
+                    meta_patch={
+                        "artifact_outcome": art_out,
+                        "artifact_status": (art_out or {}).get("status") if isinstance(art_out, dict) else None,
+                        "partial_failure": not export_ok,
+                        "research_verification": res.get("verification"),
+                    },
                 )
             return {
                 "command": "deep_research",
@@ -1642,6 +1651,8 @@ class Assistant:
                 "sources": res.get("sources") or [],
                 "verification": res.get("verification"),
                 "outcome": res.get("outcome"),
+                "export_ok": bool(res.get("export_ok", True)),
+                "export_error": str(res.get("export_error") or ""),
                 "ok": bool(res.get("ok")),
             }
 
@@ -1865,12 +1876,25 @@ class Assistant:
                     if cmd_name not in ("permission_required", "approval_required") and not (
                         cmd_name == "dev_autonomous" and planned.get("approval_token")
                     ):
+                        planned_outcome = planned.get("outcome") if isinstance(planned.get("outcome"), dict) else None
+                        planned_out_status = str((planned_outcome or {}).get("status") or "")
+                        if cmd_name == "filesystem_blocked" or (not planned.get("ok", True) and cmd_name in ("document_export", "dev_autonomous")):
+                            eff_status = "failed"
+                        elif cmd_name != "deep_research" and planned_out_status in ("failed", "unverified", "started", "cancelled"):
+                            eff_status = planned_out_status
+                        else:
+                            eff_status = "completed"
+                        err_detail = None
+                        if cmd_name == "deep_research" and planned.get("export_ok") is False:
+                            err_detail = f"Artifact generation failed: {planned.get('export_error')}"
                         await self.orchestrator.tasks.update_task(
                             current_task_id,
-                            status="completed" if planned.get("ok", True) else ("failed" if cmd_name == "filesystem_blocked" else "completed"),
+                            status=eff_status,
                             result=reply,
                             generated_files=planned.get("paths") or [],
-                            current_step=f"Finished {cmd_name}",
+                            error_info=err_detail,
+                            current_step=f"Finished {cmd_name}" if eff_status == "completed" else f"{cmd_name}: {eff_status}",
+                            meta_patch=({"outcome": planned_outcome, "outcome_status": planned_out_status} if planned_outcome and cmd_name != "deep_research" else None),
                         )
                         await self.orchestrator.fs_access.consume_task_once_permissions(current_task_id)
                     elif planned.get("approval_token"):

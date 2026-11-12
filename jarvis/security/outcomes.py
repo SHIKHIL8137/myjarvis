@@ -199,11 +199,30 @@ def verify_file_modified(
     tool_name: str = "file_modify",
     previous_sha256: str | None = None,
     expected_substring: str | None = None,
+    expected_after_sha256: str | None = None,
+    root: str | Path | None = None,
+    noop_status: str = ToolStatus.FAILED.value,
 ) -> ToolOutcome:
-    """Verify an existing file was modified rather than left untouched."""
+    """Verify an existing file genuinely changed on disk with no concurrent replacement."""
     p = Path(path)
     checks: list[dict[str, Any]] = []
-    evidence: dict[str, Any] = {"path": str(p)}
+    evidence: dict[str, Any] = {"path": str(p), "previous_sha256": previous_sha256}
+
+    if root is not None:
+        try:
+            p.resolve().relative_to(Path(root).resolve())
+            checks.append(VerificationCheck("within_root", True, str(root)).to_dict())
+        except Exception:
+            checks.append(VerificationCheck("within_root", False, f"{p} is outside {root}").to_dict())
+            return ToolOutcome(
+                tool_name=tool_name,
+                status=ToolStatus.FAILED.value,
+                summary=f"Target file escaped allowed root {root}",
+                target=str(p),
+                evidence=evidence,
+                checks=checks,
+                error="path outside allowed root",
+            )
 
     if not (p.exists() and p.is_file()):
         checks.append(VerificationCheck("file_exists", False, str(p)).to_dict())
@@ -222,6 +241,27 @@ def verify_file_modified(
     evidence["sha256"] = digest
     evidence["size_bytes"] = p.stat().st_size
 
+    if expected_after_sha256 is not None:
+        after_ok = digest == expected_after_sha256
+        checks.append(
+            VerificationCheck(
+                "content_matches_expected",
+                after_ok,
+                f"{digest[:12]} == {expected_after_sha256[:12]}",
+            ).to_dict()
+        )
+        if not after_ok:
+            evidence["concurrent_modification"] = True
+            return ToolOutcome(
+                tool_name=tool_name,
+                status=ToolStatus.FAILED.value,
+                summary=f"File {p.name} changed unexpectedly (replaced by another process or content mismatch)",
+                target=str(p),
+                evidence=evidence,
+                checks=checks,
+                error="concurrent modification or content mismatch",
+            )
+
     if expected_substring is not None:
         text = p.read_text(encoding="utf-8", errors="replace")
         has_sub = expected_substring in text
@@ -237,34 +277,48 @@ def verify_file_modified(
                 error="expected content missing",
             )
 
-    if previous_sha256 is not None:
-        changed = digest != previous_sha256
-        checks.append(VerificationCheck("hash_changed", changed, f"{previous_sha256[:10]}->{digest[:10]}").to_dict())
-        if not changed and expected_substring is None:
-            return ToolOutcome(
-                tool_name=tool_name,
-                status=ToolStatus.FAILED.value,
-                summary=f"File content hash did not change for {p.name}",
-                target=str(p),
-                evidence=evidence,
-                checks=checks,
-                error="no content change detected",
-            )
-    elif expected_substring is None:
-        checks.append(VerificationCheck("modification_delta_known", False, "no prior hash or expected content supplied").to_dict())
+    # Original hash is mandatory: an existing substring without a hash delta is never proof of change.
+    if previous_sha256 is None:
+        checks.append(
+            VerificationCheck(
+                "prior_hash_captured",
+                False,
+                "original file hash not provided; existing content cannot prove modification",
+            ).to_dict()
+        )
         return ToolOutcome(
             tool_name=tool_name,
             status=ToolStatus.UNVERIFIED.value,
-            summary=f"File {p.name} exists ({evidence['size_bytes']} bytes), but prior state was not captured to verify diff",
+            summary=f"File {p.name} exists ({evidence['size_bytes']} bytes), but prior hash was not captured to verify modification",
             target=str(p),
             evidence=evidence,
             checks=checks,
         )
 
+    changed = digest != previous_sha256
+    evidence["hash_changed"] = changed
+    checks.append(VerificationCheck("hash_changed", changed, f"{previous_sha256[:10]}->{digest[:10]}").to_dict())
+    if not changed:
+        evidence["noop"] = True
+        eff_noop = (
+            noop_status
+            if noop_status in (ToolStatus.FAILED.value, ToolStatus.UNVERIFIED.value)
+            else ToolStatus.FAILED.value
+        )
+        return ToolOutcome(
+            tool_name=tool_name,
+            status=eff_noop,
+            summary=f"No-op: file content hash unchanged for {p.name}",
+            target=str(p),
+            evidence=evidence,
+            checks=checks,
+            error="no content change detected" if eff_noop == ToolStatus.FAILED.value else "",
+        )
+
     return ToolOutcome(
         tool_name=tool_name,
         status=ToolStatus.DONE.value,
-        summary=f"Verified modification to {p.name} (sha256 {digest[:12]})",
+        summary=f"Verified modification to {p.name} (sha256 {previous_sha256[:8]}->{digest[:8]})",
         target=str(p),
         evidence=evidence,
         checks=checks,
@@ -592,6 +646,108 @@ def verify_process_state(
     )
 
 
+SIDE_EFFECTFUL_INTENTS: frozenset[str] = frozenset(
+    {
+        "filesystem_ops",
+        "shell_exec",
+        "docker_ops",
+        "recovery",
+        "recovery_ops",
+        "document_export",
+        "git_push",
+        "worktree_merge",
+        "dev_autonomous",
+        "email_send",
+        "db_restore",
+        "file_create",
+        "file_modify",
+        "file_delete",
+    }
+)
+
+SIDE_EFFECTFUL_WORKER_KINDS: frozenset[str] = frozenset(
+    {
+        "filesystem",
+        "document_export",
+        "shell",
+        "docker",
+        "workforce",
+        "recovery",
+        "action",
+        "open_app",
+        "open_file",
+    }
+)
+
+
+def coerce_tool_outcome(
+    raw_outcome: ToolOutcome | dict[str, Any],
+    *,
+    default_tool_name: str = "task_handler",
+    fallback_summary: str = "",
+) -> ToolOutcome:
+    """Re-instantiate any outcome payload through ToolOutcome so verified/done invariants hold."""
+    if isinstance(raw_outcome, ToolOutcome):
+        return ToolOutcome(
+            tool_name=raw_outcome.tool_name or default_tool_name,
+            status=raw_outcome.status,
+            summary=raw_outcome.summary or fallback_summary or default_tool_name,
+            verified=False,
+            target=raw_outcome.target,
+            evidence=dict(raw_outcome.evidence),
+            checks=[dict(c) for c in raw_outcome.checks],
+            error=raw_outcome.error,
+            timestamp=raw_outcome.timestamp,
+        )
+    if not isinstance(raw_outcome, dict):
+        return ToolOutcome(
+            tool_name=default_tool_name,
+            status=ToolStatus.UNVERIFIED.value,
+            summary=fallback_summary or f"{default_tool_name} returned non-structured outcome",
+            checks=[VerificationCheck("outcome_structured", False, type(raw_outcome).__name__).to_dict()],
+        )
+    raw_status = str(raw_outcome.get("status") or ToolStatus.UNVERIFIED.value).strip().lower()
+    if raw_status == "completed":
+        raw_status = ToolStatus.DONE.value
+    elif raw_status == "awaiting_permission":
+        raw_status = ToolStatus.AWAITING_APPROVAL.value
+    raw_checks = [dict(c) for c in (raw_outcome.get("checks") or []) if isinstance(c, dict)]
+    return ToolOutcome(
+        tool_name=str(raw_outcome.get("tool_name") or default_tool_name),
+        status=raw_status,
+        summary=str(raw_outcome.get("summary") or fallback_summary or default_tool_name),
+        verified=False,  # Ignored by __post_init__; never trust raw verified=True without passing checks.
+        target=str(raw_outcome.get("target") or ""),
+        evidence=dict(raw_outcome.get("evidence") or {}),
+        checks=raw_checks,
+        error=str(raw_outcome.get("error") or ""),
+    )
+
+
+def parse_task_outcome(
+    raw_outcome: ToolOutcome | dict[str, Any] | None,
+    *,
+    tool_name: str = "task_handler",
+    side_effect_expected: bool = False,
+    fallback_summary: str = "",
+) -> ToolOutcome | None:
+    """Enforce explicit ToolOutcome parsing for task handlers without allowing LLM/raw spoofing."""
+    if raw_outcome is None:
+        if side_effect_expected:
+            return ToolOutcome(
+                tool_name=tool_name,
+                status=ToolStatus.UNVERIFIED.value,
+                summary=fallback_summary or f"Side-effectful handler '{tool_name}' did not provide a ToolOutcome receipt",
+                checks=[VerificationCheck("outcome_present", False, "missing required ToolOutcome").to_dict()],
+            )
+        return None
+    return coerce_tool_outcome(
+        raw_outcome,
+        default_tool_name=tool_name,
+        fallback_summary=fallback_summary,
+    )
+
+
 def normalize_tool_result(
     tool_name: str,
     raw: dict[str, Any],
@@ -600,18 +756,15 @@ def normalize_tool_result(
     checks: list[dict[str, Any]] | None = None,
 ) -> ToolOutcome:
     """Wrap any tool dictionary safely into a ToolOutcome (downgrading unverified ok=True)."""
+    if isinstance(raw.get("outcome"), ToolOutcome):
+        return coerce_tool_outcome(raw["outcome"], default_tool_name=tool_name, fallback_summary=str(raw.get("message") or ""))
     if isinstance(raw.get("outcome"), dict) and raw["outcome"].get("status"):
-        out = raw["outcome"]
-        return ToolOutcome(
-            tool_name=str(out.get("tool_name") or tool_name),
-            status=str(out["status"]),
-            summary=str(out.get("summary") or raw.get("message") or tool_name),
-            verified=bool(out.get("verified", False)),
-            target=str(out.get("target") or target),
-            evidence=dict(out.get("evidence") or {}),
-            checks=list(out.get("checks") or checks or []),
-            error=str(out.get("error") or ""),
-        )
+        merged = dict(raw["outcome"])
+        if not merged.get("checks") and checks:
+            merged["checks"] = list(checks)
+        if not merged.get("target") and target:
+            merged["target"] = target
+        return coerce_tool_outcome(merged, default_tool_name=tool_name, fallback_summary=str(raw.get("message") or ""))
     if raw.get("status") in ("awaiting_permission", "awaiting_approval"):
         return ToolOutcome(
             tool_name=tool_name,

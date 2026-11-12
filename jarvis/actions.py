@@ -292,6 +292,7 @@ class ActionExecutor:
                     tool_name="modify_file",
                     previous_sha256=prev_hash,
                     expected_substring=content_str[:80] if content_str else None,
+                    expected_after_sha256=res.get("sha256"),
                 )
             elif action == "move_file":
                 res = self.fs.move_file(args["src"], args["dst"])

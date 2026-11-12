@@ -49,6 +49,8 @@ export interface AssistantTaskItem {
   result: string;
   generated_files: string[];
   error_info: string;
+  quota_reason?: string;
+  meta?: Record<string, any>;
   created_at: number;
   updated_at: number;
   completed_at?: number | null;
@@ -104,7 +106,16 @@ const READ_OP_SET = new Set(["list_directory", "read_file", "search_files", "rea
 function taskTone(status: string): "ok" | "warn" | "danger" | "info" | "" {
   if (status === "completed") return "ok";
   if (status === "running" || status === "planning" || status === "queued") return "info";
-  if (status === "awaiting_permission" || status === "awaiting_approval" || status === "paused" || status === "waiting_quota") return "warn";
+  if (
+    status === "unverified" ||
+    status === "started" ||
+    status === "awaiting_permission" ||
+    status === "awaiting_approval" ||
+    status === "paused" ||
+    status === "waiting_quota"
+  ) {
+    return "warn";
+  }
   if (status === "failed" || status === "cancelled") return "danger";
   return "";
 }
@@ -584,34 +595,57 @@ export const AssistantHome: React.FC<AssistantHomeProps> = ({
               <p className="dim">No assistant tasks recorded yet.</p>
             ) : (
               <div className="task-cards-list">
-                {tasks.slice(0, 8).map((t) => (
-                  <div key={t.task_id} className="task-mini-card">
-                    <div className="row between wrap">
-                      <span className={`pill ${taskTone(t.status)}`}>{t.status}</span>
-                      <span className="mono dim">{t.intent} · {t.source} · {fmtTime(t.created_at)}</span>
-                      {["queued", "planning", "awaiting_permission", "awaiting_approval", "running", "paused", "waiting_quota"].includes(t.status) && (
-                        <button className="danger" onClick={() => cancelTask(t.task_id)}>Cancel</button>
+                {tasks.slice(0, 8).map((t) => {
+                  const outcome = (t.meta?.outcome || null) as { status?: string; verified?: boolean; summary?: string; error?: string } | null;
+                  const artifactOutcome = (t.meta?.artifact_outcome || null) as { status?: string; summary?: string; error?: string } | null;
+                  const partialFailure = Boolean(t.meta?.partial_failure);
+                  return (
+                    <div key={t.task_id} className="task-mini-card">
+                      <div className="row between wrap">
+                        <div className="row wrap" style={{ gap: 6 }}>
+                          <span className={`pill ${taskTone(t.status)}`}>{t.status}</span>
+                          {outcome?.status && outcome.status !== "done" && outcome.status !== t.status && (
+                            <span className={`pill ${taskTone(outcome.status)}`}>outcome: {outcome.status}</span>
+                          )}
+                          {artifactOutcome?.status && artifactOutcome.status !== "done" && (
+                            <span className={`pill ${partialFailure ? "warn" : taskTone(artifactOutcome.status)}`}>
+                              export: {artifactOutcome.status}
+                            </span>
+                          )}
+                        </div>
+                        <span className="mono dim">{t.intent} · {t.source} · {fmtTime(t.created_at)}</span>
+                        {["queued", "planning", "awaiting_permission", "awaiting_approval", "running", "paused", "waiting_quota"].includes(t.status) && (
+                          <button className="danger" onClick={() => cancelTask(t.task_id)}>Cancel</button>
+                        )}
+                      </div>
+                      <div className="task-req">{t.user_request}</div>
+                      {t.current_step && <div className="dim" style={{ fontSize: 11.5 }}>{t.current_step}</div>}
+                      {outcome?.summary && (outcome.status === "unverified" || outcome.status === "started") && (
+                        <div className="dim" style={{ fontSize: 11 }}>Outcome: {outcome.summary}</div>
                       )}
+                      {artifactOutcome?.summary && artifactOutcome.status !== "done" && (
+                        <div className="err-text" style={{ fontSize: 11, marginTop: 2 }}>
+                          Export issue: {artifactOutcome.error || artifactOutcome.summary}
+                        </div>
+                      )}
+                      {t.quota_reason && (
+                        <div className="dim" style={{ fontSize: 11 }}>Quota: {t.quota_reason}</div>
+                      )}
+                      {t.plan?.length > 0 && (
+                        <ol className="task-plan-steps">
+                          {t.plan.map((st, idx) => <li key={idx}>{st}</li>)}
+                        </ol>
+                      )}
+                      <div className="row wrap" style={{ marginTop: 4 }}>
+                        {t.selected_agents?.map((a) => <span key={a} className="chip static"><b>agent</b> {a}</span>)}
+                        {t.selected_capabilities?.map((c) => <span key={c} className="chip static"><b>skill</b> {c}</span>)}
+                        {t.tools_used?.map((tl) => <span key={tl} className="chip static"><b>tool</b> {tl}</span>)}
+                        {t.generated_files?.map((f) => <span key={f} className="chip"><b>file</b> {f}</span>)}
+                      </div>
+                      {t.error_info && <p className="err-text" style={{ marginTop: 4 }}>{t.error_info}</p>}
                     </div>
-                    <div className="task-req">{t.user_request}</div>
-                    {t.current_step && <div className="dim" style={{ fontSize: 11.5 }}>{t.current_step}</div>}
-                    {(t as { quota_reason?: string }).quota_reason && (
-                      <div className="dim" style={{ fontSize: 11 }}>Quota: {(t as { quota_reason?: string }).quota_reason}</div>
-                    )}
-                    {t.plan?.length > 0 && (
-                      <ol className="task-plan-steps">
-                        {t.plan.map((st, idx) => <li key={idx}>{st}</li>)}
-                      </ol>
-                    )}
-                    <div className="row wrap" style={{ marginTop: 4 }}>
-                      {t.selected_agents?.map((a) => <span key={a} className="chip static"><b>agent</b> {a}</span>)}
-                      {t.selected_capabilities?.map((c) => <span key={c} className="chip static"><b>skill</b> {c}</span>)}
-                      {t.tools_used?.map((tl) => <span key={tl} className="chip static"><b>tool</b> {tl}</span>)}
-                      {t.generated_files?.map((f) => <span key={f} className="chip"><b>file</b> {f}</span>)}
-                    </div>
-                    {t.error_info && <p className="err-text" style={{ marginTop: 4 }}>{t.error_info}</p>}
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             )}
           </div>
