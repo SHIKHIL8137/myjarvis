@@ -11,7 +11,7 @@ from typing import AsyncIterator
 
 from . import audit, commands, graph_live, sysinfo
 from .proactive import ProactiveSuggestionEngine
-from .actions import ActionExecutor
+from .actions import ActionExecutor, ActionPermissionError
 from .aec import EchoReferenceBuffer, NLMSEchoCanceller
 from .agents.multistep import build_multistep_plan, classify_task_category
 from .agents.orchestrator import AgentOrchestrator
@@ -236,6 +236,7 @@ class Assistant:
         self.history = History(self.data_dir / "history.jsonl", settings.history_turns)
         self.conversation_refs: set[str] = set()  # graph ids the current conversation retrieved (live graph links)
         self.used_tools: set[str] = set()  # real capability/web tools invoked during this session
+        self.active_project: dict | None = None  # resolved project root context for follow-up continuity
         self.os_state = "Idle"
 
         online_fn = lambda: bool(self.settings.internet.enabled and audit.is_online_enabled())  # noqa: E731
@@ -1083,12 +1084,13 @@ class Assistant:
         return rollback_active_model(self.registry, target_version_id=target_version_id, audit_log=self.learning_audit)
 
     async def _resolve_fs_target_arg(self, raw_path: str | None) -> str:
-        """Resolve an explicit path, alias, registered project, known user folder, or default approved root."""
+        """Resolve an explicit path, alias, registered project, known user folder, or configured root."""
         raw = str(raw_path or "").strip().strip("\"'")
+        active_root = str((self.active_project or {}).get("root_path") or "") or None
         if raw:
-            resolved_alias = await self.orchestrator.fs_access.resolve_alias(raw)
-            if resolved_alias:
-                return str(resolved_alias["resolved_path"])
+            res = await self.orchestrator.fs_access.resolve_project_target(raw, active_root=active_root)
+            if res.get("matched"):
+                return str(res["resolved_path"])
             low = raw.lower()
             if low in ("documents", "my documents"):
                 return str(Path.home() / "Documents")
@@ -1104,6 +1106,8 @@ class Assistant:
                     return str(roots[0])
             return raw
 
+        if active_root:
+            return active_root
         active_perms = [
             p
             for p in await self.orchestrator.fs_access.list_permissions(status="active")
@@ -1153,7 +1157,16 @@ class Assistant:
             return json.dumps({"error": chk.reason, "blocked": True, "code": chk.code, "path": chk.canonical_path}, ensure_ascii=False)
         if not chk.allowed:
             if turn_ctx is not None and not turn_ctx.get("permission_request"):
-                req_ops = list(READ_OPS) if name in ("fs_get_project_structure", "fs_read_file", "fs_read_document") else [req_op, "list_directory", "read_metadata"]
+                if name == "fs_get_project_structure":
+                    req_ops = list(READ_OPS)
+                elif name in ("fs_read_file", "fs_read_document"):
+                    req_ops = ["read_file", "read_metadata"]
+                elif name == "fs_read_metadata":
+                    req_ops = ["read_metadata"]
+                elif name == "fs_list_directory":
+                    req_ops = ["list_directory", "read_metadata"]
+                else:
+                    req_ops = [req_op, "list_directory", "read_metadata"]
                 try:
                     req = await fs_access.create_permission_request(
                         target,
@@ -1164,6 +1177,8 @@ class Assistant:
                         deferred_action={
                             "kind": "chat_turn_resume",
                             "tool": name,
+                            "operation": req_op,
+                            "target": target,
                             "arguments": args,
                             "folder": target,
                             "original_text": original_text,
@@ -1420,7 +1435,7 @@ class Assistant:
         ):
             m = re.search(pat, raw)
             if m:
-                explicit_path = m.group(1).strip()
+                explicit_path = m.group(1).strip().rstrip(".,;?!\"'")
                 break
 
         # Detect drive root alone like "C:\" or "List C:\"
@@ -1431,7 +1446,6 @@ class Assistant:
                 explicit_path = val if val.endswith("\\") else val + "\\"
 
         alias_path = ""
-        unspecified_folder = False
         if not explicit_path:
             if re.search(r"\b(?:in\s+(?:the\s+|my\s+)?documents(?:\s+folder)?|my\s+documents\b|documents\s+folder\b)", low):
                 alias_path = str(Path.home() / "Documents")
@@ -1441,13 +1455,40 @@ class Assistant:
                 alias_path = str(Path.home() / "Desktop")
             elif re.search(r"\b(?:in\s+(?:the\s+|my\s+)?pictures(?:\s+folder)?|my\s+pictures\b|pictures\s+folder\b)", low):
                 alias_path = str(Path.home() / "Pictures")
-            elif "workspace" not in low:
-                unspecified_folder = True
 
-        target = explicit_path or alias_path or str(Path.home() / "Documents")
-        is_workspace_only = ("workspace" in low) and not explicit_path and not alias_path
+        target = explicit_path or alias_path
+        is_workspace_only = ("workspace" in low) and not explicit_path and not alias_path and not re.search(r"\bproject\b", low)
+        unspecified_folder = not bool(target) and not is_workspace_only
+        wants_explorer = bool(re.search(r"\bin\s+(?:windows\s+)?explorer\b", low))
 
-        # Operation classification strictly separated across read / write / execute / delete
+        target_file = ""
+        fm = re.search(r"\b([A-Za-z0-9_.-]+\.(?:json|ya?ml|toml|ini|cfg|py|ts|tsx|js|jsx|md|txt|csv|pdf|docx|xlsx|pptx|prisma|sql|env))\b", raw, re.I)
+        if fm:
+            target_file = fm.group(1)
+        elif re.search(r"\bprisma\s+schema\b", low):
+            target_file = "schema.prisma"
+
+        sub_target = ""
+        sub_m = re.search(
+            r"\b(?:find|open|show|list)\s+(?:the\s+|my\s+)?([A-Za-z0-9_.-]+)(?:\s+(?:folder|directory|dir))?(?:\s+(?:inside|in|under|within)\b|[?.!]*$)",
+            raw,
+            re.I,
+        )
+        if sub_m:
+            cand_sub = sub_m.group(1).strip(" .?!\"'")
+            if (
+                cand_sub
+                and not target_file
+                and cand_sub.lower() not in {"all", "my", "the", "this", "that", "folder", "directory", "project", "projects", "workspace", "structure", "files", "documents", "pdf", "erp", "jarvis"}
+                and re.search(r"\b(?:inside|in|under|within)\b", low) is not None
+                or cand_sub.lower() in {"backend", "frontend", "src", "app", "apps", "packages", "database", "docs", "tests"}
+            ):
+                sub_target = cand_sub
+
+        # Strict operation classification: never map folder opening to read_file
+        explicit_dir_cue = bool(
+            re.search(r"\b(?:folder|directory|project|workspace|repo(?:sitory)?|folder\s+structure|directory\s+structure)\b", low)
+        )
         if re.search(r"\b(?:delete|remove|unlink|erase)\b", low):
             operations = ["delete_file"]
         elif re.search(r"\b(?:edit|modify|update|append)\b", low):
@@ -1456,9 +1497,15 @@ class Assistant:
             r"\b(?:report|summary|file|document|note|markdown|\.md|\.txt|\.json|\.csv)\b", low
         ):
             operations = ["create_file", "write_file"]
-        elif re.search(r"\b(?:read|cat|show\s+contents|open)\b", low) and not re.search(r"\b(?:search|find|list)\b", low):
+        elif re.search(r"\b(?:file\s+details|get\s+(?:file\s+)?details|metadata|file\s+info|file\s+size|properties\s+of)\b", low):
+            operations = ["read_metadata"]
+        elif re.search(r"\b(?:search|find|locate)\b", low):
+            operations = ["search_files", "list_directory", "read_metadata"]
+        elif re.search(r"\b(?:read|cat|show\s+contents)\b", low) or (
+            re.search(r"\bopen\b", low) and (bool(target_file) or (bool(explicit_path) and "." in Path(explicit_path).name and not explicit_dir_cue))
+        ):
             operations = ["read_file", "read_metadata"]
-        elif re.search(r"\b(?:list|browse|what\s+files\s+are\s+in)\b", low) and not re.search(r"\b(?:search|find)\b", low):
+        elif re.search(r"\b(?:list|browse|what\s+files\s+are\s+in|open|show(?:\s+me)?)\b", low):
             operations = ["list_directory", "read_metadata"]
         else:
             operations = ["search_files", "list_directory", "read_metadata"]
@@ -1473,13 +1520,27 @@ class Assistant:
         qm = re.search(r"\b(?:for|named|matching|called)\s+([A-Za-z0-9_.\-]+)", raw, re.I)
         if qm and qm.group(1).lower() not in {"all", "my", "the", "this", "files", "documents", "pdf"}:
             query = qm.group(1).strip(" .?!\"'")
-        elif re.search(r"\b(.env|id_rsa|id_ed25519|secrets\.json)\b", low):
-            query = re.search(r"([A-Za-z0-9_.-]+)", raw).group(1)
+        elif re.search(r"\b(\.env|id_rsa|id_ed25519|secrets\.json)\b", low):
+            query = re.search(r"(\.env|id_rsa|id_ed25519|secrets\.json)", raw, re.I).group(1)  # type: ignore[union-attr]
+        elif sub_target and operations[0] == "search_files":
+            query = sub_target
+        elif target_file and operations[0] == "search_files":
+            query = target_file
+        elif operations[0] == "search_files":
+            fm_q = re.search(
+                r"\b(?:find|search(?:\s+for)?|locate)\s+(?:the\s+|my\s+|a\s+)?([A-Za-z0-9_.\- ]{2,40}?)(?:\s+(?:folder|directory|file|files|inside|in|under|within)\b|[?.!]*$)",
+                raw,
+                re.I,
+            )
+            if fm_q:
+                cand_q = fm_q.group(1).strip(" .?!\"'")
+                if cand_q.lower() not in {"all", "my", "the", "this", "files", "documents", "pdf", "pdf documents", "project", "folder"}:
+                    query = cand_q
 
         filename = "jarvis_report.md"
-        fm = re.search(r"\b([A-Za-z0-9_-]+\.(?:md|txt|json|csv))\b", raw, re.I)
-        if fm:
-            filename = fm.group(1)
+        report_fm = re.search(r"\b([A-Za-z0-9_-]+\.(?:md|txt|json|csv))\b", raw, re.I)
+        if report_fm:
+            filename = report_fm.group(1)
         elif "report" in low:
             filename = "jarvis_report.md"
 
@@ -1488,10 +1549,13 @@ class Assistant:
             "target": target,
             "is_workspace_only": is_workspace_only,
             "unspecified_folder": unspecified_folder,
+            "wants_explorer": wants_explorer,
             "operations": operations,
             "primary_op": operations[0],
             "extensions": extensions,
             "query": query,
+            "target_file": target_file,
+            "sub_target": sub_target,
             "filename": filename,
         }
 
@@ -1702,9 +1766,13 @@ class Assistant:
 
     async def execute_deferred_action(self, req_data: dict, *, task_id: str | None = None) -> dict:
         """Execute a deferred filesystem/project operation immediately after owner approval."""
+        orig_task = await self.orchestrator.tasks.get_task(task_id) if task_id else None
+        _ = orig_task
         deferred = dict(req_data.get("deferred_action") or {})
-        kind = deferred.get("kind") or "fs_search"
+        kind = str(deferred.get("kind") or "fs_search")
         folder = str(deferred.get("folder") or req_data.get("canonical_path") or "")
+        target_path = str(deferred.get("target") or folder or req_data.get("canonical_path") or "")
+        intended_op = str(deferred.get("operation") or (req_data.get("requested_operations") or ["list_directory"])[0])
         query = str(deferred.get("query") or "")
         exts = list(deferred.get("extensions") or [])
 
@@ -1712,10 +1780,24 @@ class Assistant:
             await self.orchestrator.tasks.update_task(
                 task_id,
                 status="running",
-                current_step=f"Executing approved {kind}",
+                current_step=f"Executing approved {intended_op}",
             )
 
         try:
+            # Revalidate permission against exact target path & intended operation before executing
+            if kind not in ("erp_dev_review", "chat_turn_resume", "multistep_resume"):
+                reval = await self.orchestrator.fs_access.authorize(
+                    target_path or folder,
+                    intended_op,
+                    task_id=task_id,
+                )
+                if reval.blocked or not reval.allowed:
+                    raise FilesystemSecurityError(
+                        reval.reason or f"Permission revalidation failed for `{intended_op}` on `{target_path or folder}`.",
+                        code=reval.code or "permission_denied",
+                        path=target_path or folder,
+                    )
+
             if kind == "erp_dev_review":
                 proj = deferred.get("project") or {
                     "id": deferred.get("project_id"),
@@ -1821,11 +1903,73 @@ class Assistant:
                     resume_checkpoint=cp,
                 )
 
+            if kind == "fs_metadata":
+                meta = await self.orchestrator.fs_access.execute_read_metadata(target_path, task_id=task_id)
+                reply = (
+                    f"Metadata for `{meta['path']}`: type={'directory' if meta['is_dir'] else 'file'}, "
+                    f"size={meta['size_bytes']} bytes, modified={meta['modified_at']}."
+                )
+                if task_id:
+                    await self.orchestrator.tasks.update_task(
+                        task_id,
+                        status="completed",
+                        append_tool="filesystem_access",
+                        current_step="Completed metadata inspection",
+                        result=reply,
+                    )
+                    await self.orchestrator.fs_access.consume_task_once_permissions(task_id)
+                return {"command": "filesystem_metadata", "reply": reply, "paths": [meta["path"]], "metadata": meta, "ok": True}
+
             if kind == "fs_read":
-                target_path = str(deferred.get("target") or folder)
+                target_file_name = str(deferred.get("target_file") or "").strip()
+                resolved_target_p = Path(target_path)
+                if not resolved_target_p.exists():
+                    raise FilesystemSecurityError(
+                        f"Path does not exist: `{target_path}`. Please check or clarify the path.",
+                        code="not_found",
+                        path=target_path,
+                    )
+                if resolved_target_p.is_dir():
+                    if target_file_name:
+                        matches = await self.orchestrator.fs_access.execute_search_files(
+                            resolved_target_p,
+                            query=target_file_name,
+                            task_id=task_id,
+                            limit=20,
+                        )
+                        exact = [m for m in matches if not m.get("is_dir") and Path(m["path"]).name.lower() == target_file_name.lower()]
+                        if not exact:
+                            exact = [m for m in matches if not m.get("is_dir")]
+                        if not exact:
+                            raise FilesystemSecurityError(
+                                f"File `{target_file_name}` was not found inside `{resolved_target_p}`. Please specify the exact path.",
+                                code="not_found",
+                                path=str(resolved_target_p),
+                            )
+                        if len(exact) > 1:
+                            choices = ", ".join(m["relative_path"] for m in exact[:6])
+                            raise FilesystemSecurityError(
+                                f"Multiple `{target_file_name}` files exist inside `{resolved_target_p}`: {choices}. Please specify which file to read.",
+                                code="ambiguous_target",
+                                path=str(resolved_target_p),
+                            )
+                        target_path = str(exact[0]["path"])
+                    else:
+                        raise FilesystemSecurityError(
+                            f"`{target_path}` is a directory, not a readable file (use list_directory instead).",
+                            code="not_a_file",
+                            path=target_path,
+                        )
                 doc = await self.orchestrator.fs_access.execute_read_file(target_path, task_id=task_id)
                 fitem = {"name": doc["name"], "path": doc["path"], "size_bytes": doc["size_bytes"]}
                 graph_live.filesystem_activity(self, task_id=task_id, folder_path=str(Path(doc["path"]).parent), files=[fitem], operation="read_file")
+                if deferred.get("is_project") or deferred.get("project_root"):
+                    p_root = str(deferred.get("project_root") or Path(doc["path"]).parent)
+                    self.active_project = {
+                        "name": str(deferred.get("project_name") or Path(p_root).name),
+                        "root_path": p_root,
+                        "source": str(deferred.get("project_source") or "project"),
+                    }
                 orig_text = str(deferred.get("original_text") or "")
                 notices: list[str] = []
                 if doc.get("redacted"):
@@ -1862,7 +2006,6 @@ class Assistant:
                 return {"command": "filesystem_read", "reply": reply, "paths": [doc["path"]], "document": doc, "ok": True}
 
             if kind == "fs_delete":
-                target_path = str(deferred.get("target") or folder)
                 out = await self.orchestrator.fs_access.execute_delete_file(target_path, task_id=task_id)
                 reply = f"Deleted file `{out['path']}` after explicit delete approval."
                 if task_id:
@@ -1876,47 +2019,77 @@ class Assistant:
                     await self.orchestrator.fs_access.consume_task_once_permissions(task_id)
                 return {"command": "filesystem_delete", "reply": reply, "paths": [], "ok": True}
 
-            # Default: directory search / listing
-            if deferred.get("operation") == "list_directory" and not query and not exts:
+            # Default: directory listing or search
+            if intended_op == "list_directory" and not query and not exts:
                 entries = await self.orchestrator.fs_access.execute_list_directory(folder, task_id=task_id)
                 graph_live.filesystem_activity(self, task_id=task_id, folder_path=folder, files=entries, operation="list_directory")
-                names = ", ".join(e["name"] for e in entries[:8]) or "empty folder"
-                reply = f"Listed `{folder}` ({len(entries)} items): {names}."
+                dirs = [e["name"] for e in entries if e.get("is_dir")]
+                fnames = [e["name"] for e in entries if not e.get("is_dir")]
+                summary_parts: list[str] = []
+                if dirs:
+                    summary_parts.append(f"directories: {', '.join(dirs[:12])}")
+                if fnames:
+                    summary_parts.append(f"files: {', '.join(fnames[:12])}")
+                detail_str = "; ".join(summary_parts) if summary_parts else "empty folder"
+                proj_label = str(deferred.get("project_name") or Path(folder).name)
+                if deferred.get("is_project") or deferred.get("project_root"):
+                    p_root = str(deferred.get("project_root") or folder)
+                    self.active_project = {
+                        "name": proj_label,
+                        "root_path": p_root,
+                        "source": str(deferred.get("project_source") or "project"),
+                    }
+                    reply = f"Opened `{proj_label}` at `{folder}` ({len(entries)} items) — {detail_str}."
+                else:
+                    reply = f"Listed `{folder}` ({len(entries)} items): {detail_str}."
                 paths = [e["path"] for e in entries]
                 files_out = entries
+                step_msg = "Completed directory listing"
             else:
                 matches = await self.orchestrator.fs_access.execute_search_files(
                     folder, query=query, extensions=exts, task_id=task_id
                 )
                 graph_live.filesystem_activity(self, task_id=task_id, folder_path=folder, files=matches, operation="search_files")
+                if deferred.get("is_project") or deferred.get("project_root"):
+                    p_root = str(deferred.get("project_root") or folder)
+                    self.active_project = {
+                        "name": str(deferred.get("project_name") or Path(p_root).name),
+                        "root_path": p_root,
+                        "source": str(deferred.get("project_source") or "project"),
+                    }
                 if matches:
                     names = ", ".join(m["name"] for m in matches[:8])
-                    reply = f"Found {len(matches)} matching file(s) in `{folder}`: {names}."
+                    reply = f"Found {len(matches)} matching item(s) in `{folder}`: {names}."
                 else:
                     reply = f"Searched authorized folder `{folder}`, found 0 matching files."
                 paths = [m["path"] for m in matches]
                 files_out = matches
+                step_msg = "Completed filesystem search"
 
             if task_id:
                 await self.orchestrator.tasks.update_task(
                     task_id,
                     status="completed",
                     append_tool="filesystem_access",
-                    current_step="Completed filesystem search",
+                    current_step=step_msg,
                     result=reply,
                 )
                 await self.orchestrator.fs_access.consume_task_once_permissions(task_id)
             return {"command": "filesystem_ops", "reply": reply, "paths": paths, "files": files_out, "ok": True}
-        except FilesystemSecurityError as exc:
+        except (FilesystemSecurityError, FileNotFoundError, NotADirectoryError, IsADirectoryError, OSError, ValueError) as exc:
+            err_msg = str(exc)
+            reply = f"Permission was approved, but `{intended_op}` failed on `{target_path or folder}`: {err_msg} Please verify or clarify the path."
             if task_id:
                 await self.orchestrator.tasks.update_task(
                     task_id,
                     status="failed",
-                    current_step="Blocked by filesystem policy",
-                    error_info=str(exc),
+                    current_step="Filesystem execution failed",
+                    error_info=err_msg,
+                    result=reply,
                 )
                 await self.orchestrator.fs_access.consume_task_once_permissions(task_id)
-            return {"command": "filesystem_blocked", "reply": f"Blocked by filesystem security policy: {exc}", "paths": [], "ok": False}
+            cmd_name = "filesystem_blocked" if isinstance(exc, FilesystemSecurityError) and exc.code in ("blocked", "symlink_blocked", "sensitive_path", "traversal_blocked") else "filesystem_failed"
+            return {"command": cmd_name, "reply": reply, "paths": [], "error": err_msg, "ok": False}
 
     async def resume_after_permission_decision(self, request_id: str, decision_result: dict) -> dict:
         """Complete or cancel task flow cleanly after owner decides an inline permission card."""
@@ -1943,26 +2116,29 @@ class Assistant:
                     "text": reply,
                     "request_id": request_id,
                     "granted": False,
+                    "execution_ok": False,
                     "task_id": task_id,
                     "task": task,
                     "paths": [],
                 }
             )
-            return {"reply": reply, "granted": False, "execution": None, "task": task, "paths": []}
+            return {"reply": reply, "granted": False, "execution_ok": False, "execution": None, "task": task, "paths": []}
 
         exec_res = await self.execute_deferred_action(req_data, task_id=task_id)
+        exec_ok = bool(exec_res.get("ok", True))
         reply = str(exec_res.get("reply") or "Completed authorized action.")
         task = await self.orchestrator.tasks.get_task(task_id) if task_id else None
         if task_id:
             await self.orchestrator.command_history.update_by_task(
                 task_id,
-                status=str((task or {}).get("status") or ("completed" if exec_res.get("ok", True) else "failed")),
+                status=str((task or {}).get("status") or ("completed" if exec_ok else "failed")),
                 tools_used=exec_res.get("tools_used"),
                 paths_touched=exec_res.get("paths") or [],
                 result_summary=reply,
+                error_info=(None if exec_ok else str(exec_res.get("error") or reply)),
             )
         self.history.add("assistant", reply)
-        self._set_os_state("Completed", source="system", detail=exec_res.get("command", "filesystem_ops"))
+        self._set_os_state("Completed" if exec_ok else "Error", source="system", detail=exec_res.get("command", "filesystem_ops"))
         self.bus.publish({"type": "graph_changed"})
         self.bus.publish(
             {
@@ -1970,12 +2146,22 @@ class Assistant:
                 "text": reply,
                 "request_id": request_id,
                 "granted": True,
+                "execution_ok": exec_ok,
+                "error": exec_res.get("error") or ("" if exec_ok else reply),
                 "task_id": task_id,
                 "task": task,
                 "paths": exec_res.get("paths") or [],
             }
         )
-        return {"reply": reply, "granted": True, "execution": exec_res, "task": task, "paths": exec_res.get("paths") or []}
+        return {
+            "reply": reply,
+            "granted": True,
+            "execution_ok": exec_ok,
+            "error": exec_res.get("error"),
+            "execution": exec_res,
+            "task": task,
+            "paths": exec_res.get("paths") or [],
+        }
 
     async def _execute_planned_workflow(
         self,
@@ -2190,11 +2376,100 @@ class Assistant:
             self._set_os_state("Executing", source=source, detail="filesystem_ops")
             t_start = time.perf_counter()
             fs_info = self._parse_host_fs_request(text)
-            alias_hit = await self.orchestrator.fs_access.resolve_alias(text)
-            if alias_hit and not fs_info["explicit_path"]:
+            active_root = str((self.active_project or {}).get("root_path") or "") or None
+            resolved_proj: dict = (
+                await self.orchestrator.fs_access.resolve_project_target(
+                    text,
+                    active_root=active_root,
+                    requested_filename=fs_info.get("target_file"),
+                )
+                if not fs_info["explicit_path"] and not fs_info["is_workspace_only"] and not fs_info["target"]
+                else {"matched": False, "ambiguous": False, "candidates": []}
+            )
+
+            # Ambiguous project mention (e.g. multiple matching dirs) -> ask user to choose cleanly
+            if resolved_proj.get("ambiguous"):
+                raw_cands = resolved_proj.get("candidates")
+                cands: list[dict] = list(raw_cands) if isinstance(raw_cands, list) else []
+                opts = "; ".join(f"`{c['name']}` ({c['path']})" for c in cands[:6])
+                reply = f"Multiple matching project folders were found for `{resolved_proj.get('query_name')}`: {opts}. Which folder would you like me to use?"
+                if task_id:
+                    await self.orchestrator.tasks.update_task(task_id, status="completed", result=reply, current_step="Clarification needed (multiple matches)")
+                return {"command": "clarification_needed", "reply": reply, "candidates": cands, "paths": [], "ok": False}
+
+            alias_hit = resolved_proj if resolved_proj.get("matched") else None
+            project_root = ""
+            project_name = ""
+            project_source = ""
+            if alias_hit:
+                project_root = str(alias_hit["root_path"])
+                project_name = str(alias_hit["alias"])
+                project_source = str(alias_hit["source"])
                 fs_info["target"] = str(alias_hit["resolved_path"])
                 fs_info["is_workspace_only"] = False
                 fs_info["unspecified_folder"] = False
+                if project_source in ("project_alias", "registered_project", "approved_folder", "workspace_root"):
+                    self.active_project = {"name": project_name, "root_path": project_root, "source": project_source}
+
+            # Explicit request to open folder in Windows Explorer routes strictly through ActionRegistry confirmation policy
+            if fs_info.get("wants_explorer"):
+                exp_target = fs_info.get("target") or ""
+                if not exp_target:
+                    reply = "Please specify which folder or saved project alias to open in Explorer."
+                    if task_id:
+                        await self.orchestrator.tasks.update_task(task_id, status="failed", error_info=reply, current_step="Clarification needed")
+                    return {"command": "clarification_needed", "reply": reply, "paths": [], "ok": False}
+                chk_exp = await self.orchestrator.fs_access.authorize(exp_target, "list_directory", task_id=task_id)
+                if chk_exp.blocked:
+                    return {"command": "filesystem_blocked", "reply": f"Blocked by filesystem security policy: {chk_exp.reason}", "paths": [], "ok": False}
+                if not chk_exp.allowed:
+                    req_exp = await self.orchestrator.fs_access.create_permission_request(
+                        chk_exp.canonical_path,
+                        ["list_directory", "read_metadata"],
+                        task_id=task_id,
+                        reason=f"Requested permission before opening `{chk_exp.canonical_path}` in Explorer",
+                        access_duration="once",
+                        deferred_action={
+                            "kind": "fs_search",
+                            "folder": chk_exp.canonical_path,
+                            "target": chk_exp.canonical_path,
+                            "operation": "list_directory",
+                            "query": "",
+                            "extensions": [],
+                            "filename": "",
+                            "original_text": text,
+                            "project_name": project_name,
+                            "project_root": project_root,
+                            "project_source": project_source,
+                        },
+                    )
+                    if task_id:
+                        await self.orchestrator.tasks.update_task(
+                            task_id,
+                            status="awaiting_permission",
+                            append_permission=req_exp["request_id"],
+                            current_step=f"Waiting for permission before Explorer ({chk_exp.canonical_path})",
+                        )
+                    self._set_os_state("Waiting for approval", source=source, detail=req_exp["canonical_path"])
+                    self.bus.publish({"type": "permission_requested", "request": req_exp, "task_id": task_id})
+                    return {
+                        "command": "permission_required",
+                        "reply": f"Permission required before accessing `{chk_exp.canonical_path}` in Explorer.",
+                        "paths": [],
+                        "permission_request": req_exp,
+                        "ok": False,
+                    }
+                try:
+                    out_exp = await asyncio.to_thread(self.actions.request_or_execute, "open_app", {"app": "explorer", "args": [chk_exp.canonical_path]})
+                except ActionPermissionError as exc:
+                    if task_id:
+                        await self.orchestrator.tasks.update_task(task_id, status="failed", error_info=str(exc), current_step="Blocked Explorer launch")
+                    return {"command": "open_app", "reply": f"Unable to open Explorer: {exc}", "paths": [], "ok": False}
+                if out_exp.get("confirmation_required"):
+                    reply = f"Approval required ({out_exp['token']}) to open `{chk_exp.canonical_path}` in Explorer. Confirm the pending desktop action."
+                    return {"command": "open_app", "reply": reply, "action_result": out_exp, "paths": [], "ui": {"open_drawer": "approvals"}, "ok": False}
+                return {"command": "open_app", "reply": f"Opened `{chk_exp.canonical_path}` in Explorer.", "action_result": out_exp, "paths": [chk_exp.canonical_path], "ok": True}
+
             task_cat = classify_task_category(text, intent=intent, department=plan.decision.department)
             has_explicit_seq = bool(re.search(r"\b(?:and\s+then|then|after\s+that|followed\s+by)\b|;|->", text, re.I))
             if (
@@ -2208,7 +2483,7 @@ class Assistant:
                 return await self._run_multistep_workflow(
                     text,
                     resolved_target=fs_info["target"],
-                    alias_name=(alias_hit["alias"] if alias_hit else None),
+                    alias_name=(str(alias_hit.get("alias") or "") or None if alias_hit else None),
                     task_id=task_id,
                     source=source,
                     cancel_event=cancel_event,
@@ -2245,22 +2520,55 @@ class Assistant:
                     graph_live.tool_used(self, "filesystem_search", query=text[:80], ok=False, duration_ms=dur_ms)
                     return {"command": "filesystem_ops", "reply": str(exc), "paths": [], "ok": False}
 
+            # Unknown project / unspecified folder without explicit path or resolved match -> ask user instead of assuming Documents
+            if fs_info["unspecified_folder"] and not fs_info["target"]:
+                reply = (
+                    f"I couldn't locate `{resolved_proj.get('query_name') or 'that folder'}` in your saved aliases, "
+                    "registered projects, or configured workspace roots. Please specify which folder or full path you want me to open."
+                )
+                if task_id:
+                    await self.orchestrator.tasks.update_task(task_id, status="completed", result=reply, current_step="Clarification needed")
+                return {"command": "clarification_needed", "reply": reply, "paths": [], "ok": False}
+
             # Scoped Host Filesystem Flow (P10.20)
             target_path = fs_info["target"]
-            primary_op = fs_info["primary_op"]
-            if fs_info["unspecified_folder"] and primary_op == "search_files":
-                active_perms = [
-                    p
-                    for p in await self.orchestrator.fs_access.list_permissions(status="active")
-                    if p["scope"] in ("session", "persistent") and "search_files" in (p.get("granted_operations") or [])
-                ]
-                if active_perms:
-                    target_path = active_perms[0]["canonical_folder_path"]
+            req_operations = list(fs_info["operations"])
+            primary_op = req_operations[0]
+            folder_for_exec = target_path
+
+            # Refine target inside resolved project root when targeting a specific file or subfolder
+            if alias_hit and project_root:
+                target_file_name = str(fs_info.get("target_file") or "").strip()
+                sub_target_name = str(fs_info.get("sub_target") or "").strip()
+                if target_file_name:
+                    cand_file = Path(project_root) / target_file_name
+                    if cand_file.exists() and cand_file.is_file():
+                        target_path = str(cand_file)
+                        folder_for_exec = project_root
+                    else:
+                        target_path = project_root
+                        folder_for_exec = project_root
+                        if primary_op == "read_file" and "search_files" not in req_operations:
+                            req_operations = ["read_file", "search_files", "list_directory", "read_metadata"]
+                elif sub_target_name:
+                    cand_sub = Path(project_root) / sub_target_name
+                    if cand_sub.exists() and cand_sub.is_dir() and primary_op == "list_directory":
+                        target_path = str(cand_sub)
+                        folder_for_exec = str(cand_sub)
+                    else:
+                        target_path = project_root
+                        folder_for_exec = project_root
+                elif primary_op == "search_files" and not fs_info["query"] and not fs_info["extensions"]:
+                    # Project-level lookup ("Find my ERP project") -> open/list resolved project folder rather than searching for its own name
+                    req_operations = ["list_directory", "read_metadata"]
+                    primary_op = "list_directory"
 
             if primary_op in WRITE_OPS:
                 deferred_kind = "fs_write_report"
             elif primary_op == "read_file":
                 deferred_kind = "fs_read"
+            elif primary_op == "read_metadata":
+                deferred_kind = "fs_metadata"
             elif primary_op == "delete_file":
                 deferred_kind = "fs_delete"
             else:
@@ -2282,24 +2590,38 @@ class Assistant:
                     "ok": False,
                 }
 
+            # Verify explicit path actually exists for non-create operations before creating misleading permission cards
+            if fs_info["explicit_path"] and primary_op not in ("create_file", "write_file"):
+                cp_target = Path(chk.canonical_path)
+                if not cp_target.exists():
+                    reply = f"The path `{chk.canonical_path}` does not exist. Please check and clarify the exact path."
+                    if task_id:
+                        await self.orchestrator.tasks.update_task(task_id, status="failed", error_info=reply, current_step="Invalid target path")
+                    return {"command": "invalid_path", "reply": reply, "paths": [], "ok": False}
+
             deferred_payload = {
                 "kind": deferred_kind,
-                "folder": target_path,
+                "folder": folder_for_exec,
                 "target": target_path,
+                "target_file": fs_info.get("target_file") or "",
                 "operation": primary_op,
                 "query": fs_info["query"],
                 "extensions": fs_info["extensions"],
                 "filename": fs_info["filename"],
                 "original_text": text,
+                "is_project": bool(alias_hit and project_source in ("project_alias", "registered_project", "approved_folder", "workspace_root")),
+                "project_name": project_name,
+                "project_root": project_root,
+                "project_source": project_source,
             }
 
             if not chk.allowed:
                 try:
                     req = await self.orchestrator.fs_access.create_permission_request(
                         target_path,
-                        fs_info["operations"],
+                        req_operations,
                         task_id=task_id,
-                        reason=f"Requested `{primary_op}` access for: {text[:140]}",
+                        reason=f"Requested `{primary_op}` access on `{target_path}` for: {text[:140]}",
                         access_duration="once",
                         deferred_action=deferred_payload,
                     )
@@ -2312,22 +2634,22 @@ class Assistant:
                     await self.orchestrator.tasks.update_task(
                         task_id,
                         status="awaiting_permission",
-                        plan=[f"Request scoped `{', '.join(fs_info['operations'])}` permission for `{req['canonical_path']}`", f"Execute `{deferred_kind}` inside authorized folder"],
+                        plan=[f"Request scoped `{', '.join(req_operations)}` permission for `{req['canonical_path']}`", f"Execute `{primary_op}` on `{target_path}`"],
                         append_permission=req["request_id"],
-                        current_step=f"Waiting for permission ({', '.join(fs_info['operations'])})",
+                        current_step=f"Waiting for permission ({', '.join(req_operations)})",
                     )
                 self._set_os_state("Waiting for approval", source=source, detail=req["canonical_path"])
                 self.bus.publish({"type": "permission_requested", "request": req, "task_id": task_id})
                 return {
                     "command": "permission_required",
-                    "reply": f"Permission required before `{primary_op}` on `{req['canonical_path']}`. Choose Allow once, Allow for this session, Always allow (read-only), or Deny.",
+                    "reply": f"Permission required before `{primary_op}` on `{target_path}`. Choose Allow once, Allow for this session, Always allow (read-only), or Deny.",
                     "paths": [],
                     "permission_request": req,
                     "ok": False,
                 }
 
             return await self.execute_deferred_action(
-                {"canonical_path": chk.canonical_path, "deferred_action": deferred_payload},
+                {"canonical_path": chk.canonical_path, "requested_operations": req_operations, "deferred_action": deferred_payload},
                 task_id=task_id,
             )
 
@@ -2737,7 +3059,7 @@ class Assistant:
                     flags = ", ".join(plan.decision.sensitive_flags) or "privileged operation"
                     if "file_deletion" in (plan.decision.sensitive_flags or []):
                         fs_del = self._parse_host_fs_request(text)
-                        if not fs_del["is_workspace_only"]:
+                        if not fs_del["is_workspace_only"] and fs_del["target"]:
                             chk_del = await self.orchestrator.fs_access.authorize(fs_del["target"], "delete_file", task_id=current_task_id)
                             if chk_del.blocked:
                                 await self.orchestrator.tasks.update_task(

@@ -560,8 +560,14 @@ class ActionExecutor:
                 if app_key not in self.spec.allowed_apps:
                     raise ActionPermissionError(f"Application {app_key!r} is not in allowed_apps: {sorted(self.spec.allowed_apps)}")
                 cmd = list(self.spec.allowed_apps[app_key])
+                extra_args = args.get("args")
+                if isinstance(extra_args, (list, tuple)):
+                    for item in extra_args[:4]:
+                        s_item = str(item or "").strip()
+                        if s_item and not any(c in s_item for c in ("|", "&", ";", ">", "<", "`", "\n", "\r")):
+                            cmd.append(s_item)
                 child = subprocess.Popen(cmd, shell=False)
-                res = {"launched": app_key, "pid": child.pid}
+                res = {"launched": app_key, "pid": child.pid, "args": cmd[len(self.spec.allowed_apps[app_key]):]}
                 outcome = verify_process_state(tool_name="open_app", pid=child.pid, target=app_key, started_only=True)
             elif action == "run_command":
                 cmd_str = (args.get("command") or "").strip()

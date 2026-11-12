@@ -252,6 +252,7 @@ class MemorySpec(BaseModel):
 
 class FilesystemSpec(BaseModel):
     allowed_roots: list[str] = Field(default_factory=lambda: [str(ROOT / "notes")])
+    workspace_roots: list[str] = Field(default_factory=list)
     excluded_dirs: list[str] = Field(default_factory=lambda: [".git", ".venv", "venv", "node_modules", "__pycache__", ".pytest_cache", ".trash", "Windows", "Program Files", "System32"])
     max_file_bytes: int = Field(512_000, ge=10_000, le=5_000_000)
     max_results: int = Field(40, ge=5, le=200)

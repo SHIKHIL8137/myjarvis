@@ -70,7 +70,10 @@ _STOPWORDS = {
     "from", "by", "as", "my", "your", "our", "me", "you", "please",
 }
 _RISKY_VOICE_CMD_RE = re.compile(
-    r"\b(?:delete|remove|erase|overwrite|modify|move|rename|create|write|run|execute|confirm|approve|click|type|open\s+(?:url|file|app)|focus\s+window|screenshot|shutdown|restart|cancel)\b",
+    r"\b(?:delete|remove|erase|overwrite|modify|move|rename|create|write|run|execute|confirm|approve|click|type|"
+    r"open\s+(?:(?:the|my|this|that)\s+)?(?:[A-Za-z0-9_.-]+\s+){0,3}(?:url|file|folder|directory|project|app)|"
+    r"(?:find|read|inspect|search)\s+(?:(?:the|my|this|that)\s+)?(?:folder|directory|project)|"
+    r"focus\s+window|screenshot|shutdown|restart|cancel)\b",
     re.I,
 )
 

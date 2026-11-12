@@ -1068,6 +1068,30 @@ class FilesystemAccessManager:
                 safe_dirs.append(d)
             dirnames[:] = safe_dirs
 
+            if not ext_set and q_tokens:
+                for dname in safe_dirs:
+                    sub = dp / dname
+                    d_low = dname.lower()
+                    d_path_low = str(sub).lower()
+                    if any(tok in d_low or tok in d_path_low for tok in q_tokens):
+                        try:
+                            dst = sub.stat()
+                            matches.append(
+                                {
+                                    "name": dname,
+                                    "path": str(sub),
+                                    "relative_path": str(sub.relative_to(root)),
+                                    "extension": "",
+                                    "is_dir": True,
+                                    "size_bytes": 0,
+                                    "modified_at": dst.st_mtime,
+                                }
+                            )
+                            if len(matches) >= limit:
+                                return matches
+                        except OSError:
+                            continue
+
             for fname in filenames:
                 fp = dp / fname
                 if _has_reparse_or_symlink(fp) or _detect_sensitive_path(fp):
@@ -1500,70 +1524,287 @@ class FilesystemAccessManager:
         await self._log_audit(actor=actor, decision="alias_deleted", target=target, details={"alias": key})
         return True
 
-    async def resolve_alias(self, target_or_query: str) -> dict[str, Any] | None:
-        """Resolve an alias name, registered project name, or active approved folder basename (with optional subpath)."""
+    @staticmethod
+    def _project_slug(name: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", str(name or "").lower())
+
+    @staticmethod
+    def _project_norm_space(name: str) -> str:
+        return re.sub(r"[\s_-]+", " ", str(name or "").strip().lower()).strip()
+
+    @staticmethod
+    def _extract_project_mention(text: str) -> dict[str, str]:
+        """Extract explicit/subpath project mention, contextual flag, and sub-target from NL or path-like query."""
+        raw = str(text or "").strip().strip("\"'")
+        low = raw.lower()
+        contextual = bool(
+            re.search(
+                r"\b(?:(?:in|inside|from|of)\s+(?:that|this|the)\s+(?:project|folder|directory|repo)|inside\s+it|in\s+there|\bits\b)\b",
+                low,
+            )
+        )
+        # "Find the backend folder inside ERP V2" / "folder structure of ERP V2"
+        in_m = re.search(
+            r"\b(?:inside|within|in|of|under|from)\s+(?:my\s+|the\s+)?([A-Za-z0-9_.\- ]{2,60}?)(?:\s+(?:folder|directory|project|workspace|repo(?:sitory)?))?\s*[?.!]*$",
+            raw,
+            re.I,
+        )
+        sub_item = ""
+        mention = ""
+        if in_m:
+            cand = in_m.group(1).strip(" .?!\"'")
+            if cand.lower() not in {"that", "this", "the", "that project", "this project", "the project", "that folder", "the folder", "it", "there"}:
+                mention = cand
+        if not mention:
+            # "Open the ERP V2 folder" / "Find my ERP project" / "Open my Jarvis project"
+            m2 = re.search(
+                r"\b(?:open|find|search(?:\s+for)?|show(?:\s+me)?|list|inspect|read)\s+(?:the\s+|my\s+)?(.+?)\s+(?:folder|directory|project|workspace|repo(?:sitory)?)\b",
+                raw,
+                re.I,
+            )
+            if m2:
+                candidate_phrase = re.sub(r"\b(?:structure|contents|files)\s+(?:of|in)\b", "", m2.group(1), flags=re.I).strip(" .?!\"'")
+                if candidate_phrase and candidate_phrase.lower() not in {"that", "this", "the", "a", "my"}:
+                    mention = candidate_phrase
+        # Extract sub-folder / sub-item if phrase was "<verb> the <sub_item> (folder|file)? inside <project>"
+        sub_m = re.search(
+            r"\b(?:find|open|locate|read|show)\s+(?:the\s+|my\s+)?([A-Za-z0-9_.\-]+)(?:\s+(?:folder|directory|file))?\s+(?:inside|in|under|within|from)\b",
+            raw,
+            re.I,
+        )
+        if sub_m:
+            sub_cand = sub_m.group(1).strip(" .?!\"'")
+            if sub_cand.lower() not in {"folder", "structure", "project", "that", "this", "the", "files", "documents"}:
+                sub_item = sub_cand
+        return {
+            "mention": mention,
+            "sub_item": sub_item,
+            "contextual": "1" if contextual else "",
+        }
+
+    def _score_project_match(self, cand_name: str, cand_path: str, query_phrase: str, full_tokens: set[str]) -> int:
+        """Return match strength (>0): 100=exact key/slug, 70=variation/prefix/token, 0=none."""
+        q_slug = self._project_slug(query_phrase) if query_phrase else ""
+        q_norm = self._project_norm_space(query_phrase) if query_phrase else ""
+        c_names = [cand_name, Path(cand_path).name]
+        best = 0
+        for cname in c_names:
+            c_norm = self._project_norm_space(cname)
+            c_slug = self._project_slug(cname)
+            if not c_slug:
+                continue
+            if q_slug:
+                if c_slug == q_slug or c_norm == q_norm:
+                    return 100
+                # Variation matching: "jarvis" <-> "myjarvis", "erp" <-> "erp_v2"
+                if (len(q_slug) >= 3 and (q_slug in c_slug or c_slug in q_slug)) or (
+                    q_norm and len(q_norm) >= 3 and q_norm in c_norm.split()
+                ):
+                    best = max(best, 75)
+            # Token match inside full NL query
+            if len(c_norm) >= 2 and (c_norm in full_tokens or c_slug in full_tokens):
+                best = max(best, 90)
+        return best
+
+    async def resolve_project_target(
+        self,
+        target_or_query: str,
+        *,
+        active_root: str | None = None,
+        requested_filename: str | None = None,
+    ) -> dict[str, Any]:
+        """Resolve project mentions strictly in priority order without unrestricted disk scanning:
+        1. Exact saved project alias.
+        2. Registered workspace/project paths.
+        3. Previously approved (session/persistent) project roots.
+        4. Shallow search within explicitly configured workspace roots.
+        5. Return ambiguous candidates list for user choice, or contextual active_root fallback.
+        """
         raw = str(target_or_query or "").strip().strip("\"'")
-        if not raw or re.match(r"^(?:[A-Za-z]:[/\\]|\\\\|/)", raw):
-            return None
-        key = self._normalize_alias_key(raw)
-        # Support "ERP_V2/backend/config.py" by matching leading segment against alias/project
+        if not raw:
+            return {"matched": False, "ambiguous": False, "candidates": [], "query_name": ""}
+        if re.match(r"^(?:[A-Za-z]:[/\\]|\\\\|/)", raw):
+            return {"matched": False, "ambiguous": False, "candidates": [], "explicit_path": raw, "query_name": raw}
+
         parts = raw.replace("\\", "/").split("/", 1)
-        head_key = self._normalize_alias_key(parts[0])
+        head_raw = parts[0].strip()
         subpath = parts[1].strip("/") if len(parts) > 1 and parts[1].strip("/") else ""
+        info = self._extract_project_mention(raw)
+        has_verb = bool(re.match(r"^(?:open|find|search|show|list|inspect|read|locate)\b", raw, re.I))
+        mention = info["mention"] or (head_raw if (subpath or (not has_verb and len(raw.split()) <= 3)) else "")
+        # Avoid treating generic words ("that", "that project", "package.json") as project names
+        if mention.lower() in {"that", "this", "the", "my", "project", "folder", "directory", "workspace", "package.json", "that project", "backend", "frontend"}:
+            mention = ""
+
+        norm_full = self._project_norm_space(raw)
+        full_tokens = set(re.findall(r"[a-z0-9_.-]+", norm_full))
+        # Add adjacent word bigrams normalized into slug form (e.g. "erp v2" -> "erpv2")
+        word_list = re.findall(r"[a-z0-9]+", raw.lower())
+        for idx in range(len(word_list) - 1):
+            full_tokens.add(word_list[idx] + word_list[idx + 1])
+            full_tokens.add(f"{word_list[idx]} {word_list[idx + 1]}")
 
         async with self.db.async_session() as s:
             aliases = (await s.execute(select(ProjectAliasRow))).scalars().all()
             projects = (await s.execute(select(ProjectRow))).scalars().all()
             perms = (await s.execute(select(FilesystemPermissionRow).where(FilesystemPermissionRow.status == "active"))).scalars().all()
 
-        def _combine(base_path: str, source: str, name: str) -> dict[str, Any] | None:
-            base = Path(base_path)
-            if subpath:
-                cand = base / subpath
-                return {"source": source, "alias": name, "root_path": str(base), "resolved_path": str(cand)}
-            return {"source": source, "alias": name, "root_path": str(base), "resolved_path": str(base)}
+        def _make_hit(base_path: str, source: str, name: str, score: int) -> dict[str, Any] | None:
+            try:
+                resolved, _ = self._screen_target_security(base_path, "list_directory")
+            except FilesystemSecurityError:
+                return None
+            if not resolved.exists() or not resolved.is_dir():
+                return None
+            cand_path = resolved / subpath if subpath else resolved
+            return {
+                "matched": True,
+                "ambiguous": False,
+                "source": source,
+                "alias": name,
+                "root_path": str(resolved),
+                "resolved_path": str(cand_path),
+                "sub_item": info["sub_item"],
+                "score": score,
+            }
 
-        # 1. Exact alias match (full key or head segment)
+        def _pick_from_hits(hits: list[dict[str, Any]]) -> dict[str, Any] | None:
+            if not hits:
+                return None
+            # Deduplicate by resolved root_path keeping highest score
+            by_root: dict[str, dict[str, Any]] = {}
+            for h in hits:
+                rk = h["root_path"].lower()
+                if rk not in by_root or h["score"] > by_root[rk]["score"]:
+                    by_root[rk] = h
+            unique = list(by_root.values())
+            max_score = max(h["score"] for h in unique)
+            # Prefer exact (90+) hits over weaker variation hits if exact hits exist
+            top = [h for h in unique if (h["score"] >= 90 if max_score >= 90 else h["score"] == max_score)]
+            if len(top) == 1:
+                return top[0]
+            return {
+                "matched": False,
+                "ambiguous": True,
+                "candidates": [{"name": h["alias"], "path": h["root_path"], "source": h["source"]} for h in sorted(top, key=lambda x: x["root_path"].lower())],
+                "query_name": mention or raw,
+            }
+
+        # Step 1: Saved project aliases
+        alias_hits: list[dict[str, Any]] = []
         for a in aliases:
-            if a.alias in (key, head_key):
-                return _combine(a.folder_path, "project_alias", a.display_name or a.alias)
-        # 2. Exact registered project match
+            sc = self._score_project_match(a.display_name or a.alias, a.folder_path, mention, full_tokens)
+            if sc > 0:
+                hit = _make_hit(a.folder_path, "project_alias", a.display_name or a.alias, sc)
+                if hit:
+                    alias_hits.append(hit)
+        picked = _pick_from_hits(alias_hits)
+        if picked:
+            return picked
+
+        # Step 2: Registered workspace/project paths
+        proj_hits: list[dict[str, Any]] = []
         for p in projects:
-            pk = self._normalize_alias_key(p.name)
-            if pk in (key, head_key):
-                return _combine(p.root_path, "registered_project", p.name)
-        # 3. Active approved folder basename match
-        for perm in perms:
-            if perm.scope not in ("persistent", "session"):
-                continue
-            bk = self._normalize_alias_key(Path(perm.canonical_folder_path).name)
-            if bk and bk in (key, head_key):
-                return _combine(perm.canonical_folder_path, "approved_folder", Path(perm.canonical_folder_path).name)
-        # 4. Natural-language token mention of alias or registered project
-        lowered = f" {key} "
-        tokens = set(re.findall(r"[a-z0-9_.-]+", key))
-        best: tuple[int, dict[str, Any]] | None = None
-        for a in aliases:
-            if len(a.alias) >= 2 and (f" {a.alias} " in lowered or a.alias in tokens):
-                cand = _combine(a.folder_path, "project_alias", a.display_name or a.alias)
-                if cand and (best is None or len(a.alias) > best[0]):
-                    best = (len(a.alias), cand)
-        for p in projects:
-            pk = self._normalize_alias_key(p.name)
-            if len(pk) >= 2 and (f" {pk} " in lowered or pk in tokens):
-                cand = _combine(p.root_path, "registered_project", p.name)
-                if cand and (best is None or len(pk) > best[0]):
-                    best = (len(pk), cand)
+            sc = self._score_project_match(p.name, p.root_path, mention, full_tokens)
+            if sc > 0:
+                hit = _make_hit(p.root_path, "registered_project", p.name, sc)
+                if hit:
+                    proj_hits.append(hit)
+        picked = _pick_from_hits(proj_hits)
+        if picked:
+            return picked
+
+        # Step 3: Previously approved & accessible project roots (session/persistent only; never 'once')
+        std_home_names = {"documents", "downloads", "desktop", "pictures"}
+        perm_hits: list[dict[str, Any]] = []
         for perm in perms:
             if perm.scope not in ("persistent", "session"):
                 continue
             bname = Path(perm.canonical_folder_path).name
-            bk = self._normalize_alias_key(bname)
-            if len(bk) >= 3 and (f" {bk} " in lowered or bk in tokens):
-                cand = _combine(perm.canonical_folder_path, "approved_folder", bname)
-                if cand and (best is None or len(bk) > best[0]):
-                    best = (len(bk), cand)
-        return best[1] if best else None
+            if bname.lower() in std_home_names and mention.lower() not in std_home_names:
+                continue
+            sc = self._score_project_match(bname, perm.canonical_folder_path, mention, full_tokens)
+            if sc > 0:
+                hit = _make_hit(perm.canonical_folder_path, "approved_folder", bname, sc)
+                if hit:
+                    perm_hits.append(hit)
+        picked = _pick_from_hits(perm_hits)
+        if picked:
+            return picked
+
+        # Step 4: Search within explicitly configured workspace roots (shallow, bounded, safe)
+        ws_roots: list[Path] = []
+        notes_root = str(self.settings.notes_path)
+        raw_low = raw.lower()
+        for raw_ws in list(getattr(self.settings.filesystem, "workspace_roots", []) or []) + list(
+            getattr(self.settings.filesystem, "allowed_roots", []) or []
+        ):
+            try:
+                ws_res, _ = self._screen_target_security(raw_ws, "list_directory")
+            except FilesystemSecurityError:
+                continue
+            if str(ws_res).lower() == notes_root.lower() and "note" not in raw_low:
+                continue
+            if ws_res.exists() and ws_res.is_dir() and ws_res not in ws_roots:
+                ws_roots.append(ws_res)
+
+        ws_hits: list[dict[str, Any]] = []
+        if ws_roots and (mention or full_tokens):
+            skip_names = set(getattr(self.settings.filesystem, "excluded_dirs", []) or []) | {".git", "node_modules", "__pycache__", ".venv", "venv"}
+            for ws_root in ws_roots:
+                # Check direct children and depth-2 children cleanly
+                lvl1: list[Path] = []
+                try:
+                    for child in ws_root.iterdir():
+                        if not child.is_dir() or child.name in skip_names or child.name.startswith("."):
+                            continue
+                        if _has_reparse_or_symlink(child) or _detect_sensitive_path(child):
+                            continue
+                        lvl1.append(child)
+                        sc = self._score_project_match(child.name, str(child), mention, full_tokens)
+                        if sc > 0:
+                            hit = _make_hit(str(child), "workspace_root", child.name, sc)
+                            if hit:
+                                ws_hits.append(hit)
+                except OSError:
+                    continue
+                for sub_parent in lvl1[:40]:
+                    try:
+                        for grand in sub_parent.iterdir():
+                            if not grand.is_dir() or grand.name in skip_names or grand.name.startswith("."):
+                                continue
+                            if _has_reparse_or_symlink(grand) or _detect_sensitive_path(grand):
+                                continue
+                            sc = self._score_project_match(grand.name, str(grand), mention, full_tokens)
+                            if sc > 0:
+                                hit = _make_hit(str(grand), "workspace_root", grand.name, max(1, sc - 5))
+                                if hit:
+                                    ws_hits.append(hit)
+                    except OSError:
+                        continue
+        picked = _pick_from_hits(ws_hits)
+        if picked:
+            return picked
+
+        # Step 5: Contextual follow-up reuse of active_root ONLY when query references prior project or lacks an unknown named project
+        if active_root and (info["contextual"] or (not mention and (info["sub_item"] or requested_filename))):
+            hit = _make_hit(active_root, "active_context", Path(active_root).name, 80)
+            if hit:
+                return hit
+
+        return {"matched": False, "ambiguous": False, "candidates": [], "query_name": mention or raw}
+
+    async def resolve_alias(self, target_or_query: str) -> dict[str, Any] | None:
+        """Resolve an alias name, registered project name, approved folder, or configured workspace project (with optional subpath)."""
+        res = await self.resolve_project_target(target_or_query)
+        if res.get("matched"):
+            return {
+                "source": res["source"],
+                "alias": res["alias"],
+                "root_path": res["root_path"],
+                "resolved_path": res["resolved_path"],
+            }
+        return None
 
     # ---------------- Serializers ----------------
 
@@ -1586,19 +1827,23 @@ class FilesystemAccessManager:
 
     @staticmethod
     def _request_to_dict(row: FilesystemPermissionRequestRow) -> dict[str, Any]:
+        deferred = dict(row.deferred_action or {})
+        req_ops = list(row.requested_operations or [])
         return {
             "request_id": row.request_id,
             "task_id": row.task_id,
             "requested_path": row.requested_path,
             "canonical_path": row.canonical_path,
-            "requested_operations": list(row.requested_operations or []),
+            "exact_target_path": str(deferred.get("target") or row.requested_path or row.canonical_path),
+            "requested_operation": str(deferred.get("operation") or (req_ops[0] if req_ops else "")),
+            "requested_operations": req_ops,
             "not_requested_operations": list(row.not_requested_operations or []),
             "sensitive_flags": list(row.sensitive_flags or []),
             "reason": row.reason,
             "access_duration": row.access_duration,
             "status": row.status,
             "permission_id": row.permission_id,
-            "deferred_action": dict(row.deferred_action or {}),
+            "deferred_action": deferred,
             "decided_by": row.decided_by,
             "created_at": row.created_at,
             "expires_at": row.expires_at,

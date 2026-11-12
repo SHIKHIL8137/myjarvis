@@ -205,6 +205,7 @@ class FsPolicyUpdateIn(BaseModel):
     max_read_bytes: int | None = Field(None, ge=10_000, le=5_000_000)
     max_file_bytes: int | None = Field(None, ge=10_000, le=5_000_000)
     allowed_extensions: list[str] | None = None
+    workspace_roots: list[str] | None = None
 
 
 class FsAliasCreateIn(BaseModel):

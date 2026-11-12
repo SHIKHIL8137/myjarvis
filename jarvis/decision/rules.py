@@ -28,10 +28,12 @@ WEB_RESEARCH_RE = re.compile(
 )
 FILESYSTEM_OPS_RE = re.compile(
     r"\b(?:(?:list|show|find|search|inspect|read|open|create|write|edit|save|delete)\s+"
-    r"(?:(?:[A-Za-z0-9_-]+\s+){0,3})?"
-    r"(?:files?|folders?|directories|workspace\s+files?|pdf\s+documents?|documents?|downloads?|desktop|reports?\b)|"
-    r"(?:list|show|find|search|inspect|read|open|create|write|edit|save|delete)\b[^\n]{0,60}"
-    r"(?:my\s+|the\s+)?(?:documents|downloads|desktop|pictures|folder|directory)\b|"
+    r"(?:(?:[A-Za-z0-9_.-]+\s+){0,4})?"
+    r"(?:files?|folders?|directories|projects?|workspace\s+files?|pdf\s+documents?|documents?|downloads?|desktop|reports?\b)|"
+    r"(?:list|show|find|search|inspect|read|open|create|write|edit|save|delete)\b[^\n]{0,70}"
+    r"(?:my\s+|the\s+|that\s+|this\s+)?(?:documents|downloads|desktop|pictures|folder|directory|project)\b|"
+    r"\b(?:read|open|show|inspect|check)\s+(?:its\s+|the\s+)?[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,8}\b[^\n]{0,40}\b(?:in|inside|from)?|"
+    r"\b(?:folder|directory)\s+structure\b|"
     r"what\s+files\s+are\s+in\b|[A-Za-z]:\\|\\\\[A-Za-z0-9_.-]+\\)",
     re.I,
 )
@@ -40,7 +42,11 @@ TASK_STATUS_RE = re.compile(
     re.I,
 )
 HOST_FOLDER_TARGET_RE = re.compile(
-    r"(?:[A-Za-z]:\\|\\\\[^\s]+|\b(?:my\s+|the\s+)?(?:documents|downloads|desktop|pictures|folder|directory)\b)",
+    r"(?:[A-Za-z]:\\|\\\\[^\s]+|"
+    r"\b(?:my\s+|the\s+|that\s+|this\s+|installed\s+)?(?:documents|downloads|desktop|pictures|folder|directory|project)\b|"
+    r"\b(?:folder|directory)\s+structure\b|"
+    r"\b(?:in|inside|of)\s+(?:that|this|the)\s+(?:project|folder|directory)\b|"
+    r"\bits\s+[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,8}\b)",
     re.I,
 )
 MEMORY_MANAGE_RE = re.compile(

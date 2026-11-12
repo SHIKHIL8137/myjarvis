@@ -626,10 +626,10 @@ async def route_intent(a, text: str) -> dict | None:
         return _res("search_history", f"Found {len(hits)} past turns: {snippets}", history_hits=hits)
 
     # Filesystem & action execution commands
-    # Host directories / explicit OS paths route through DecisionEngine + P10.20 FilesystemAccessManager
+    # Host directories / project folders / explicit OS paths route through DecisionEngine + P10.20 FilesystemAccessManager
     _host_fs_cue = bool(
         re.search(
-            r"(?:[A-Za-z]:\\|\\\\[^\s]+|\b(?:documents|downloads|desktop|pictures|pdf\s+documents?|folder|directory)\b|\.\.)",
+            r"(?:[A-Za-z]:\\|\\\\[^\s]+|\b(?:documents|downloads|desktop|pictures|pdf\s+documents?|folder|directory|project|projects|workspace)\b|\.\.)",
             text or "",
             re.I,
         )

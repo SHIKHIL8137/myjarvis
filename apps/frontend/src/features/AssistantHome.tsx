@@ -18,11 +18,14 @@ export interface FsPermissionRequest {
   task_id?: string | null;
   requested_path: string;
   canonical_path: string;
+  exact_target_path?: string;
+  requested_operation?: string;
   requested_operations: string[];
   not_requested_operations: string[];
   sensitive_flags: string[];
   reason: string;
   access_duration?: string;
+  granted_scope?: string;
   status: string;
   permission_id?: string | null;
 }
@@ -307,12 +310,17 @@ export const AssistantHome: React.FC<AssistantHomeProps> = ({
       } else if (ev.type === "assistant_message" && ev.text) {
         const reqId = ev.request_id ? String(ev.request_id) : undefined;
         const apTok = ev.approval_token ? String(ev.approval_token) : undefined;
+        const execFailed = ev.execution_ok === false || (ev.task as AssistantTaskItem | undefined)?.status === "failed";
         setFeed((prev) => {
           const next = prev.map((m) => {
             if (reqId && m.permissionRequest?.request_id === reqId) {
               return {
                 ...m,
-                permissionRequest: { ...m.permissionRequest, status: ev.granted ? "approved" : "denied" },
+                permissionRequest: {
+                  ...m.permissionRequest,
+                  status: ev.granted ? "approved" : "denied",
+                  granted_scope: ev.scope ? String(ev.scope) : m.permissionRequest.granted_scope,
+                },
               };
             }
             if (apTok && m.approvalRequest?.token === apTok) {
@@ -333,6 +341,7 @@ export const AssistantHome: React.FC<AssistantHomeProps> = ({
               id: `asst-msg-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
               role: "assistant",
               text: String(ev.text),
+              error: execFailed ? String(ev.error || ev.text) : undefined,
               paths: Array.isArray(ev.paths) ? (ev.paths as string[]) : [],
               task: (ev.task as AssistantTaskItem) || null,
               resolvedForRequestId: reqId,
@@ -361,14 +370,19 @@ export const AssistantHome: React.FC<AssistantHomeProps> = ({
     try {
       const res = await apiFetch<{
         granted: boolean;
+        execution_ok?: boolean;
+        error?: string;
         reply?: string;
         paths?: string[];
         task?: AssistantTaskItem | null;
         request?: FsPermissionRequest;
+        permission?: { scope?: string };
       }>(`/v2/filesystem/requests/${requestId}/decide`, {
         method: "POST",
         body: { decision, decided_by: "owner", execute_deferred: true },
       });
+      const scopeLabel = res.permission?.scope || (decision === "allow_once" ? "once" : decision === "allow_session" ? "session" : decision === "always_read_only" ? "persistent" : undefined);
+      const execFailed = res.granted && (res.execution_ok === false || res.task?.status === "failed");
       setFeed((prev) => {
         const updated = prev.map((m) =>
           m.permissionRequest?.request_id === requestId
@@ -377,15 +391,18 @@ export const AssistantHome: React.FC<AssistantHomeProps> = ({
                 permissionRequest: {
                   ...(res.request || m.permissionRequest),
                   status: res.granted ? "approved" : "denied",
+                  granted_scope: scopeLabel || m.permissionRequest?.granted_scope,
                 },
+                task: res.task || m.task,
               }
             : m
         );
-        if (res.reply && !updated.some((m) => m.resolvedForRequestId === requestId)) {
+        if ((res.reply || res.error) && !updated.some((m) => m.resolvedForRequestId === requestId)) {
           updated.push({
             id: `fs-res-${requestId}`,
             role: "assistant",
-            text: res.reply,
+            text: res.reply || res.error || "",
+            error: execFailed ? (res.error || res.reply || "Execution failed after permission grant.") : undefined,
             paths: res.paths || [],
             task: res.task || null,
             resolvedForRequestId: requestId,
@@ -396,7 +413,11 @@ export const AssistantHome: React.FC<AssistantHomeProps> = ({
       if (res.task) {
         setTasks((prev) => [res.task!, ...prev.filter((t) => t.task_id !== res.task!.task_id)]);
       }
-      onNotify(res.granted ? `Access granted (${decision.replace(/_/g, " ")})` : "Access denied");
+      if (execFailed) {
+        onNotify(`Permission granted (${scopeLabel || decision}), but task execution failed.`);
+      } else {
+        onNotify(res.granted ? `Access granted (${scopeLabel || decision.replace(/_/g, " ")})` : "Access denied");
+      }
     } catch (e) {
       onNotify((e as Error).message);
     } finally {
@@ -854,10 +875,27 @@ export const AssistantHome: React.FC<AssistantHomeProps> = ({
                           <div className="row between wrap">
                             <span className={`pill ${pr.status === "approved" ? "ok" : pr.status === "denied" ? "danger" : "warn"}`}>
                               Filesystem Permission · {pr.status}
+                              {pr.granted_scope
+                                ? ` · ${
+                                    pr.granted_scope === "once"
+                                      ? "Once (this task)"
+                                      : pr.granted_scope === "session"
+                                        ? "Session"
+                                        : pr.granted_scope === "persistent"
+                                          ? "Persistent (read-only)"
+                                          : pr.granted_scope
+                                  }`
+                                : ""}
                             </span>
                             <span className="mono dim">id: {pr.request_id.slice(0, 8)}</span>
                           </div>
-                          <div className="perm-path-box mono">{pr.canonical_path}</div>
+                          <div className="dim" style={{ fontSize: 12, marginTop: 4 }}>
+                            Requested operation:{" "}
+                            <span className="mono">{pr.requested_operation || pr.requested_operations[0] || "read_metadata"}</span>
+                          </div>
+                          <div className="perm-path-box mono" title="Exact resolved path">
+                            {pr.exact_target_path || pr.canonical_path}
+                          </div>
                           <div className="perm-ops-grid">
                             <div>
                               <small className="dim">Requested permissions</small>
@@ -868,9 +906,9 @@ export const AssistantHome: React.FC<AssistantHomeProps> = ({
                               </div>
                             </div>
                             <div>
-                              <small className="dim">NOT requested (stays blocked)</small>
+                              <small className="dim">Permissions not requested (stays blocked)</small>
                               <div className="row wrap">
-                                {(pr.not_requested_operations || []).slice(0, 5).map((op) => (
+                                {(pr.not_requested_operations || []).map((op) => (
                                   <span key={op} className="pill">{op}</span>
                                 ))}
                               </div>
@@ -882,38 +920,43 @@ export const AssistantHome: React.FC<AssistantHomeProps> = ({
                             </div>
                           )}
                           {pr.status === "pending" && (
-                            <div className="row wrap perm-actions">
-                              <button
-                                className="ok"
-                                disabled={decidingId === pr.request_id}
-                                onClick={() => decideFsPermission(pr.request_id, "allow_once")}
-                              >
-                                Allow once
-                              </button>
-                              <button
-                                className="active"
-                                disabled={decidingId === pr.request_id}
-                                onClick={() => decideFsPermission(pr.request_id, "allow_session")}
-                              >
-                                Allow for this session
-                              </button>
-                              {canAlwaysReadOnly && (
+                            <>
+                              <div className="dim" style={{ fontSize: 11.5, marginTop: 4 }}>
+                                Approval scope: Once (this task) · Session · Persistent (read-only)
+                              </div>
+                              <div className="row wrap perm-actions">
                                 <button
-                                  className="ghost"
+                                  className="ok"
                                   disabled={decidingId === pr.request_id}
-                                  onClick={() => decideFsPermission(pr.request_id, "always_read_only")}
+                                  onClick={() => decideFsPermission(pr.request_id, "allow_once")}
                                 >
-                                  Always allow (read-only)
+                                  Allow once (this task)
                                 </button>
-                              )}
-                              <button
-                                className="danger"
-                                disabled={decidingId === pr.request_id}
-                                onClick={() => decideFsPermission(pr.request_id, "deny")}
-                              >
-                                Deny
-                              </button>
-                            </div>
+                                <button
+                                  className="active"
+                                  disabled={decidingId === pr.request_id}
+                                  onClick={() => decideFsPermission(pr.request_id, "allow_session")}
+                                >
+                                  Allow for this session
+                                </button>
+                                {canAlwaysReadOnly && (
+                                  <button
+                                    className="ghost"
+                                    disabled={decidingId === pr.request_id}
+                                    onClick={() => decideFsPermission(pr.request_id, "always_read_only")}
+                                  >
+                                    Always allow (persistent read-only)
+                                  </button>
+                                )}
+                                <button
+                                  className="danger"
+                                  disabled={decidingId === pr.request_id}
+                                  onClick={() => decideFsPermission(pr.request_id, "deny")}
+                                >
+                                  Deny
+                                </button>
+                              </div>
+                            </>
                           )}
                         </div>
                       )}
