@@ -29,6 +29,8 @@ from ..skills.router import AgentCapabilityRouter
 from .approvals import ApprovalService
 from .assistant_graph import build_assistant_graph
 from .checkpointer import DBBackedCheckpointSaver
+from .research import DeepResearchEngine, run_deep_research_background_task
+from .task_runner import BackgroundTaskRunner
 from .tasks import AssistantTaskService
 from .workforce_graph import build_workforce_graph
 
@@ -60,6 +62,7 @@ class AgentOrchestrator:
             workspace_baseline_roots=[settings.notes_dir],
         )
         self.tasks = AssistantTaskService(self.db, event_publisher=self.bus.publish)
+        self.task_runner = BackgroundTaskRunner(self.tasks)
         self.projects = ProjectRegistryService(self.db)
         self.workforce = DevWorkforceService(self.db, self.projects)
         self.documents = DocumentService(self.data_dir / "outputs" / "documents")
@@ -109,6 +112,29 @@ class AgentOrchestrator:
             capability_router=self.capability_router,
             checkpointer=self.checkpointer,
         )
+        self.research_engine = DeepResearchEngine(
+            data_dir=self.data_dir,
+            search_service=None,
+            knowledge_pipeline=None,
+            document_service=self.documents,
+            online_allowed_fn=lambda: bool(self.settings.internet.enabled and not self.settings.offline_enforced),
+        )
+        # Re-compile assistant_graph with isolated deep_research engine and register durable worker handler.
+        self._assistant_graph = build_assistant_graph(
+            memory=self.memory,
+            docs=self.documents,
+            reminders=self.reminders,
+            email_service=self.email,
+            approvals=self.approvals,
+            online_allowed_fn=lambda: bool(self.settings.internet.enabled and not self.settings.offline_enforced),
+            capability_router=self.capability_router,
+            deep_research=self.research_engine,
+            checkpointer=self.checkpointer,
+        )
+        self.task_runner.register_handler(
+            "deep_research",
+            lambda ctx, t: run_deep_research_background_task(ctx, t, engine=self.research_engine),
+        )
         self._workforce_graph = build_workforce_graph(
             projects=self.projects,
             workforce=self.workforce,
@@ -124,6 +150,24 @@ class AgentOrchestrator:
             opencode_bin=settings.workforce.opencode_bin,
             checkpointer=self.checkpointer,
         )
+
+    def attach_research_deps(
+        self,
+        *,
+        search_service=None,
+        knowledge_pipeline=None,
+        online_allowed_fn=None,
+        synthesizer_fn=None,
+    ) -> None:
+        """Bind web search & knowledge index dependencies to DeepResearchEngine (never personal memory)."""
+        if search_service is not None:
+            self.research_engine.search_service = search_service
+        if knowledge_pipeline is not None:
+            self.research_engine.knowledge_pipeline = knowledge_pipeline
+        if online_allowed_fn is not None:
+            self.research_engine.online_allowed_fn = online_allowed_fn
+        if synthesizer_fn is not None:
+            self.research_engine.synthesizer_fn = synthesizer_fn
 
     def is_run_cancelled(self, run_id: str) -> tuple[bool, str]:
         with self._orch_lock:

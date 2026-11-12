@@ -194,11 +194,22 @@ class Assistant:
         self.warm_status = {"stt": False, "tts": False, "brain": False}
         self.orchestrator = AgentOrchestrator(settings, bus=self.bus, brain=self.brain, data_dir=self.data_dir)
         self.knowledge.vector_store = self.orchestrator.memory.vectors
+        self.orchestrator.attach_research_deps(
+            search_service=self.search,
+            knowledge_pipeline=self.knowledge,
+            online_allowed_fn=online_fn,
+        )
 
     # ---- lifecycle -----------------------------------------------------------------------------------
     async def start(self):
         self.loop = asyncio.get_running_loop()
         self.bus.loop = self.loop
+        try:
+            recovery = await self.orchestrator.task_runner.start()
+            if any(recovery.values()):
+                self.bus.publish({"type": "task_recovery_boot", "report": recovery})
+        except Exception as e:
+            log.warning("Background task runner startup recovery skipped: %s", e)
         threading.Thread(target=self._warm_speech, name="warm-speech", daemon=True).start()
         self._spawn(self._watch_notes())
         self._spawn(self._watch_knowledge())
@@ -245,6 +256,10 @@ class Assistant:
     async def stop(self):
         self.voice.disable()
         self.speaker.stop()
+        try:
+            await self.orchestrator.task_runner.stop()
+        except Exception:
+            pass
         for t in self._bg:
             t.cancel()
         await self.brain.client.aclose()
@@ -693,7 +708,9 @@ class Assistant:
         return rollback_active_model(self.registry, target_version_id=target_version_id, audit_log=self.learning_audit)
 
     async def _execute_tool(self, call: dict) -> tuple[str, list[dict]]:
-        """Execute ONLY approved backend web tools; never shell, Python, or unapproved URLs."""
+        """Execute ONLY approved backend web tools; wrap untrusted results strictly before returning to LLM."""
+        from jarvis.security.untrusted import UNTRUSTED_DATA_POLICY, wrap_untrusted
+
         name = call.get("name", "")
         args = call.get("arguments") or {}
         if name == "web_search":
@@ -703,14 +720,48 @@ class Assistant:
             try:
                 res = await self.search.search(query)
                 results = res["results"]
-                return json.dumps({"query": res["query"], "provider": res["provider"], "results": results}, ensure_ascii=False), results
+                wrapped_items = [
+                    wrap_untrusted(
+                        r.get("snippet") or r.get("content") or "",
+                        source_type="web_search",
+                        source_id=f"search-{idx}",
+                        url=str(r.get("url") or ""),
+                        title=str(r.get("title") or ""),
+                    )
+                    for idx, r in enumerate(results, 1)
+                ]
+                payload = {
+                    "policy": UNTRUSTED_DATA_POLICY,
+                    "query": res["query"],
+                    "provider": res["provider"],
+                    "untrusted_results": wrapped_items,
+                    "results": results,
+                }
+                return json.dumps(payload, ensure_ascii=False), results
             except SearchError as e:
                 return json.dumps({"error": str(e)}, ensure_ascii=False), []
         if name == "fetch_webpage":
             url = str(args.get("url") or "").strip()
             try:
                 page = await self.search.fetch_page(url)
-                return json.dumps(page, ensure_ascii=False), [{"title": page["title"], "url": page["url"], "snippet": page["content"][:220], "provider": "webpage"}]
+                wrapped_content = wrap_untrusted(
+                    page.get("content", ""),
+                    source_type="web_page",
+                    source_id=page.get("sha256", "")[:12] or "webpage",
+                    url=str(page.get("url") or url),
+                    title=str(page.get("title") or ""),
+                    sha256=str(page.get("sha256") or ""),
+                )
+                payload = {
+                    "policy": UNTRUSTED_DATA_POLICY,
+                    "url": page["url"],
+                    "title": page["title"],
+                    "sha256": page.get("sha256", ""),
+                    "untrusted_content": wrapped_content,
+                }
+                return json.dumps(payload, ensure_ascii=False), [
+                    {"title": page["title"], "url": page["url"], "snippet": page["content"][:220], "provider": "webpage"}
+                ]
             except SearchError as e:
                 return json.dumps({"error": str(e)}, ensure_ascii=False), []
         return json.dumps({"error": f"tool {name!r} is not permitted"}), []
@@ -1265,8 +1316,8 @@ class Assistant:
             self._set_os_state("Delegating", source=source, detail=plan.agent_role)
             self._set_os_state("Executing", source=source, detail="document_export")
             fmt_raw = str((plan.decision.command_payload or {}).get("format") or "pdf").lower()
-            fmt_map = {"word": "docx", "powerpoint": "pptx", "excel": "xlsx", "spreadsheet": "xlsx"}
-            fmt = fmt_map.get(fmt_raw, fmt_raw if fmt_raw in {"pdf", "docx", "pptx", "xlsx"} else "pdf")
+            fmt_map = {"word": "docx", "powerpoint": "pptx", "excel": "xlsx", "spreadsheet": "xlsx", "markdown": "md"}
+            fmt = fmt_map.get(fmt_raw, fmt_raw if fmt_raw in {"pdf", "docx", "pptx", "xlsx", "md"} else "pdf")
             wf_payload = {"format": fmt, "title": text[:80], "sections": [{"heading": "Summary", "body": text}]}
             t_start = time.perf_counter()
             graph_live.tool_invoked(self, "doc_export", query=text[:80])
@@ -1558,6 +1609,41 @@ class Assistant:
                 f"{latest_txt} Production restores remain strictly gated by owner approval."
             )
             return {"command": "recovery_ops", "reply": reply, "paths": [], "manifests": manifests, "targets": targets, "ok": True}
+
+        if intent == "web_research" and re.search(
+            r"\b(?:deep\s+research|deep\s+dive|comprehensive\s+research|verified\s+report)\b",
+            text,
+            re.I,
+        ):
+            self._set_os_state("Delegating", source=source, detail="deep_research")
+            self._set_os_state("Executing", source=source, detail="deep_research")
+            t_start = time.perf_counter()
+            graph_live.tool_invoked(self, "deep_research", query=text[:80])
+            res = await self.orchestrator.research_engine.run(
+                task_id=task_id or f"dr-{int(time.time())}",
+                question=text,
+                export_format="md",
+            )
+            dur_ms = (time.perf_counter() - t_start) * 1000.0
+            graph_live.tool_used(self, "deep_research", query=text[:80], ok=bool(res.get("ok")), duration_ms=dur_ms)
+            if task_id:
+                await self.orchestrator.tasks.update_task(
+                    task_id,
+                    status="completed",
+                    append_tool="deep_research",
+                    generated_files=res.get("generated_files") or [],
+                    result=res.get("markdown") or res.get("summary") or "",
+                    current_step="Verified deep research report ready",
+                )
+            return {
+                "command": "deep_research",
+                "reply": str(res.get("markdown") or res.get("summary") or "Deep research finished."),
+                "paths": list(res.get("generated_files") or []),
+                "sources": res.get("sources") or [],
+                "verification": res.get("verification"),
+                "outcome": res.get("outcome"),
+                "ok": bool(res.get("ok")),
+            }
 
         if intent == "web_research" and not online:
             t_start = time.perf_counter()
@@ -1878,17 +1964,21 @@ class Assistant:
                             return
                     answer = out_buf[-1] if out_buf else ""
                 else:
-                    # Online Assisted Mode: try Ollama tool calling first (if enabled), with deterministic fallback
+                    # Online Assisted Mode: isolate pure web-research turns from private memory/notes to prevent untrusted mix/exfil.
+                    isolate_web = bool(
+                        plan.decision.intent in ("web_research", "research") or getattr(plan.decision, "needs_live_web", False)
+                    )
                     msgs = build_messages(
                         self.history.window(),
                         text,
-                        notes_ctx,
+                        [] if isolate_web else notes_ctx,
                         today,
                         online=True,
-                        memories=ctx_bundle["memories_ctx"] or None,
-                        history_hits=ctx_bundle["history_ctx"] or None,
+                        memories=None if isolate_web else (ctx_bundle["memories_ctx"] or None),
+                        history_hits=None if isolate_web else (ctx_bundle["history_ctx"] or None),
                         feedback_lessons=ctx_bundle["feedback_ctx"] or None,
                         knowledge_hits=ctx_bundle["knowledge_ctx"] or None,
+                        isolate_untrusted_context=isolate_web,
                     )
                     tools = _web_tools(self.settings.internet.allow_page_fetch) if self.settings.internet.tool_calling else None
                     answer, chunker = "", StreamingSpeechBuffer()
@@ -1961,27 +2051,29 @@ class Assistant:
                                 msgs = build_messages(
                                     self.history.window(),
                                     text,
-                                    notes_ctx,
+                                    [] if isolate_web else notes_ctx,
                                     today,
                                     online=True,
                                     web_results=web_sources,
-                                    memories=ctx_bundle["memories_ctx"] or None,
-                                    history_hits=ctx_bundle["history_ctx"] or None,
+                                    memories=None if isolate_web else (ctx_bundle["memories_ctx"] or None),
+                                    history_hits=None if isolate_web else (ctx_bundle["history_ctx"] or None),
                                     feedback_lessons=ctx_bundle["feedback_ctx"] or None,
                                     knowledge_hits=ctx_bundle["knowledge_ctx"] or None,
+                                    isolate_untrusted_context=isolate_web,
                                 )
                             except SearchError as e:
                                 msgs = build_messages(
                                     self.history.window(),
                                     text,
-                                    notes_ctx,
+                                    [] if isolate_web else notes_ctx,
                                     today,
                                     online=True,
                                     web_results=[{"title": "Web search error", "url": "", "snippet": str(e)}],
-                                    memories=ctx_bundle["memories_ctx"] or None,
-                                    history_hits=ctx_bundle["history_ctx"] or None,
+                                    memories=None if isolate_web else (ctx_bundle["memories_ctx"] or None),
+                                    history_hits=None if isolate_web else (ctx_bundle["history_ctx"] or None),
                                     feedback_lessons=ctx_bundle["feedback_ctx"] or None,
                                     knowledge_hits=ctx_bundle["knowledge_ctx"] or None,
+                                    isolate_untrusted_context=isolate_web,
                                 )
                             out_buf = []
                             async for ev in self._stream_llm_with_tts(msgs, speak=speak, cancel_event=eff_cancel, answer_out=out_buf):

@@ -104,7 +104,7 @@ const READ_OP_SET = new Set(["list_directory", "read_file", "search_files", "rea
 function taskTone(status: string): "ok" | "warn" | "danger" | "info" | "" {
   if (status === "completed") return "ok";
   if (status === "running" || status === "planning" || status === "queued") return "info";
-  if (status === "awaiting_permission" || status === "awaiting_approval" || status === "paused") return "warn";
+  if (status === "awaiting_permission" || status === "awaiting_approval" || status === "paused" || status === "waiting_quota") return "warn";
   if (status === "failed" || status === "cancelled") return "danger";
   return "";
 }
@@ -406,7 +406,7 @@ export const AssistantHome: React.FC<AssistantHomeProps> = ({
   };
 
   const activeTasks = tasks.filter((t) =>
-    ["queued", "planning", "awaiting_permission", "awaiting_approval", "running", "paused"].includes(t.status)
+    ["queued", "planning", "awaiting_permission", "awaiting_approval", "running", "paused", "waiting_quota"].includes(t.status)
   );
   const currentModel = status?.brain?.model || "local";
   const currentProvider = status?.brain?.provider || "ollama";
@@ -589,12 +589,15 @@ export const AssistantHome: React.FC<AssistantHomeProps> = ({
                     <div className="row between wrap">
                       <span className={`pill ${taskTone(t.status)}`}>{t.status}</span>
                       <span className="mono dim">{t.intent} · {t.source} · {fmtTime(t.created_at)}</span>
-                      {["queued", "planning", "awaiting_permission", "awaiting_approval", "running"].includes(t.status) && (
+                      {["queued", "planning", "awaiting_permission", "awaiting_approval", "running", "paused", "waiting_quota"].includes(t.status) && (
                         <button className="danger" onClick={() => cancelTask(t.task_id)}>Cancel</button>
                       )}
                     </div>
                     <div className="task-req">{t.user_request}</div>
                     {t.current_step && <div className="dim" style={{ fontSize: 11.5 }}>{t.current_step}</div>}
+                    {(t as { quota_reason?: string }).quota_reason && (
+                      <div className="dim" style={{ fontSize: 11 }}>Quota: {(t as { quota_reason?: string }).quota_reason}</div>
+                    )}
                     {t.plan?.length > 0 && (
                       <ol className="task-plan-steps">
                         {t.plan.map((st, idx) => <li key={idx}>{st}</li>)}

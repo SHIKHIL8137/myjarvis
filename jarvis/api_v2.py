@@ -88,10 +88,16 @@ class CancelRunIn(BaseModel):
 
 
 class DocGenerateIn(BaseModel):
-    format: str = Field(..., pattern="^(pdf|docx|word|pptx|powerpoint|slides|xlsx|excel|spreadsheet)$")
+    format: str = Field(..., pattern="^(pdf|docx|word|pptx|powerpoint|slides|xlsx|excel|spreadsheet|md|markdown)$")
     filename: str = Field(..., min_length=1, max_length=120)
     title: str = Field(..., min_length=1, max_length=200)
     payload: dict = Field(default_factory=dict)
+
+
+class TaskSteerIn(BaseModel):
+    instruction: str = Field(..., min_length=1, max_length=1000)
+    author: str = "owner"
+    resume_if_paused: bool = False
 
 
 class DocParseIn(BaseModel):
@@ -746,6 +752,60 @@ def create_v2_router(fallback=None) -> APIRouter:
             raise HTTPException(404, f"Task {task_id} not found")
         await a.orchestrator.fs_access.consume_task_once_permissions(task_id)
         return {"ok": True, "task": t}
+
+    @router.post("/tasks/{task_id}/steer")
+    async def steer_assistant_task(task_id: str, body: TaskSteerIn, a=Depends(get_a)):
+        try:
+            t = await a.orchestrator.tasks.append_steer(
+                task_id,
+                body.instruction,
+                author=body.author,
+                resume_if_paused=body.resume_if_paused,
+            )
+        except ValueError as e:
+            raise HTTPException(422, str(e)) from e
+        if t is None:
+            raise HTTPException(404, f"Task {task_id} not found")
+        a.orchestrator.task_runner.wake()
+        return {"ok": True, "task": t}
+
+    @router.post("/tasks/{task_id}/resume")
+    async def resume_assistant_task(task_id: str, a=Depends(get_a)):
+        t = await a.orchestrator.tasks.get_task(task_id)
+        if t is None:
+            raise HTTPException(404, f"Task {task_id} not found")
+        if t["status"] in ("awaiting_permission", "awaiting_approval"):
+            raise HTTPException(409, "Task requires explicit permission or approval decision before resuming")
+        if t["status"] not in ("paused", "waiting_quota", "queued"):
+            raise HTTPException(409, f"Task cannot be resumed from status '{t['status']}'")
+        updated = await a.orchestrator.tasks.update_task(
+            task_id,
+            status="queued",
+            current_step="Manually resumed by owner",
+            clear_not_before=True,
+            clear_claim=True,
+        )
+        a.orchestrator.task_runner.wake()
+        return {"ok": True, "task": updated}
+
+    @router.post("/research")
+    async def start_verified_deep_research(
+        body: AssistantRunIn,
+        run_now: bool = False,
+        a=Depends(get_a),
+    ):
+        task = await a.orchestrator.task_runner.enqueue(
+            body.goal,
+            worker_kind="deep_research",
+            intent="web_research",
+            source="api",
+            payload={"question": body.goal, **(body.payload or {})},
+            meta={"safe_resumable": True},
+        )
+        if run_now:
+            await a.orchestrator.task_runner.run_once()
+            task = await a.orchestrator.tasks.get_task(task["task_id"]) or task
+        return {"ok": True, "task": task}
 
     # ---- P10.20 Consolidated Settings & Secure Provider Gateway --------------------------------------
     @router.get("/settings")

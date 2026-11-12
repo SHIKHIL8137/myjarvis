@@ -8,7 +8,6 @@ from html import unescape
 from html.parser import HTMLParser
 import json
 import logging
-import re
 import threading
 import time
 from urllib import robotparser
@@ -142,7 +141,7 @@ def _unwrap_ddg_url(href: str) -> str:
     return href
 
 
-def extract_readable_text(html_bytes: bytes, charset: str = "utf-8", max_chars: int = 2500) -> tuple[str, str]:
+def extract_readable_text(html_bytes: bytes, charset: str = "utf-8", max_chars: int | None = 2500) -> tuple[str, str]:
     text_raw = html_bytes.decode(charset, errors="replace")
     parser = _TextExtractor()
     parser.feed(text_raw)
@@ -151,7 +150,7 @@ def extract_readable_text(html_bytes: bytes, charset: str = "utf-8", max_chars: 
     body = unescape("".join(parser.chunks))
     lines = [" ".join(ln.split()) for ln in body.splitlines()]
     cleaned = "\n".join(ln for ln in lines if ln)
-    if len(cleaned) > max_chars:
+    if max_chars is not None and max_chars > 0 and len(cleaned) > max_chars:
         cleaned = cleaned[:max_chars].rsplit(" ", 1)[0] + "…"
     return title, cleaned
 
@@ -518,12 +517,12 @@ class WebSearchService:
                 self._robots_cache[origin] = (now, rp)
         return rp.can_fetch("JarvisLocalAssistant", url)
 
-    async def fetch_page(self, url: str) -> dict:
+    async def fetch_page(self, url: str, *, max_chars: int | None = 2500) -> dict:
         self._require_online()
         if not self.spec.allow_page_fetch:
             raise SearchOfflineError("Website content retrieval is disabled in settings.")
         clean_url = (url or "").strip()
-        cache_key = ("page", clean_url)
+        cache_key = ("page", clean_url, max_chars)
         now = time.time()
         if self.spec.cache_ttl_s > 0:
             with self._lock:
@@ -554,14 +553,25 @@ class WebSearchService:
 
         ctype = resp.headers.get("content-type", "").lower()
         if "html" in ctype or not ctype:
-            title, content = extract_readable_text(resp.body)
+            title, content = extract_readable_text(resp.body, max_chars=max_chars)
         elif ctype.startswith("text/") or "json" in ctype:
             title = urlsplit(resp.url).hostname or resp.url
-            content = resp.body.decode("utf-8", errors="replace")[:2500]
+            decoded = resp.body.decode("utf-8", errors="replace")
+            content = decoded[:max_chars] if (max_chars is not None and max_chars > 0) else decoded
         else:
             raise SearchError(f"Unsupported content type for retrieval: {ctype}")
 
-        result = {"url": resp.url, "title": title or resp.url, "content": content, "cached": False}
+        import hashlib
+
+        digest = hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()
+        result = {
+            "url": resp.url,
+            "title": title or resp.url,
+            "content": content,
+            "sha256": digest,
+            "untrusted": True,
+            "cached": False,
+        }
         if self.spec.cache_ttl_s > 0:
             with self._lock:
                 self._cache[cache_key] = (time.time(), result)

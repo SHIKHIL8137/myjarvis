@@ -596,14 +596,22 @@ class KnowledgePipeline:
 
     @staticmethod
     def format_untrusted_knowledge(results: list[dict]) -> str:
-        """Render external knowledge chunks in strict inert XML-like delimiters so docs never act as system instructions."""
+        """Render external knowledge chunks in spoof-proof untrusted data delimiters so docs never act as system instructions."""
+        import secrets
+        from jarvis.security.untrusted import _escape_attr, sanitize_untrusted_text
+
         blocks: list[str] = []
         for r in results:
-            sid = str(r.get("source_id") or "")
-            trust = str(r.get("trust") or "external")
-            loc = str(r.get("location") or "")
+            sid = _escape_attr(r.get("source_id") or "", 120)
+            trust = _escape_attr(r.get("trust") or "external", 48)
+            loc = _escape_attr(r.get("location") or "", 320)
             txt = str(r.get("content") or "")
             if detect_poisoning(txt):
                 continue
-            blocks.append(f'<retrieved_knowledge source_id="{sid}" trust="{trust}" location="{loc}" untrusted_data="true">\n{txt}\n</retrieved_knowledge>')
+            nonce = secrets.token_hex(6)
+            clean_txt = sanitize_untrusted_text(txt)
+            blocks.append(
+                f'<retrieved_knowledge source_id="{sid}" trust="{trust}" location="{loc}" '
+                f'data-boundary="{nonce}" untrusted_data="true">\n{clean_txt}\n</retrieved_knowledge data-boundary="{nonce}">'
+            )
         return "\n".join(blocks)

@@ -480,7 +480,14 @@ def build_workforce_graph(
 
         wf_app = validate_transition(state.get("workflow_state"), WorkforceState.APPROVED)
         wf_merging = validate_transition(wf_app, WorkforceState.MERGING)
+        from jarvis.security.outcomes import verify_git_state
+
         mres = git_worktree.merge_worktree(root, state["branch_name"], wt, commit_msg=state["task_prompt"][:100])
+        merge_outcome = verify_git_state(
+            root,
+            tool_name="worktree_merge",
+            expect_head_changed_from=state.get("worktree_base_sha"),
+        )
         git_worktree.cleanup_worktree(root, wt, state.get("branch_name"), authorized_uncommitted=False, expected_task_id=state.get("run_id"))
         workforce.update_worktree_status(wt, "merged")
         wf_done = validate_transition(wf_merging, WorkforceState.COMPLETED)
@@ -491,9 +498,14 @@ def build_workforce_graph(
         return {
             "approved": True,
             "merge_result": mres,
+            "merge_outcome": merge_outcome.to_dict(),
             "workflow_state": wf_done,
-            "status": "completed",
-            "summary": f"Verified, merged {state['branch_name']}, and cleaned worktree.",
+            "status": "completed" if merge_outcome.ok else merge_outcome.status,
+            "summary": (
+                f"Verified, merged {state['branch_name']}, and cleaned worktree."
+                if merge_outcome.ok
+                else f"Merged {state['branch_name']}, post-condition status: {merge_outcome.format_for_assistant()}"
+            ),
         }
 
     def extract_lesson(state: WorkforceGraphState) -> dict:

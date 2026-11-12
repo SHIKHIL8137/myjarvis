@@ -34,13 +34,17 @@ def build_assistant_graph(
     approvals: ApprovalService,
     online_allowed_fn,
     capability_router=None,
+    deep_research=None,
     checkpointer=None,
 ):
     def gather_context(state: AssistantGraphState) -> dict:
         goal = state.get("goal", "")
         kind = state.get("task_kind", "research")
-        personal = memory.search_personal_memory(goal, k=3)
-        exp = memory.search_experience(goal, scope="assistant", k=2)
+        payload = state.get("payload") or {}
+        # Strict privacy isolation: never leak personal memory into web/deep research prompts.
+        isolate_web = kind == "deep_research" or (kind == "research" and (bool(payload.get("deep_research")) or bool(online_allowed_fn())))
+        personal = [] if isolate_web else memory.search_personal_memory(goal, k=3)
+        exp = [] if isolate_web else memory.search_experience(goal, scope="assistant", k=2)
         sel_skills: list[dict] = []
         skill_block = ""
         if capability_router is not None:
@@ -120,6 +124,33 @@ def build_assistant_graph(
         return {"approved": True, "artifact": sent, "status": "completed", "summary": f"Email status: {sent['status']}."}
 
     def summarize(state: AssistantGraphState) -> dict:
+        kind = state.get("task_kind", "research")
+        payload = state.get("payload") or {}
+        if deep_research is not None and (kind == "deep_research" or bool(payload.get("deep_research"))):
+            import asyncio
+
+            run_id = state.get("run_id") or "research-graph"
+            fmt = payload.get("export_format", "md")
+            coro = deep_research.run(
+                task_id=str(run_id),
+                question=str(state.get("goal") or ""),
+                export_format=str(fmt) if payload.get("export_artifact", True) else None,
+            )
+            try:
+                asyncio.get_running_loop()
+                # If invoked inside an existing loop thread (rare), run on helper thread loop
+                import concurrent.futures
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    res = pool.submit(lambda: asyncio.run(coro)).result()
+            except RuntimeError:
+                res = asyncio.run(coro)
+            return {
+                "status": "completed",
+                "artifact": res,
+                "summary": res.get("summary") or f"Deep research completed ({len(res.get('sources') or [])} sources).",
+            }
+
         hits = state.get("context_hits") or []
         skills_used = [s.get("skill_id") for s in (state.get("selected_skills") or []) if s.get("skill_id")]
         note = f" Skills active: {', '.join(skills_used)}." if (skills_used and state.get("skill_prompt_block")) else ""

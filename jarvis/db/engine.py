@@ -38,6 +38,27 @@ _P10_COLUMN_DDLS: dict[str, list[tuple[str, str]]] = {
         ("expires_at", "FLOAT"),
         ("created_at", "FLOAT NOT NULL DEFAULT 0.0"),
     ],
+    "assistant_tasks": [
+        ("worker_kind", "VARCHAR(48) NOT NULL DEFAULT 'assistant'"),
+        ("attempts", "INTEGER NOT NULL DEFAULT 0"),
+        ("max_attempts", "INTEGER NOT NULL DEFAULT 3"),
+        ("not_before", "FLOAT"),
+        ("next_retry_at", "FLOAT"),
+        ("deadline_at", "FLOAT"),
+        ("step_budget", "INTEGER NOT NULL DEFAULT 20"),
+        ("steps_used", "INTEGER NOT NULL DEFAULT 0"),
+        ("token_budget", "INTEGER NOT NULL DEFAULT 120000"),
+        ("tokens_used", "INTEGER NOT NULL DEFAULT 0"),
+        ("tool_budget", "INTEGER NOT NULL DEFAULT 40"),
+        ("tools_used_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("quota_reason", "VARCHAR(200) NOT NULL DEFAULT ''"),
+        ("payload", "TEXT NOT NULL DEFAULT '{}'"),
+        ("checkpoint_json", "TEXT NOT NULL DEFAULT '{}'"),
+        ("steer_notes", "TEXT NOT NULL DEFAULT '[]'"),
+        ("completed_step_keys", "TEXT NOT NULL DEFAULT '[]'"),
+        ("claimed_by", "VARCHAR(64)"),
+        ("claimed_at", "FLOAT"),
+    ],
 }
 
 
@@ -83,7 +104,12 @@ def _reconcile_columns_sync(conn) -> None:
         for cname, ddl in cols:
             if cname in have:
                 continue
-            pg_ddl = ddl.replace("TEXT NOT NULL DEFAULT '{}'", "JSONB NOT NULL DEFAULT '{}'::jsonb") if (is_pg and cname == "meta") else ddl
+            pg_ddl = ddl
+            if is_pg:
+                if cname in ("meta", "payload", "checkpoint_json"):
+                    pg_ddl = ddl.replace("TEXT NOT NULL DEFAULT '{}'", "JSONB NOT NULL DEFAULT '{}'::jsonb")
+                elif cname in ("steer_notes", "completed_step_keys"):
+                    pg_ddl = ddl.replace("TEXT NOT NULL DEFAULT '[]'", "JSONB NOT NULL DEFAULT '[]'::jsonb")
             conn.execute(text(f"ALTER TABLE {tbl} ADD COLUMN {cname} {pg_ddl}"))
 
 

@@ -92,6 +92,44 @@ def parse_document(path: Path, *, max_chars: int = 24_000) -> dict:
     }
 
 
+def parse_document_untrusted(path: Path, *, max_chars: int = 24_000) -> dict:
+    """Parse document and attach a spoof-proof untrusted boundary block for safe LLM consumption."""
+    import hashlib
+    from jarvis.security.untrusted import wrap_untrusted
+
+    parsed = parse_document(path, max_chars=max_chars)
+    raw_txt = str(parsed.get("content") or "")
+    digest = hashlib.sha256(raw_txt.encode("utf-8", errors="replace")).hexdigest()
+    parsed["sha256"] = digest
+    parsed["untrusted_block"] = wrap_untrusted(
+        raw_txt,
+        source_type="parsed_document",
+        source_id=str(parsed.get("name") or ""),
+        title=str(parsed.get("name") or ""),
+        sha256=digest,
+        max_chars=max_chars,
+    )
+    return parsed
+
+
+def generate_markdown(output_path: Path, *, title: str, sections: list[dict], content: str | None = None) -> Path:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if content is not None and content.strip():
+        body = content
+    else:
+        parts: list[str] = [f"# {title or 'Document'}", ""]
+        for sec in sections:
+            h = str(sec.get("heading") or "").strip()
+            if h:
+                parts.extend([f"## {h}", ""])
+            b = str(sec.get("body") or "").strip()
+            if b:
+                parts.extend([b, ""])
+        body = "\n".join(parts).rstrip() + "\n"
+    output_path.write_text(body, encoding="utf-8")
+    return output_path
+
+
 def generate_pdf(output_path: Path, *, title: str, sections: list[dict]) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     doc = SimpleDocTemplate(str(output_path), pagesize=letter, title=title)
@@ -198,18 +236,54 @@ class DocumentService:
         return dest
 
     def generate(self, fmt: str, *, filename: str, title: str, payload: dict) -> dict:
+        from jarvis.security.outcomes import verify_document_generated
+
         kind = fmt.strip().lower()
         if kind == "pdf":
+            expected_fmt = "pdf"
             p = generate_pdf(self._safe_out(filename, ".pdf"), title=title, sections=payload.get("sections") or [{"body": payload.get("text", "")}])
         elif kind in ("docx", "word"):
+            expected_fmt = "docx"
             p = generate_docx(self._safe_out(filename, ".docx"), title=title, sections=payload.get("sections") or [{"body": payload.get("text", "")}])
         elif kind in ("pptx", "powerpoint", "slides"):
+            expected_fmt = "pptx"
             p = generate_pptx(self._safe_out(filename, ".pptx"), title=title, slides=payload.get("slides") or [{"title": title, "bullets": payload.get("bullets", [])}])
         elif kind in ("xlsx", "excel", "spreadsheet"):
+            expected_fmt = "xlsx"
             p = generate_xlsx(self._safe_out(filename, ".xlsx"), sheets=payload.get("sheets") or [{"name": "Data", "rows": payload.get("rows", [])}])
+        elif kind in ("md", "markdown"):
+            expected_fmt = "md"
+            p = generate_markdown(
+                self._safe_out(filename, ".md"),
+                title=title,
+                sections=payload.get("sections") or [{"body": payload.get("text", "")}],
+                content=payload.get("content") or payload.get("markdown"),
+            )
         else:
             raise ValueError(f"Unsupported export format: {fmt!r}")
-        return {"ok": True, "format": kind, "path": str(p), "name": p.name, "bytes": p.stat().st_size}
+
+        def _parse_for_verify(fp: Path) -> str:
+            parsed = parse_document(fp, max_chars=4096)
+            return str(parsed.get("content") or "")
+
+        outcome = verify_document_generated(
+            p,
+            fmt=expected_fmt,
+            tool_name=f"generate_{expected_fmt}",
+            expected_min_bytes=1,
+            parser=None if expected_fmt == "xlsx" else _parse_for_verify,
+        )
+        return {
+            "ok": outcome.ok,
+            "verified": outcome.verified,
+            "status": outcome.status,
+            "format": kind,
+            "path": str(p),
+            "name": p.name,
+            "bytes": p.stat().st_size if p.exists() else 0,
+            "sha256": outcome.evidence.get("sha256", ""),
+            "outcome": outcome.to_dict(),
+        }
 
     def list_generated(self) -> list[dict]:
         return [

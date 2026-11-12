@@ -245,25 +245,74 @@ class ActionExecutor:
         try:
             self.tasks.advance(task.id, 1, "running")
             res: dict
+            outcome = None
+            from jarvis.security.outcomes import (
+                ToolOutcome,
+                ToolStatus,
+                VerificationCheck,
+                sha256_file,
+                verify_file_created,
+                verify_file_deleted,
+                verify_file_modified,
+                verify_process_state,
+            )
+
             if action == "search_files":
                 res = {"matches": self.fs.search(**args)}
+                outcome = ToolOutcome(
+                    tool_name="search_files",
+                    status=ToolStatus.DONE.value,
+                    summary=f"Searched files ({len(res['matches'])} matches)",
+                    evidence={"match_count": len(res["matches"])},
+                    checks=[VerificationCheck("search_executed", True, f"matches={len(res['matches'])}").to_dict()],
+                )
             elif action == "read_file":
                 res = self.fs.read_document(args["path"], max_chars=int(args.get("max_chars", 8000)))
+                outcome = verify_file_created(res["path"], tool_name="read_file", min_bytes=0)
             elif action == "inspect_project":
                 res = self.fs.inspect_project(args.get("path"))
+                outcome = ToolOutcome(
+                    tool_name="inspect_project",
+                    status=ToolStatus.DONE.value,
+                    summary=f"Inspected {res['root']} ({res['total_files']} files)",
+                    target=res["root"],
+                    evidence={"total_files": res["total_files"]},
+                    checks=[VerificationCheck("root_inspected", True, str(res["root"])).to_dict()],
+                )
             elif action == "create_file":
                 res = self.fs.create_or_modify(args["path"], args.get("content", ""), overwrite=False)
+                outcome = verify_file_created(res["path"], tool_name="create_file", min_bytes=0)
             elif action == "modify_file":
+                target_fp = self.fs.resolve_safe(args["path"], must_exist=False)
+                prev_hash = sha256_file(target_fp) if target_fp.exists() and target_fp.is_file() else None
                 res = self.fs.create_or_modify(args["path"], args.get("content", ""), overwrite=True)
+                content_str = str(args.get("content", ""))
+                outcome = verify_file_modified(
+                    res["path"],
+                    tool_name="modify_file",
+                    previous_sha256=prev_hash,
+                    expected_substring=content_str[:80] if content_str else None,
+                )
             elif action == "move_file":
                 res = self.fs.move_file(args["src"], args["dst"])
+                dst_check = verify_file_created(res["to"], tool_name="move_file", min_bytes=0)
+                src_gone = verify_file_deleted(res["from"], tool_name="move_file_src")
+                outcome = dst_check if dst_check.ok and src_gone.ok else (dst_check if not dst_check.ok else src_gone)
             elif action == "delete_file":
                 res = self.fs.delete_file(args["path"])
+                outcome = verify_file_deleted(res["deleted"], tool_name="delete_file")
             elif action == "open_file":
                 fp = self.fs.resolve_safe(args["path"], must_exist=True)
                 if hasattr(os, "startfile"):
                     os.startfile(str(fp))  # noqa: S606 - validated against allowlisted roots
                 res = {"opened": str(fp)}
+                outcome = ToolOutcome(
+                    tool_name="open_file",
+                    status=ToolStatus.STARTED.value,
+                    summary=f"Dispatched {fp.name} to OS handler; window state not directly verifiable",
+                    target=str(fp),
+                    checks=[VerificationCheck("os_launch_dispatched", True, str(fp)).to_dict()],
+                )
             elif action == "open_app":
                 app_key = (args.get("app") or "").strip().lower()
                 if app_key not in self.spec.allowed_apps:
@@ -271,6 +320,7 @@ class ActionExecutor:
                 cmd = list(self.spec.allowed_apps[app_key])
                 proc = subprocess.Popen(cmd, shell=False)
                 res = {"launched": app_key, "pid": proc.pid}
+                outcome = verify_process_state(tool_name="open_app", pid=proc.pid, target=app_key, started_only=True)
             elif action == "run_command":
                 cmd_str = (args.get("command") or "").strip()
                 if not cmd_str or any(c in cmd_str for c in ("|", "&", ";", ">", "<", "`", "$(", "\n", "\r")):
@@ -280,11 +330,21 @@ class ActionExecutor:
                 argv = shlex.split(cmd_str, posix=(os.name != "nt"))
                 proc = subprocess.run(argv, cwd=str(self.fs.default_base), capture_output=True, text=True, timeout=20, shell=False)
                 res = {"returncode": proc.returncode, "stdout": proc.stdout[:4000], "stderr": proc.stderr[:2000]}
+                outcome = verify_process_state(tool_name="run_command", exit_code=proc.returncode, target=cmd_str)
             else:
                 raise ActionPermissionError(f"Unsupported action: {action!r}")
 
             self.tasks.advance(task.id, 2)
-            out = {"status": "completed", "ok": True, "action": action, "level": lvl.value, "task_id": task.id, "result": res}
+            out = {
+                "status": "completed" if (outcome is None or outcome.ok) else outcome.status,
+                "ok": bool(outcome.ok if outcome is not None else True),
+                "verified": bool(outcome.verified if outcome is not None else False),
+                "action": action,
+                "level": lvl.value,
+                "task_id": task.id,
+                "result": res,
+                "outcome": outcome.to_dict() if outcome is not None else None,
+            }
             if approval_token:
                 self.tasks.record_approval(task.id, {"token": approval_token, "status": "approved"})
             self.tasks.complete(task.id, res)
