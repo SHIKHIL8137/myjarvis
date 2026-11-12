@@ -50,17 +50,10 @@ interface VoiceDockProps extends ShellProps {
 const SPEAK_KEY = "jarvis.speak";
 let replySeq = 0;
 
-/** Encode float32 PCM samples (-1..1) into standard 16-bit mono WAV bytes for /api/voice/command. */
+/** Encode float32 PCM samples (-1..1) at native sampleRate into standard 16-bit mono WAV bytes (no aliasing decimation; backend applies bandlimited resampling). */
 function encodeWav16(samples: Float32Array, sampleRate: number): Blob {
-  const targetRate = 16000;
-  let pcm = samples;
-  if (sampleRate !== targetRate && sampleRate > targetRate) {
-    const ratio = sampleRate / targetRate;
-    const len = Math.floor(samples.length / ratio);
-    pcm = new Float32Array(len);
-    for (let i = 0; i < len; i++) pcm[i] = samples[Math.floor(i * ratio)];
-  }
-  const rate = sampleRate > targetRate ? targetRate : sampleRate;
+  const pcm = samples;
+  const rate = Math.max(8000, Math.round(sampleRate || 16000));
   const buf = new ArrayBuffer(44 + pcm.length * 2);
   const view = new DataView(buf);
   const str = (off: number, s: string) => {

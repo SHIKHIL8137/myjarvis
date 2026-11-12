@@ -38,3 +38,12 @@ Logs: `logs\jarvis.log` (application), `logs\server.err` (startup errors), and `
 - **4B model tool calling**: `qwen3:4b-instruct` supports Ollama tool calling, though small 4B models can occasionally skip a tool call under strict prompts — Jarvis pairs Ollama tool calling with deterministic intent fallback routing.
 
 To reset: stop Jarvis, then delete `data\history.jsonl` (conversation), `data\settings.json` (settings overrides), `data\secrets.json` (saved API keys), or `data\tts_cache\` (cached speech). Notes are never touched by a reset.
+
+
+## Speech Recognition, Audio & Translation Troubleshooting
+
+- **Silence or background hum turns into repeated digits/words**: Ensure `"stt.preprocessing_profile"` is `"light"` (default) rather than raw peak normalization. Silence floors below the energy threshold short-circuit safely without invoking Whisper.
+- **Words cut off at start/end or clipped distortion**: Switch **Settings → Voice → Audio Preprocessing Profile** to `"light"` or `"off"`, check the **Audio Diagnostics** badge in the **Voice** inspector for `CLIPPED` warnings, and lower OS microphone gain if clipping exceeds 1%. Keep **Native Mic Sample Rate** enabled (`audio.prefer_native_sample_rate: true`) so Jarvis captures at hardware native rate and resamples once per utterance instead of per-chunk.
+- **Technical terms or project names misheard**: Add exact spellings to `config/vocab_hints.txt` or **Settings → Voice → Domain Vocabulary Hints**.
+- **Malayalam outputs Devanagari or mixed Malayalam+English loses English words**: Select **`ml`** for monolingual Malayalam (or install local `whisper-small-malayalam-v2-ct2`) and use **`mixed`** when speaking Manglish/Malayalam+English code-switched sentences, keeping **Preserve Mixed Code-Switching** enabled.
+- **Translation drops numbers, negations, or entities**: Keep **Verify Translations** (`translation.verify_translations: true`) enabled so semantic verification catches missing anchors, retries automatically once, and marks remaining anomalies as `Verify: ...` / `Uncertain`.

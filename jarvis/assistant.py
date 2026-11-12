@@ -194,6 +194,10 @@ class Assistant:
         self.warm_status = {"stt": False, "tts": False, "brain": False}
         self.orchestrator = AgentOrchestrator(settings, bus=self.bus, brain=self.brain, data_dir=self.data_dir)
         self.knowledge.vector_store = self.orchestrator.memory.vectors
+        try:
+            self.translator.records.attach_db(self.orchestrator.db.sync_session)
+        except Exception:
+            pass
         self.orchestrator.attach_research_deps(
             search_service=self.search,
             knowledge_pipeline=self.knowledge,
@@ -325,6 +329,8 @@ class Assistant:
         self.tts.spec = new.tts
         self.tts._voice = None  # reload on next use (voice may have changed)
         self.stt.spec = new.stt
+        if hasattr(self.stt, "configure"):
+            self.stt.configure(new.stt)
         self.warm_status["stt"] = self.stt.ready
         self.wake.spec = new.wake
         self.voice.s = self.settings
@@ -434,8 +440,17 @@ class Assistant:
                     self.voice.complete_turn(utt_id, was_interrupted=was_interrupted or self._cancel_event.is_set())
 
     async def _run_voice_utterance(self, utt_id: int, audio_f32) -> bool:
+        meta = self.voice.pop_utterance_meta(utt_id) if hasattr(self.voice, "pop_utterance_meta") else {}
         try:
-            stt_res = await asyncio.to_thread(self.stt.transcribe, audio_f32)
+            if meta.get("raw_audio") is not None:
+                stt_res = await asyncio.to_thread(
+                    self.stt.transcribe,
+                    meta["raw_audio"],
+                    sample_rate=int(meta.get("sample_rate", 16000) or 16000),
+                    channels=int(meta.get("channels", 1) or 1),
+                )
+            else:
+                stt_res = await asyncio.to_thread(self.stt.transcribe, audio_f32)
         except Exception as e:
             log.exception("transcribe failed")
             self.bus.publish({"type": "error", "message": f"transcription failed: {e}"})
@@ -453,7 +468,7 @@ class Assistant:
             "assistant.transcript.partial",
             legacy_type="transcript_partial",
             source_department="assistant",
-            payload={"text": text, "language": stt_res.get("language", "unknown")},
+            payload={"text": text, "language": stt_res.get("detected_language", stt_res.get("language", "unknown"))},
             text=text,
         )
 

@@ -1,0 +1,21 @@
+# Jarvis Configurable Speech Recognition Vocabulary Hints
+# Add one term or comma-separated terms per line. Lines starting with # are ignored.
+# Updated at runtime without modifying Python source code.
+Jarvis
+Ollama
+Qwen
+FastAPI
+React
+Node.js
+TypeScript
+MongoDB
+PostgreSQL
+VRAM
+quantization
+Silero
+Malayalam
+LangGraph
+pgvector
+uvicorn
+Alembic
+

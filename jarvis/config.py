@@ -34,7 +34,7 @@ PROVIDER_ENV_VARS = {
     "huggingface": "HF_TOKEN",
     "custom": "JARVIS_CUSTOM_LLM_API_KEY",
 }
-_LANG_RE = re.compile(r"^(auto|none|[a-z]{2,3}(?:-[A-Za-z]{2,4})?)$")
+_LANG_RE = re.compile(r"^(auto|none|mixed|[a-z]{2,3}(?:-[A-Za-z]{2,4})?)$")
 
 
 class BrainSpec(BaseModel):
@@ -60,8 +60,9 @@ class STTSpec(BaseModel):
     model: str = "small"
     compute_type: str = "int8"
     cpu_threads: int = Field(6, ge=1, le=32)
-    language: str = "auto"  # "auto" | "en" | "ml" | "hi" | ...
+    language: str = "auto"  # "auto" | "en" | "ml" | "mixed" | "hi" | "ta" | ...
     quality: str = "balanced"  # "fast" | "balanced" | "accurate"
+    preprocessing_profile: str = "light"  # "off" | "light" | "standard"
     beam_size: int | None = Field(None, ge=1, le=10)
     best_of: int | None = Field(None, ge=1, le=10)
     vad_filter: bool = True
@@ -69,8 +70,19 @@ class STTSpec(BaseModel):
     min_silence_duration_ms: int = Field(450, ge=100, le=3000)
     min_speech_duration_ms: int = Field(120, ge=50, le=2000)
     speech_pad_ms: int = Field(300, ge=50, le=1000)
+    short_utterance_pad_ms: int = Field(160, ge=0, le=500)
     vocab_hints: str = ""
+    vocab_hints_file: str = "config/vocab_hints.txt"
     preserve_punctuation: bool = True
+    word_timestamps: bool = False
+    malayalam_model: str = ""  # optional local specialized provider/dir e.g. "malayalam_whisper" or "indic_conformer"
+    hindi_model: str = ""
+    tamil_model: str = ""
+    max_retry_attempts: int = Field(2, ge=0, le=3)
+    retry_on_low_quality: bool = True
+    max_cached_models: int = Field(2, ge=1, le=3)
+    preserve_original_audio: bool = True
+    audio_store_dir: str = "data/audio"
 
     @field_validator("language")
     @classmethod
@@ -88,12 +100,23 @@ class STTSpec(BaseModel):
             raise ValueError("quality must be 'fast', 'balanced', or 'accurate'")
         return v
 
+    @field_validator("preprocessing_profile")
+    @classmethod
+    def _valid_profile(cls, v: str) -> str:
+        v = (v or "light").strip().lower()
+        if v not in ("off", "light", "standard"):
+            raise ValueError("preprocessing_profile must be 'off', 'light', or 'standard'")
+        return v
+
 
 class TranslationSpec(BaseModel):
     mode: str = "transcribe_only"  # "transcribe_only" | "translate"
     target_language: str = "none"  # "none" | "en" | "ml" | "hi" | ...
     auto_correct: bool = False
-    prefer_whisper_for_english: bool = True
+    prefer_whisper_for_english: bool = False
+    verify_translations: bool = True
+    preserve_mixed_code_switching: bool = True
+    eval_export_dir: str = "data/eval_consented"
 
     @field_validator("mode")
     @classmethod
@@ -121,6 +144,7 @@ class WakeSpec(BaseModel):
 class AudioSpec(BaseModel):
     input_device: int | str | None = None
     sample_rate: int = Field(16000, ge=8000, le=48000)
+    prefer_native_sample_rate: bool = True
     voice_mode: str = "continuous"  # "continuous" | "ptt" | "wake_word"
     duplex_mode: str = "half_duplex"  # "half_duplex" (safe default) | "full_duplex" (requires verified AEC)
     echo_cancellation: str = "auto"  # "auto" | "nlms" | "off"

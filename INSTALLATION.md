@@ -60,3 +60,16 @@ DuckDuckGo search requires no API key. If you prefer Tavily, Brave Search, Serpe
 ## Using your own notes
 
 Set `"notes_dir"` in `config.json` to a folder of markdown files (absolute path or relative to the project). Sub-folders become categories and `[[Note Title]]` links become graph links. Jarvis writes new memories into a `captures` sub-folder there.
+
+
+## Optional Local Malayalam Specialized ASR Setup (Offline / CPU INT8)
+
+Standard OpenAI Whisper `base`/`small` models are weaker on conversational Malayalam and can occasionally emit Devanagari script instead of Malayalam Unicode. If you speak pure Malayalam frequently, you can place a specialized local CTranslate2 `int8` or ONNX model offline (no automatic runtime download occurs):
+
+1. **`sajilck/whisper-small-malayalam-v2` (Apache-2.0)** converted to CTranslate2 `int8` placed under `models/asr/whisper-small-malayalam-v2-ct2/` (containing `model.bin`).
+2. Or AI4Bharat **`ai4bharat/indicconformer_stt_ml_hybrid_ctc_rnnt_large` (MIT)** ONNX + `tokens.txt` placed under `models/asr/indicconformer-ml/` with `sherpa-onnx` installed.
+3. Configure **Settings → Voice & Audio Devices → Local Malayalam Specialized Model** (or `"stt.malayalam_model"` in `config.json`) to `"malayalam_whisper"` or `"indic_conformer"`.
+
+## Custom Domain Vocabulary Hints
+
+Add technical names, project titles, frameworks, or personal nouns (one per line or comma-separated) to `config/vocab_hints.txt` or edit **Settings → Voice & Audio Devices → Domain Vocabulary Hints** without modifying code.

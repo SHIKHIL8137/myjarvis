@@ -5,6 +5,7 @@ import type { ForceConfig, GalaxyHandle } from "../components/GalaxyCanvas";
 import { HologramCore, type CoreMode } from "../components/HologramCore";
 import { Inspector } from "../components/Inspector";
 import { Markdown } from "../components/Markdown";
+import { SpeechInspectorPanel, type VoiceTranscriptItem } from "../components/SpeechInspectorPanel";
 import { graph, useGraphVersion } from "../graphStore";
 import { onEvent, type ConnState, type LiveEvent } from "../live";
 import { fmtTime, type Inspectable, type ShellProps } from "../shell";
@@ -147,6 +148,8 @@ export const AssistantHome: React.FC<AssistantHomeProps> = ({
   const [coreMode, setCoreMode] = useState<CoreMode>("ring");
   const [tasks, setTasks] = useState<AssistantTaskItem[]>([]);
   const [tasksOpen, setTasksOpen] = useState(false);
+  const [transcripts, setTranscripts] = useState<VoiceTranscriptItem[]>([]);
+  const [voiceOpen, setVoiceOpen] = useState(false);
   const [explorerOpen, setExplorerOpen] = useState(false);
   const [allowAlwaysReadOnly, setAllowAlwaysReadOnly] = useState(true);
   const [decidingId, setDecidingId] = useState<string | null>(null);
@@ -172,6 +175,14 @@ export const AssistantHome: React.FC<AssistantHomeProps> = ({
   useEffect(() => {
     loadTasksAndPolicy();
   }, [loadTasksAndPolicy]);
+
+  useEffect(() => {
+    apiFetch<{ records?: VoiceTranscriptItem[] }>("/voice/transcripts?limit=20")
+      .then((res) => {
+        if (Array.isArray(res.records)) setTranscripts(res.records);
+      })
+      .catch(() => {});
+  }, []);
 
   // Hydrate conversation history + any still-pending inline permissions/approvals on initial mount
   useEffect(() => {
@@ -295,6 +306,9 @@ export const AssistantHome: React.FC<AssistantHomeProps> = ({
             },
           ];
         });
+      } else if (ev.type === "transcript_record" && ev.id) {
+        const rec = ev as unknown as VoiceTranscriptItem;
+        setTranscripts((prev) => [rec, ...prev.filter((r) => r.id !== rec.id)].slice(0, 50));
       } else if (ev.type === "config_updated" || ev.type === "filesystem_permissions_changed") {
         loadTasksAndPolicy();
       }
@@ -575,6 +589,13 @@ export const AssistantHome: React.FC<AssistantHomeProps> = ({
                 Tasks ({tasks.length})
               </button>
             )}
+            <button
+              className={voiceOpen ? "active" : "ghost"}
+              onClick={() => setVoiceOpen((o) => !o)}
+              title="Inspect transcripts, replay original audio, retry recognition, and verify translations"
+            >
+              Voice ({transcripts.length})
+            </button>
           </div>
           <div className="row">
             <button className="ghost" onClick={() => onNavigate?.("settings")}>Settings</button>
@@ -583,6 +604,15 @@ export const AssistantHome: React.FC<AssistantHomeProps> = ({
             )}
           </div>
         </div>
+
+        {voiceOpen && (
+          <SpeechInspectorPanel
+            records={transcripts}
+            onClose={() => setVoiceOpen(false)}
+            onRecordsChange={setTranscripts}
+            onNotify={onNotify}
+          />
+        )}
 
         {/* Contextual Tasks Panel: shown on active work or user click */}
         {tasksOpen && (

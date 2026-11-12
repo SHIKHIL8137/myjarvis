@@ -10,6 +10,7 @@ import time
 import numpy as np
 
 from .aec import NLMSEchoCanceller, discover_aec_backends
+from .audio_preprocess import bandlimited_resample, diagnose_audio, downmix_to_mono
 from .config import Settings
 from .stt import SR, Whisper, resample_audio
 from .wakeword import FRAME, WakeWord
@@ -159,6 +160,7 @@ class VoiceLoop:
         # Bounded utterance queue (prevents unbounded audio growth and duplicate utterance processing)
         self.utterance_queue: queue.Queue[tuple[int, np.ndarray]] = queue.Queue(maxsize=2)
         self._utt_seq = 0
+        self._utterance_meta: dict[int, dict] = {}
         self._active_utt_id = 0
         self._interrupted_utt_id = 0
         self._followup_until = 0.0
@@ -493,23 +495,59 @@ class VoiceLoop:
                 return None
         return self._vad
 
+    def pop_utterance_meta(self, utt_id: int) -> dict:
+        """Return and remove native capture metadata/audio captured for `utt_id`."""
+        with self._state_lock:
+            return self._utterance_meta.pop(utt_id, {})
+
     def _open_stream_once(self, sd):
         a = self.s.audio
         dev_arg = _resolve_input_device(sd, a.input_device)
         req_sr = int(a.sample_rate or SR)
+        prefer_native = bool(getattr(a, "prefer_native_sample_rate", True))
+
+        nat_sr: int | None = None
+        nat_ch = 1
         try:
-            block = int(round(FRAME * req_sr / SR))
-            return sd.InputStream(samplerate=req_sr, channels=1, dtype="int16", blocksize=block, device=dev_arg), req_sr, block
-        except Exception as first_err:
+            dev = sd.query_devices(dev_arg, "input") if dev_arg is not None else sd.query_devices(kind="input")
+            if isinstance(dev, dict):
+                raw_nat = dev.get("default_samplerate")
+                if isinstance(raw_nat, (int, float)) and int(raw_nat) >= 8000:
+                    nat_sr = int(raw_nat)
+                max_ch = dev.get("max_input_channels")
+                if isinstance(max_ch, (int, float)) and int(max_ch) == 2:
+                    nat_ch = 2
+        except Exception:
+            nat_sr = None
+
+        is_real_sd = getattr(getattr(sd, "InputStream", None), "__module__", "") == "sounddevice"
+        candidates: list[tuple[int, int]] = []
+        if is_real_sd and prefer_native and nat_sr and nat_sr != req_sr:
+            candidates.append((nat_sr, 1))
+            if nat_ch == 2:
+                candidates.append((nat_sr, 2))
+        candidates.append((req_sr, 1))
+        if nat_sr and nat_sr != req_sr and (nat_sr, 1) not in candidates:
+            candidates.append((nat_sr, 1))
+        candidates.append((req_sr, 2))
+
+        first_err: Exception | None = None
+        for sr_try, ch_try in candidates:
+            block = max(1, int(round(FRAME * sr_try / SR)))
             try:
-                dev = sd.query_devices(dev_arg, "input") if dev_arg is not None else sd.query_devices(kind="input")
-                nat_sr = int(dev["default_samplerate"])
-                if nat_sr > 0 and nat_sr != req_sr:
-                    block = int(round(FRAME * nat_sr / SR))
-                    return sd.InputStream(samplerate=nat_sr, channels=1, dtype="int16", blocksize=block, device=dev_arg), nat_sr, block
-            except Exception:
-                pass
-            raise first_err
+                stream = sd.InputStream(
+                    samplerate=sr_try,
+                    channels=ch_try,
+                    dtype="int16",
+                    blocksize=block,
+                    device=dev_arg,
+                )
+                return stream, sr_try, block, ch_try
+            except Exception as err:
+                if first_err is None:
+                    first_err = err
+        assert first_err is not None
+        raise first_err
 
     def _open_stream(self, sd):
         try:
@@ -525,18 +563,50 @@ class VoiceLoop:
                     pass
             raise first_err
 
-    def _submit_utterance(self, audio_i16: np.ndarray) -> bool:
+    def _submit_utterance(
+        self,
+        audio_i16: np.ndarray,
+        raw_native: np.ndarray | None = None,
+        cap_sr: int = SR,
+        cap_ch: int = 1,
+    ) -> bool:
         """Queue captured speech and signal whether half-duplex should suspend mic immediately."""
         min_samples = int(SR * (self.s.audio.min_utterance_ms / 1000.0))
-        if len(audio_i16) < min_samples:
+        if raw_native is not None and len(raw_native) > 0:
+            mono_native, detected_ch = downmix_to_mono(raw_native)
+            cap_ch = max(cap_ch, detected_ch)
+            audio_f32 = bandlimited_resample(mono_native, cap_sr, SR, remove_dc=True) if cap_sr != SR else mono_native
+            raw_save = raw_native
+        else:
+            audio_f32 = audio_i16.astype(np.float32) / 32768.0
+            raw_save = audio_f32
+
+        if len(audio_f32) < min_samples:
             self._transition(self._entry_state(), reason="too_short")
             return False
-        audio_f32 = audio_i16.astype(np.float32) / 32768.0
+
+        diag = diagnose_audio(raw_save, sr=cap_sr, channels=cap_ch)
+        if diag.empty_or_too_short and diag.rms_level < 1e-4:
+            self.emit({"type": "voice_diag", **diag.to_dict()})
+            self._transition(self._entry_state(), reason="empty_audio")
+            return False
+        if diag.clipped:
+            self.emit({"type": "voice_diag", **diag.to_dict()})
+
         suspend_mic = self._is_half_duplex
         with self._state_lock:
             self._utt_seq += 1
             utt_id = self._utt_seq
             self._active_utt_id = utt_id
+            while len(self._utterance_meta) >= 8:
+                oldest = next(iter(self._utterance_meta))
+                self._utterance_meta.pop(oldest, None)
+            self._utterance_meta[utt_id] = {
+                "sample_rate": cap_sr,
+                "channels": cap_ch,
+                "raw_audio": raw_save,
+                "diagnostics": diag.to_dict(),
+            }
             if suspend_mic:
                 self._turn_gate.set()
                 self._turn_wake.clear()
@@ -625,7 +695,7 @@ class VoiceLoop:
                     wake_followup_after_turn = True
 
                 try:
-                    stream, cap_sr, blocksize = self._open_stream(sd)
+                    stream, cap_sr, blocksize, cap_ch = self._open_stream(sd)
                 except Exception as e:
                     self._run.clear()
                     self.mic_suspended = False
@@ -641,9 +711,13 @@ class VoiceLoop:
                 noise = float(a.noise_gate_rms) * 0.8
                 pre_frames = max(1, int(round(a.pre_roll_ms / 80)))
                 pre_roll: collections.deque[np.ndarray] = collections.deque(maxlen=pre_frames)
+                raw_pre_roll: collections.deque[np.ndarray] = collections.deque(maxlen=pre_frames)
                 pre_snap: list[np.ndarray] = []
+                raw_pre_snap: list[np.ndarray] = []
                 onset_buf: list[np.ndarray] = []
+                raw_onset_buf: list[np.ndarray] = []
                 rec_buf: list[np.ndarray] = []
+                raw_rec_buf: list[np.ndarray] = []
                 barge_buf: list[np.ndarray] = []
                 speech_run_ms = 0.0
                 silence_run_ms = 0.0
@@ -671,15 +745,18 @@ class VoiceLoop:
                     while self._run.is_set() and not self.paused and not (self._turn_gate.is_set() and self._is_half_duplex):
                         a = self.s.audio
                         if pre_roll.maxlen != max(1, int(round(a.pre_roll_ms / 80))):
-                            pre_roll = collections.deque(pre_roll, maxlen=max(1, int(round(a.pre_roll_ms / 80))))
+                            maxlen_new = max(1, int(round(a.pre_roll_ms / 80)))
+                            pre_roll = collections.deque(pre_roll, maxlen=maxlen_new)
+                            raw_pre_roll = collections.deque(raw_pre_roll, maxlen=maxlen_new)
 
                         try:
                             frame, _ = stream.read(blocksize)
                         except Exception as read_err:
                             raise OSError(f"microphone disconnected or read failed: {read_err}") from read_err
 
-                        raw_mono = frame[:, 0] if frame.ndim > 1 else frame
-                        if len(raw_mono) < max(1, blocksize // 2):
+                        raw_frame_copy = frame.copy()
+                        raw_mono_f32, _ = downmix_to_mono(frame)
+                        if len(raw_mono_f32) < max(1, blocksize // 2):
                             empty_reads += 1
                             if empty_reads > 50:
                                 raise OSError("microphone stopped delivering audio frames")
@@ -687,10 +764,16 @@ class VoiceLoop:
                         empty_reads = 0
 
                         if cap_sr != SR:
-                            f32 = resample_audio(raw_mono.astype(np.float32) / 32768.0, cap_sr, SR, remove_dc=False)
+                            f32 = resample_audio(raw_mono_f32, cap_sr, SR, remove_dc=False)
                             frame16 = (np.clip(f32, -1.0, 1.0) * 32767.0).astype(np.int16)
                         else:
-                            frame16 = raw_mono
+                            frame16 = (
+                                frame[:, 0]
+                                if frame.ndim > 1 and frame.shape[1] == 1 and frame.dtype == np.int16
+                                else (np.clip(raw_mono_f32, -1.0, 1.0) * 32767.0).astype(np.int16)
+                                if (frame.ndim > 1 or frame.dtype != np.int16)
+                                else frame
+                            )
                         if len(frame16) < FRAME and cap_sr == SR:
                             continue
 
@@ -820,15 +903,21 @@ class VoiceLoop:
                             if is_speech:
                                 if not onset_buf:
                                     pre_snap = list(pre_roll)
+                                    raw_pre_snap = list(raw_pre_roll)
                                 onset_buf.append(frame16.copy())
+                                raw_onset_buf.append(raw_frame_copy)
                                 speech_run_ms += frame_ms
                                 listen_idle_ms = 0.0
                                 if speech_run_ms >= a.speech_confirm_ms:
                                     rec_buf = pre_snap + onset_buf
+                                    raw_rec_buf = raw_pre_snap + raw_onset_buf
                                     rec_samples = sum(len(x) for x in rec_buf)
                                     pre_snap = []
+                                    raw_pre_snap = []
                                     onset_buf.clear()
+                                    raw_onset_buf.clear()
                                     pre_roll.clear()
+                                    raw_pre_roll.clear()
                                     speech_run_ms = 0.0
                                     silence_run_ms = 0.0
                                     has_voiced_in_rec = True
@@ -838,10 +927,15 @@ class VoiceLoop:
                                 if onset_buf:
                                     for f in onset_buf:
                                         pre_roll.append(f)
+                                    for rf in raw_onset_buf:
+                                        raw_pre_roll.append(rf)
                                     onset_buf.clear()
+                                    raw_onset_buf.clear()
                                     pre_snap = []
+                                    raw_pre_snap = []
                                     speech_run_ms = 0.0
                                 pre_roll.append(frame16.copy())
+                                raw_pre_roll.append(raw_frame_copy)
                                 noise = 0.97 * noise + 0.03 * min(rms, 2000.0)
                                 listen_idle_ms += frame_ms
                                 if (self._one_shot_ptt or self.mode == "ptt") and listen_idle_ms >= a.no_speech_timeout_s * 1000.0:
@@ -852,6 +946,7 @@ class VoiceLoop:
 
                         if st == VoiceState.SPEECH_DETECTED:
                             rec_buf.append(frame16.copy())
+                            raw_rec_buf.append(raw_frame_copy)
                             rec_samples += len(frame16)
                             if (rec_samples // FRAME) % 2 == 0:
                                 self.emit({"type": "level", "v": round(min(1.0, rms / 4000.0), 3)})
@@ -873,6 +968,7 @@ class VoiceLoop:
                             if not has_voiced_in_rec:
                                 if silence_run_ms >= a.no_speech_timeout_s * 1000.0:
                                     rec_buf.clear()
+                                    raw_rec_buf.clear()
                                     rec_samples = 0
                                     silence_run_ms = 0.0
                                     if vad:
@@ -884,12 +980,18 @@ class VoiceLoop:
                                         self._transition(self._entry_state(), reason="ptt_timeout")
                             elif silence_run_ms >= a.silence_ms or utt_dur_s >= a.max_utterance_s:
                                 payload = np.concatenate(rec_buf)
+                                raw_payload = (
+                                    np.concatenate(raw_rec_buf, axis=0)
+                                    if len(raw_rec_buf) == len(rec_buf) and raw_rec_buf
+                                    else None
+                                )
                                 rec_buf.clear()
+                                raw_rec_buf.clear()
                                 rec_samples = 0
                                 silence_run_ms = 0.0
                                 if vad:
                                     vad.reset()
-                                if self._submit_utterance(payload):
+                                if self._submit_utterance(payload, raw_native=raw_payload, cap_sr=cap_sr, cap_ch=cap_ch):
                                     # Half-duplex: exit `with stream:` immediately to release hardware mic
                                     break
                             continue

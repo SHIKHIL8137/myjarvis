@@ -91,6 +91,7 @@ class CorrectIn(BaseModel):
     id: str = Field(min_length=1, max_length=64)
     corrected_transcript: str = Field(min_length=1, max_length=8000)
     target_language: str | None = Field(None, max_length=16)
+    eval_consent: bool | None = None
 
 
 class TranslateIn(BaseModel):
@@ -98,6 +99,22 @@ class TranslateIn(BaseModel):
     text: str | None = Field(None, max_length=8000)
     source_language: str = Field("auto", max_length=16)
     target_language: str = Field(min_length=2, max_length=16)
+
+
+class RetryVoiceIn(BaseModel):
+    audio_id: str = Field(min_length=1, max_length=64)
+    transcript_id: str | None = Field(None, max_length=64)
+    model: str | None = Field(None, max_length=64)
+    language: str | None = Field(None, max_length=16)
+    quality: str | None = Field(None, max_length=16)
+    preprocessing_profile: str | None = Field(None, max_length=16)
+    target_language: str | None = Field(None, max_length=16)
+
+
+class EvalConsentIn(BaseModel):
+    id: str = Field(min_length=1, max_length=64)
+    consent: bool = True
+    include_audio: bool = False
 
 
 class InternetModeIn(BaseModel):
@@ -273,11 +290,19 @@ def create_app(settings: Settings | None = None, assistant: Assistant | None = N
         data = await request.body()
         if not data or len(data) > MAX_WAV:
             raise ValueError("body must be a WAV file of at most 10 MB")
-        from .stt import wav_to_float
-        audio = wav_to_float(data)
+        from .audio_preprocess import parse_wav_raw
+        raw_arr, raw_sr, raw_ch = parse_wav_raw(data)
         a = A()
-        stt_res = await asyncio.to_thread(a.stt.transcribe, audio, language=language, quality=quality)
-        rec = await a.translator.process_stt(stt_res, a.settings.translation, audio=audio, target_override=translate_to)
+        stt_res = await asyncio.to_thread(
+            a.stt.transcribe,
+            raw_arr,
+            sample_rate=raw_sr,
+            channels=raw_ch,
+            raw_wav_bytes=data,
+            language=language,
+            quality=quality,
+        )
+        rec = await a.translator.process_stt(stt_res, a.settings.translation, audio=raw_arr, target_override=translate_to)
         payload = rec.to_dict()
         a.bus.publish({"type": "transcript_record", **payload})
         return payload
@@ -294,11 +319,20 @@ def create_app(settings: Settings | None = None, assistant: Assistant | None = N
         data = await request.body()
         if not data or len(data) > MAX_WAV:
             raise ValueError("body must be a WAV file of at most 10 MB")
-        from .stt import wav_to_float
-        audio = wav_to_float(data)
+        from .audio_preprocess import parse_wav_raw
+        raw_arr, raw_sr, raw_ch = parse_wav_raw(data)
+        audio = raw_arr
         a = A()
         a._set_os_state("Transcribing", source="voice", detail="whisper")
-        stt_res = await asyncio.to_thread(a.stt.transcribe, audio, language=language, quality=quality)
+        stt_res = await asyncio.to_thread(
+            a.stt.transcribe,
+            raw_arr,
+            sample_rate=raw_sr,
+            channels=raw_ch,
+            raw_wav_bytes=data,
+            language=language,
+            quality=quality,
+        )
         raw_text = (stt_res.get("text") or "").strip()
         if raw_text:
             graph_live.publish_os_event(
@@ -306,7 +340,7 @@ def create_app(settings: Settings | None = None, assistant: Assistant | None = N
                 "assistant.transcript.partial",
                 legacy_type="transcript_partial",
                 source_department="assistant",
-                payload={"text": raw_text, "language": stt_res.get("language", "unknown")},
+                payload={"text": raw_text, "language": stt_res.get("detected_language", stt_res.get("language", "unknown"))},
                 text=raw_text,
             )
         rec = await a.translator.process_stt(stt_res, a.settings.translation, audio=audio, target_override=translate_to)
@@ -341,7 +375,14 @@ def create_app(settings: Settings | None = None, assistant: Assistant | None = N
 
     @app.post("/api/voice/correct")
     async def correct_transcript(body: CorrectIn):
-        rec = await A().translator.apply_correction(body.id, body.corrected_transcript, target_language=body.target_language)
+        rec = await A().translator.apply_correction(
+            body.id,
+            body.corrected_transcript,
+            target_language=body.target_language,
+            eval_consent=body.eval_consent,
+        )
+        if rec is None:
+            return JSONResponse({"error": f"Transcript '{body.id}' not found"}, 404)
         payload = rec.to_dict()
         A().bus.publish({"type": "transcript_record", **payload})
         return payload
@@ -359,17 +400,117 @@ def create_app(settings: Settings | None = None, assistant: Assistant | None = N
             return payload
         if not body.text or not body.text.strip():
             raise ValueError("provide either 'id' or non-empty 'text'")
-        translated = await a.translator.translate_text(body.text, body.source_language, body.target_language)
+        translated, verification = await a.translator.translate_text_with_verification(
+            body.text,
+            body.source_language,
+            body.target_language,
+            verify=bool(getattr(a.settings.translation, "verify_translations", True)),
+            preserve_code_switching=bool(getattr(a.settings.translation, "preserve_mixed_code_switching", True)),
+        )
         return {
             "source_text": body.text.strip(),
             "source_language": body.source_language,
             "target_language": body.target_language,
             "translated_text": translated,
+            "verification": verification,
         }
 
     @app.get("/api/voice/transcripts")
     async def transcripts(limit: int = 20):
         return {"records": A().translator.records.list_recent(limit)}
+
+    @app.get("/api/voice/audio/{audio_id}")
+    async def voice_audio(audio_id: str):
+        wav_bytes = A().stt.audio_store.get_wav_bytes(audio_id)
+        if not wav_bytes:
+            return JSONResponse({"error": f"Audio '{audio_id}' not found"}, 404)
+        return Response(content=wav_bytes, media_type="audio/wav", headers={"Cache-Control": "no-store"})
+
+    @app.get("/api/voice/diagnostics/{audio_id}")
+    async def voice_diagnostics(audio_id: str):
+        a = A()
+        raw = a.stt.audio_store.get_raw(audio_id)
+        if raw is None:
+            return JSONResponse({"error": f"Audio '{audio_id}' not found"}, 404)
+        raw_arr, raw_sr, raw_ch = raw
+        from .audio_preprocess import diagnose_audio
+
+        diag = diagnose_audio(
+            raw_arr,
+            sr=raw_sr,
+            channels=raw_ch,
+            profile=a.settings.stt.preprocessing_profile,
+        )
+        return {"audio_id": audio_id, "diagnostics": diag.to_dict()}
+
+    @app.post("/api/voice/retry")
+    async def retry_voice_transcript(body: RetryVoiceIn):
+        a = A()
+        raw = a.stt.audio_store.get_raw(body.audio_id)
+        if raw is None:
+            return JSONResponse({"error": f"Stored audio '{body.audio_id}' not found"}, 404)
+        raw_arr, raw_sr, raw_ch = raw
+        try:
+            stt_res = await asyncio.to_thread(
+                a.stt.transcribe,
+                raw_arr,
+                sample_rate=raw_sr,
+                channels=raw_ch,
+                language=body.language,
+                quality=body.quality,
+                model_override=body.model,
+                preprocessing_profile=body.preprocessing_profile,
+                save_audio=False,
+            )
+            import uuid
+            stt_res["audio_id"] = body.audio_id
+            stt_res["id"] = body.transcript_id or uuid.uuid4().hex[:16]
+            rec = await a.translator.process_stt(
+                stt_res,
+                a.settings.translation,
+                audio=raw_arr,
+                target_override=body.target_language,
+            )
+            payload = rec.to_dict()
+            a.bus.publish({"type": "transcript_record", **payload})
+            return {"transcript_record": payload}
+        except Exception as e:
+            return JSONResponse({"error": f"retry transcription failed: {e}"}, 500)
+
+    @app.post("/api/voice/eval-consent")
+    async def save_voice_eval_consent(body: EvalConsentIn):
+        a = A()
+        rec = a.translator.records.get(body.id)
+        if rec is None:
+            return JSONResponse({"error": f"Transcript '{body.id}' not found"}, 404)
+        rec.eval_consent = bool(body.consent)
+        a.translator.records.put(rec)
+        exported_path = None
+        if rec.eval_consent:
+            from .translator import export_consented_sample
+
+            wav_bytes = a.stt.audio_store.get_wav_bytes(rec.audio_id) if (body.include_audio and rec.audio_id) else None
+            exported_path = str(export_consented_sample(rec, a.settings.translation.eval_export_dir, audio_wav_bytes=wav_bytes))
+        return {"ok": True, "eval_consent": rec.eval_consent, "exported_path": exported_path}
+
+    @app.delete("/api/voice/transcripts/{record_id}")
+    async def delete_voice_transcript(record_id: str, delete_audio: bool = Query(False)):
+        a = A()
+        rec = a.translator.records.get(record_id)
+        if rec is None:
+            return JSONResponse({"error": f"Transcript '{record_id}' not found"}, 404)
+        if delete_audio and rec.audio_id:
+            a.stt.audio_store.delete(rec.audio_id)
+        ok = a.translator.records.delete(record_id)
+        return {"ok": ok, "deleted_id": record_id}
+
+    @app.delete("/api/voice/transcripts")
+    async def clear_voice_transcripts(delete_audio: bool = Query(False)):
+        a = A()
+        count = a.translator.records.clear()
+        if delete_audio:
+            a.stt.audio_store.clear()
+        return {"ok": True, "deleted_count": count}
 
     @app.post("/api/tts")
     async def tts(body: SpeakIn):

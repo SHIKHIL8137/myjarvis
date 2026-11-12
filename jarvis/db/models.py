@@ -88,12 +88,16 @@ class VoiceTranscriptRow(Base):
     original_transcript: Mapped[str] = mapped_column(Text)
     corrected_transcript: Mapped[str] = mapped_column(Text)
     detected_language: Mapped[str] = mapped_column(String(16), default="en")
+    source_language: Mapped[str] = mapped_column(String(24), default="unknown")
+    language_probability: Mapped[float] = mapped_column(Float, default=0.0)
+    recognition_quality: Mapped[str] = mapped_column(String(24), default="medium")
     target_language: Mapped[str] = mapped_column(String(16), default="none")
     translated_text: Mapped[str | None] = mapped_column(Text, nullable=True)
     translation_engine: Mapped[str | None] = mapped_column(String(32), nullable=True)
     confidence: Mapped[float] = mapped_column(Float, default=0.0)
     model: Mapped[str] = mapped_column(String(64), default="")
     seconds: Mapped[float] = mapped_column(Float, default=0.0)
+    meta_json: Mapped[str] = mapped_column(Text, default="{}")
     created_at: Mapped[float] = mapped_column(Float, default=_now, index=True)
 
 

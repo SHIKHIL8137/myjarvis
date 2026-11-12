@@ -97,3 +97,20 @@ Executed with real hardware (`[1] Microphone Array (Realtek(R) Audio)` at 44.1 k
 - **Live Chrome DevTools browser inspection (`http://127.0.0.1:4700/` and `/legacy`)**: Blocked in this session because Chrome remote debugging (`C:\Users\shikh\AppData\Local\Google\Chrome\User Data\DevToolsActivePort`) was not active (`ENOENT`). Enable remote debugging via `chrome://inspect/#remote-debugging` in Chrome to verify interactive React rendering in the live browser; static `tsc --noEmit && vite build`, `preflight.py` HTTP byte-hash parity, and `FastAPI TestClient` API tests all passed.
 - **Live PostgreSQL + `pgvector` server execution**: Not run against a live PostgreSQL server because `JARVIS_PG_TEST_URL` credentials were not configured; SQLAlchemy ORM models, Alembic migrations, isolated vector scopes, and LangGraph checkpointing were verified against SQLite (`WAL` + foreign keys).
 - **Live OpenCode & cloud LLM providers**: Not executed against live external APIs (system kept in Local Mode with `providers.allow_cloud=false`); OpenCode CLI (`1.19.5`) & Graphify (`0.9.80`) presence checked and Dev Workforce orchestrator verified end-to-end with an injected worktree coder, real `git worktree`, real `Graphify`, and real `.venv` `pytest` execution inside the worktree.
+
+
+## Speech Recognition & Translation Accuracy Upgrade Verification (2026-11-12)
+
+- **Full Python Test Suite (`.\.venv\Scripts\pytest.exe -q -rs`)**: **229 passed, 4 skipped** (`231.54s`), zero failures across unit, API, live Ollama Qwen translation/tool-calling, real microphone stream open/release, continuous half-duplex/barge-in voice lifecycle, and DB persistence tests.
+  - Skipped (host prerequisites absent): `test_p10_11_hardening.py:221` (Live Docker daemon not running), `test_p10_11_hardening.py:378` (`JARVIS_PG_TEST_URL` / `JARVIS_PG_SCRATCH_URL` not set), `test_p10_12_hardening.py:165` (Live Docker daemon not running), `test_p10_pgvector_memory.py:193` (`JARVIS_PG_TEST_URL` not set).
+- **Speech Upgrade Suite (`tests/test_speech_pipeline_upgrade.py`)**: **7 passed** covering `parse_wav_raw`/`downmix_to_mono`/`bandlimited_resample` across 8/16/44.1/48 kHz stereo+mono, audio diagnostics (empty, short, clipped, silence floor guard), script-mismatch bounded retry, LRU cache eviction + offline specialized provider gating, correction hallucination guard + semantic translation verification auto-retry, SQLite `VoiceTranscriptRow` persistence + `original_transcript` immutability + consented eval export + delete, and REST replay/diagnostics/retry/correct/consent/delete endpoints.
+- **Alembic Schema Migration Round-Trip (`0006_voice_pipeline_upgrade`)**: `upgrade head` -> `downgrade -1` -> `upgrade head` exited `0` (`ALEMBIC_ROUNDTRIP_OK`).
+- **Frontend Tests & Production Build (`apps/frontend`)**: `npm test -- --run` (**6 passed, 0 failed**) and `tsc --noEmit && vite build` exited `0` (`dist/assets/index-lFZkh7vw.js`).
+- **Multilingual ASR Benchmark Before vs After (15-WAV manifest `benchmarks/multilingual/manifest.json`)**:
+  - `base fast`: WER `20.4% -> 10.0%`, CER `5.2% -> 3.3%`, Lang Acc `100.0%`
+  - `base balanced`: WER `13.1% -> 12.9%`, CER `3.4% -> 3.5%`, Del Rate `0.0%`
+  - `small balanced`: WER `20.3% -> 10.7%`, CER `5.0% -> 3.7%`, fixed technical terms (`FastAPI`, `PostgreSQL`, `Ollama`, `Qwen`, `TypeScript`, `Node.js`)
+  - `small.en balanced`: WER `19.9% -> 11.8%`, CER `4.8% -> 3.5%`
+- **Live Diagnostic Samples Verification**:
+  - `benchmarks/samples/live_mixed.wav` (pure room noise floor, `rms=0.00058`): short-circuited without Whisper hallucination (`text=''`, `provider='none'`, `quality_flags=['no_speech_energy', 'very_low_input_volume', 'mostly_silence']`).
+  - `benchmarks/samples/live_malayalam.wav`: flagged `quality_flags=['script_mismatch']`, `recognition_quality='low'`, `retry_triggered=True` when Whisper `small` emitted Devanagari on `ml` speech (optional local Malayalam specialized weights not installed offline yet).

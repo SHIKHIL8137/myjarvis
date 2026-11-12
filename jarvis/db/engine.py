@@ -59,6 +59,12 @@ _P10_COLUMN_DDLS: dict[str, list[tuple[str, str]]] = {
         ("claimed_by", "VARCHAR(64)"),
         ("claimed_at", "FLOAT"),
     ],
+    "voice_transcripts": [
+        ("source_language", "VARCHAR(24) NOT NULL DEFAULT 'unknown'"),
+        ("language_probability", "FLOAT NOT NULL DEFAULT 0.0"),
+        ("recognition_quality", "VARCHAR(24) NOT NULL DEFAULT 'medium'"),
+        ("meta_json", "TEXT NOT NULL DEFAULT '{}'"),
+    ],
 }
 
 

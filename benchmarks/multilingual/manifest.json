@@ -1,0 +1,150 @@
+{
+  "schema_version": 1,
+  "description": "Multilingual STT benchmark manifest. Only synthetic exact-prompt English/Technical/Noisy/Command WAVs or explicitly user-verified recordings may carry reference_verified=true. Never fabricate human-verified Malayalam, Hindi, Tamil, or Mixed transcripts.",
+  "targets": {
+    "en": 30,
+    "ml": 30,
+    "mixed": 30,
+    "hi": 15,
+    "ta": 15,
+    "noisy": 15,
+    "technical": 15
+  },
+  "samples": [
+    {
+      "id": "cmd_001",
+      "audio": "samples/cmd_001.wav",
+      "language": "en",
+      "reference": "Stop.",
+      "category": "short_command",
+      "source": "synthetic_piper",
+      "reference_verified": true
+    },
+    {
+      "id": "cmd_002",
+      "audio": "samples/cmd_002.wav",
+      "language": "en",
+      "reference": "Yes.",
+      "category": "short_command",
+      "source": "synthetic_piper",
+      "reference_verified": true
+    },
+    {
+      "id": "cmd_003",
+      "audio": "samples/cmd_003.wav",
+      "language": "en",
+      "reference": "Pause.",
+      "category": "short_command",
+      "source": "synthetic_piper",
+      "reference_verified": true
+    },
+    {
+      "id": "cmd_004",
+      "audio": "samples/cmd_004.wav",
+      "language": "en",
+      "reference": "Resume listening.",
+      "category": "short_command",
+      "source": "synthetic_piper",
+      "reference_verified": true
+    },
+    {
+      "id": "en_001",
+      "audio": "samples/en_001.wav",
+      "language": "en",
+      "reference": "What is the weather forecast for this afternoon?",
+      "category": "normal_speech",
+      "source": "synthetic_piper",
+      "reference_verified": true
+    },
+    {
+      "id": "en_002",
+      "audio": "samples/en_002.wav",
+      "language": "en",
+      "reference": "Open my project notes and summarize the main tasks.",
+      "category": "normal_speech",
+      "source": "synthetic_piper",
+      "reference_verified": true
+    },
+    {
+      "id": "en_003",
+      "audio": "samples/en_003.wav",
+      "language": "en",
+      "reference": "Do not delete the database backup file before verification.",
+      "category": "normal_speech",
+      "source": "synthetic_piper",
+      "reference_verified": true
+    },
+    {
+      "id": "en_004",
+      "audio": "samples/en_004.wav",
+      "language": "en",
+      "reference": "Schedule a reminder for tomorrow morning at nine thirty.",
+      "category": "normal_speech",
+      "source": "synthetic_piper",
+      "reference_verified": true
+    },
+    {
+      "id": "en_005_44k_stereo",
+      "audio": "samples/en_005_44k_stereo.wav",
+      "language": "en",
+      "reference": "Do not delete the database backup file before verification.",
+      "category": "normal_speech",
+      "source": "synthetic_piper_44k_stereo",
+      "reference_verified": true
+    },
+    {
+      "id": "en_sapi_david",
+      "audio": "samples/en_sapi_david.wav",
+      "language": "en",
+      "reference": "Do not skip the regression tests before deployment.",
+      "category": "normal_speech",
+      "source": "synthetic_windows_sapi",
+      "reference_verified": true
+    },
+    {
+      "id": "en_sapi_zira",
+      "audio": "samples/en_sapi_zira.wav",
+      "language": "en",
+      "reference": "Explain Qwen local inference and latency on six threads.",
+      "category": "normal_speech",
+      "source": "synthetic_windows_sapi",
+      "reference_verified": true
+    },
+    {
+      "id": "noisy_001_48k",
+      "audio": "samples/noisy_001_48k.wav",
+      "language": "en",
+      "reference": "Jarvis, check the FastAPI and PostgreSQL status in Ollama.",
+      "category": "noisy",
+      "source": "synthetic_piper_48k_noisy",
+      "reference_verified": true
+    },
+    {
+      "id": "tech_001",
+      "audio": "samples/tech_001.wav",
+      "language": "en",
+      "reference": "Jarvis, check the FastAPI and PostgreSQL status in Ollama.",
+      "category": "technical",
+      "source": "synthetic_piper",
+      "reference_verified": true
+    },
+    {
+      "id": "tech_002",
+      "audio": "samples/tech_002.wav",
+      "language": "en",
+      "reference": "Update the React and TypeScript frontend to connect with Node.js.",
+      "category": "technical",
+      "source": "synthetic_piper",
+      "reference_verified": true
+    },
+    {
+      "id": "tech_003",
+      "audio": "samples/tech_003.wav",
+      "language": "en",
+      "reference": "Verify Qwen quantization and MongoDB connection pooling.",
+      "category": "technical",
+      "source": "synthetic_piper",
+      "reference_verified": true
+    }
+  ]
+}

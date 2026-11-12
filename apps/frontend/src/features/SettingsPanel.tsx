@@ -6,13 +6,30 @@ type SectionId = "providers" | "voice" | "permissions" | "system";
 
 interface ConsolidatedSettings {
   tts: { enabled: boolean; voice: string; speed: number };
-  stt: { model: string; language: string; quality: string };
+  stt: {
+    model: string;
+    language: string;
+    quality: string;
+    preprocessing_profile?: string;
+    vocab_hints?: string;
+    malayalam_model?: string;
+    max_retry_attempts?: number;
+  };
   audio: {
     voice_mode: string;
     barge_in_enabled: boolean;
     suppress_mic_during_tts: boolean;
+    prefer_native_sample_rate?: boolean;
     input_device: number | null;
     output_device: number | null;
+  };
+  translation?: {
+    mode: string;
+    target_language: string;
+    auto_correct: boolean;
+    prefer_whisper_for_english: boolean;
+    verify_translations: boolean;
+    preserve_mixed_code_switching: boolean;
   };
   wake: { enabled: boolean };
   internet: { enabled: boolean; provider: string };
@@ -65,7 +82,7 @@ interface ConsolidatedSettings {
   mode: string;
   voices: string[];
   stt_models: string[];
-  stt_languages: string[];
+  stt_languages: Record<string, string> | string[];
 }
 
 interface ModelItem {
@@ -589,8 +606,11 @@ export const SettingsPanel: React.FC<ShellProps> = ({ onNotify }) => {
             <label className="field">
               Speech Language
               <select value={cfg.stt.language} onChange={(e) => patchSettings("STT language changed", { stt: { language: e.target.value } })}>
-                {(cfg.stt_languages || ["en", "ml", "auto"]).map((l) => (
-                  <option key={l} value={l}>{l}</option>
+                {(Array.isArray(cfg.stt_languages)
+                  ? cfg.stt_languages.map((l) => [l, l] as [string, string])
+                  : Object.entries(cfg.stt_languages || { auto: "Auto-detect", en: "English", ml: "Malayalam", mixed: "Mixed ML+EN" })
+                ).map(([code, label]) => (
+                  <option key={code} value={code}>{label} ({code})</option>
                 ))}
               </select>
             </label>
@@ -698,6 +718,144 @@ export const SettingsPanel: React.FC<ShellProps> = ({ onNotify }) => {
               onClick={() => patchSettings("Echo suppression updated", { audio: { suppress_mic_during_tts: !cfg.audio.suppress_mic_during_tts } })}
             >
               Suppress Mic During TTS: {cfg.audio.suppress_mic_during_tts ? "On" : "Off"}
+            </button>
+            <button
+              aria-pressed={cfg.audio.prefer_native_sample_rate ?? true}
+              className="ghost"
+              onClick={() =>
+                patchSettings("Native sample rate capture updated", {
+                  audio: { prefer_native_sample_rate: !(cfg.audio.prefer_native_sample_rate ?? true) },
+                })
+              }
+            >
+              Native Mic Sample Rate: {(cfg.audio.prefer_native_sample_rate ?? true) ? "On" : "Off"}
+            </button>
+          </div>
+
+          <h4 style={{ marginTop: 14, marginBottom: 8 }}>Recognition Accuracy, Preprocessing &amp; Translation</h4>
+          <div className="grid-2">
+            <label className="field">
+              Recognition Quality Preset
+              <select
+                value={cfg.stt.quality || "balanced"}
+                onChange={(e) => patchSettings("Recognition quality updated", { stt: { quality: e.target.value } })}
+              >
+                <option value="fast">Fast (low latency)</option>
+                <option value="balanced">Balanced (recommended)</option>
+                <option value="high">High Accuracy (slower beam/retry)</option>
+              </select>
+            </label>
+
+            <label className="field">
+              Audio Preprocessing Profile
+              <select
+                value={cfg.stt.preprocessing_profile || "light"}
+                onChange={(e) =>
+                  patchSettings("Preprocessing profile updated", { stt: { preprocessing_profile: e.target.value } })
+                }
+              >
+                <option value="off">Off (raw bandlimited 16kHz only)</option>
+                <option value="light">Light (HPF + safe headroom normalize · Recommended)</option>
+                <option value="standard">Standard (+ conservative spectral gate)</option>
+              </select>
+            </label>
+
+            <label className="field">
+              Translation Mode &amp; Target Language
+              <div className="row" style={{ gap: 6 }}>
+                <select
+                  value={cfg.translation?.mode || "transcribe_only"}
+                  onChange={(e) =>
+                    patchSettings("Translation mode updated", {
+                      translation: { mode: e.target.value },
+                    })
+                  }
+                >
+                  <option value="transcribe_only">Transcribe only</option>
+                  <option value="translate">Auto-translate</option>
+                </select>
+                <select
+                  value={cfg.translation?.target_language || "none"}
+                  onChange={(e) =>
+                    patchSettings("Target language updated", {
+                      translation: { target_language: e.target.value },
+                    })
+                  }
+                >
+                  <option value="none">None</option>
+                  <option value="en">English (en)</option>
+                  <option value="ml">Malayalam (ml)</option>
+                  <option value="hi">Hindi (hi)</option>
+                  <option value="ta">Tamil (ta)</option>
+                </select>
+              </div>
+            </label>
+
+            <label className="field">
+              Local Malayalam Specialized Model (optional CTranslate2/ONNX path)
+              <input
+                type="text"
+                defaultValue={cfg.stt.malayalam_model || ""}
+                placeholder="e.g. D:/models/whisper-small-malayalam-ct2"
+                onBlur={(e) => {
+                  const val = e.target.value.trim();
+                  if (val !== (cfg.stt.malayalam_model || "")) {
+                    patchSettings("Malayalam ASR model path updated", { stt: { malayalam_model: val } });
+                  }
+                }}
+              />
+            </label>
+          </div>
+
+          <label className="field" style={{ marginTop: 8 }}>
+            Domain Vocabulary Hints (names, technical terms, comma-separated)
+            <input
+              type="text"
+              defaultValue={cfg.stt.vocab_hints || ""}
+              onBlur={(e) => {
+                const val = e.target.value.trim();
+                if (val !== (cfg.stt.vocab_hints || "")) {
+                  patchSettings("Vocabulary hints saved", { stt: { vocab_hints: val } });
+                }
+              }}
+            />
+          </label>
+
+          <div className="row wrap" style={{ marginTop: 10 }}>
+            <button
+              aria-pressed={Boolean(cfg.translation?.auto_correct)}
+              className="ghost"
+              onClick={() =>
+                patchSettings("Transcript post-correction updated", {
+                  translation: { auto_correct: !cfg.translation?.auto_correct },
+                })
+              }
+            >
+              Guarded Post-Correction: {cfg.translation?.auto_correct ? "On" : "Off"}
+            </button>
+            <button
+              aria-pressed={cfg.translation?.verify_translations ?? true}
+              className="ghost"
+              onClick={() =>
+                patchSettings("Translation semantic verification updated", {
+                  translation: { verify_translations: !(cfg.translation?.verify_translations ?? true) },
+                })
+              }
+            >
+              Verify Translations: {(cfg.translation?.verify_translations ?? true) ? "On" : "Off"}
+            </button>
+            <button
+              aria-pressed={cfg.translation?.preserve_mixed_code_switching ?? true}
+              className="ghost"
+              onClick={() =>
+                patchSettings("Mixed code-switching preservation updated", {
+                  translation: {
+                    preserve_mixed_code_switching: !(cfg.translation?.preserve_mixed_code_switching ?? true),
+                  },
+                })
+              }
+            >
+              Preserve Mixed Code-Switching: {(cfg.translation?.preserve_mixed_code_switching ?? true) ? "On" : "Off"}
             </button>
           </div>
         </div>

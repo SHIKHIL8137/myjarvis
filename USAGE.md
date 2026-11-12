@@ -85,3 +85,13 @@ Jarvis starts in **Local Mode** (`internet.enabled: false`), blocking all extern
 ## Personal Memory, Local Files & Learning Dashboard
 - **Memory & Files Drawer**: Filter personal memories by category (`explicit`, `preference`, `project`, `temporary`, `feedback`), approve inferred memories, create backups, search full on-disk conversation history, browse allowlisted files, and approve/reject pending `MODIFY`/`DESTRUCTIVE` actions.
 - **Brain & Learning Drawer**: View active model version and hardware capacity, trigger incremental knowledge updates (RAG chunks only — never modifies weights), validate/clean/split datasets with zero prompt leakage, create approval-gated training jobs, run the 12-category evaluation gate, and promote or atomically roll back registered versions.
+
+
+## Speech & Translation Inspector Panel
+
+Inside **JARVIS ASSISTANT**, click **Voice (`N`)** in the workspace header to open the contextual Speech & Translation Inspector without leaving the main screen:
+- **Replay Original Audio**: Listen to the untouched native-rate microphone or UI upload recording (`/api/voice/audio/{audio_id}`).
+- **Audio Diagnostics**: View sample rate, channel count, estimated SNR (dB), clipping warnings, trim status, and active preprocessing profile (`off`, `light`, `standard`).
+- **Immutable Original vs Editable Correction**: Copy `original_transcript` or edit `corrected_transcript` and optionally re-translate; original audio and `original_transcript` are never overwritten.
+- **Retry Pass & Candidate Comparison**: Re-run STT on the stored original audio with any model (`base`, `small`, `small.en`), language (`auto`, `en`, `ml`, `mixed`, `hi`, `ta`), quality tier (`fast`, `balanced`, `high`), or preprocessing profile (`off`, `light`, `standard`), and expand **Compare passes** to review scores.
+- **Local Consent & Privacy Controls**: Explicitly approve a corrected sample for local offline evaluation (`data/eval_consented/`), or permanently delete individual/all transcripts and stored audio buffers.
