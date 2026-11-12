@@ -92,11 +92,11 @@ class TranscriptRecord:
     original_transcript: str
     corrected_transcript: str
     detected_language: str
-    language_probability: float
-    confidence: float
-    avg_logprob: float
-    no_speech_prob: float
-    compression_ratio: float
+    language_probability: float | None
+    confidence: float | None
+    avg_logprob: float | None
+    no_speech_prob: float | None
+    compression_ratio: float | None
     translated_text: str | None = None
     target_language: str = "none"
     translation_engine: str | None = None
@@ -107,12 +107,16 @@ class TranscriptRecord:
     recognition_model: str = ""
     recognition_quality: str = "medium"
     review_needed: bool = False
+    confidence_available: bool = True
+    language_probability_available: bool = True
     translation_provider: str | None = None
     status: str = "completed"
     quality_flags: list[str] = field(default_factory=list)
     attempts: list[dict] = field(default_factory=list)
     provider_status: dict = field(default_factory=dict)
     provider_errors: list[dict] = field(default_factory=list)
+    selection_reason: str = ""
+    selected_candidate: dict = field(default_factory=dict)
     audio_diagnostics: dict = field(default_factory=dict)
     translation_verification: dict | None = None
     eval_consent: bool = False
@@ -281,13 +285,14 @@ def verify_translation(source: str, translated: str, source_lang: str, target_la
     src = source.strip()
     tr = translated.strip()
     warnings: list[str] = []
-    note = "Heuristic structural check only; full semantic equivalence requires human or contextual review."
+    note = "Structural anchor check only (numbers, negation, intent, technical terms, target script); not proof of semantic accuracy."
     if not src:
         return {
             "passed": True,
             "uncertain": False,
             "warnings": [],
             "score": 1.0,
+            "structural_check": True,
             "semantic_equivalence_proven": False,
             "check_method": "heuristic_anchors",
             "note": note,
@@ -298,6 +303,7 @@ def verify_translation(source: str, translated: str, source_lang: str, target_la
             "uncertain": True,
             "warnings": ["empty_translation"],
             "score": 0.0,
+            "structural_check": True,
             "semantic_equivalence_proven": False,
             "check_method": "heuristic_anchors",
             "note": note,
@@ -384,6 +390,7 @@ def verify_translation(source: str, translated: str, source_lang: str, target_la
         "uncertain": uncertain,
         "warnings": warnings,
         "score": score,
+        "structural_check": True,
         "semantic_equivalence_proven": False,
         "check_method": "heuristic_anchors",
         "note": note,
@@ -411,17 +418,19 @@ class TranscriptStore:
                 meta = {}
         except Exception:
             meta = {}
+        raw_conf = meta["confidence"] if "confidence" in meta else getattr(row, "confidence", None)
+        raw_lp_prob = meta["language_probability"] if "language_probability" in meta else getattr(row, "language_probability", None)
         return TranscriptRecord(
             id=row.id,
             audio_id=row.audio_id,
             original_transcript=row.original_transcript,
             corrected_transcript=row.corrected_transcript,
             detected_language=row.detected_language,
-            language_probability=float(getattr(row, "language_probability", 0.0) or 0.0),
-            confidence=float(row.confidence or 0.0),
-            avg_logprob=float(meta.get("avg_logprob", 0.0) or 0.0),
-            no_speech_prob=float(meta.get("no_speech_prob", 0.0) or 0.0),
-            compression_ratio=float(meta.get("compression_ratio", 0.0) or 0.0),
+            language_probability=float(raw_lp_prob) if raw_lp_prob is not None else None,
+            confidence=float(raw_conf) if raw_conf is not None else None,
+            avg_logprob=float(meta["avg_logprob"]) if meta.get("avg_logprob") is not None else None,
+            no_speech_prob=float(meta["no_speech_prob"]) if meta.get("no_speech_prob") is not None else None,
+            compression_ratio=float(meta["compression_ratio"]) if meta.get("compression_ratio") is not None else None,
             translated_text=row.translated_text,
             target_language=row.target_language,
             translation_engine=row.translation_engine,
@@ -432,12 +441,16 @@ class TranscriptStore:
             recognition_model=str(meta.get("recognition_model", row.model) or row.model),
             recognition_quality=str(getattr(row, "recognition_quality", "medium") or "medium"),
             review_needed=bool(meta.get("review_needed", False)),
+            confidence_available=bool(meta.get("confidence_available", raw_conf is not None)),
+            language_probability_available=bool(meta.get("language_probability_available", raw_lp_prob is not None)),
             translation_provider=meta.get("translation_provider") or row.translation_engine,
             status=str(meta.get("status", "completed")),
             quality_flags=list(meta.get("quality_flags", [])),
             attempts=list(meta.get("attempts", [])),
             provider_status=dict(meta.get("provider_status", {})),
             provider_errors=list(meta.get("provider_errors", [])),
+            selection_reason=str(meta.get("selection_reason", "")),
+            selected_candidate=dict(meta.get("selected_candidate", {})),
             audio_diagnostics=dict(meta.get("audio_diagnostics", {})),
             translation_verification=meta.get("translation_verification"),
             eval_consent=bool(meta.get("eval_consent", False)),
@@ -449,6 +462,10 @@ class TranscriptStore:
         from .db.models import VoiceTranscriptRow
 
         meta = {
+            "confidence": rec.confidence,
+            "language_probability": rec.language_probability,
+            "confidence_available": rec.confidence_available,
+            "language_probability_available": rec.language_probability_available,
             "avg_logprob": rec.avg_logprob,
             "no_speech_prob": rec.no_speech_prob,
             "compression_ratio": rec.compression_ratio,
@@ -460,6 +477,8 @@ class TranscriptStore:
             "attempts": rec.attempts,
             "provider_status": rec.provider_status,
             "provider_errors": rec.provider_errors,
+            "selection_reason": rec.selection_reason,
+            "selected_candidate": rec.selected_candidate,
             "audio_diagnostics": rec.audio_diagnostics,
             "translation_verification": rec.translation_verification,
             "eval_consent": rec.eval_consent,
@@ -475,12 +494,12 @@ class TranscriptStore:
                         corrected_transcript=rec.corrected_transcript,
                         detected_language=rec.detected_language,
                         source_language=rec.source_language,
-                        language_probability=rec.language_probability,
+                        language_probability=float(rec.language_probability or 0.0),
                         recognition_quality=rec.recognition_quality,
                         target_language=rec.target_language,
                         translated_text=rec.translated_text,
                         translation_engine=rec.translation_engine,
-                        confidence=rec.confidence,
+                        confidence=float(rec.confidence or 0.0),
                         model=rec.model,
                         seconds=rec.seconds,
                         meta_json=json.dumps(meta, ensure_ascii=False),
@@ -752,9 +771,13 @@ class Translator:
     ) -> TranscriptRecord:
         """Build a TranscriptRecord with optional guarded correction & verified translation."""
         rec_id = str(stt_res.get("id") or stt_res.get("audio_id") or uuid.uuid4().hex[:16])
+        existing_rec = self.records.get(rec_id)
         raw_text = str(stt_res.get("text", "") or "").strip()
         lang = str(stt_res.get("detected_language", stt_res.get("language", "unknown")) or "unknown")
-        lang_prob = float(stt_res.get("language_probability", 0.0) or 0.0)
+        raw_lang_prob = stt_res.get("language_probability")
+        lang_prob = float(raw_lang_prob) if raw_lang_prob is not None else None
+        raw_conf = stt_res.get("confidence")
+        conf = float(raw_conf) if raw_conf is not None else None
         flags = list(stt_res.get("quality_flags", []))
         target = (target_override if target_override is not None else cfg.target_language) or "none"
 
@@ -815,6 +838,30 @@ class Translator:
                     log.warning("qwen translation failed: %s", e)
                     flags.append(f"translation_error:{e}")
 
+        # Never overwrite an earlier valid translation when a retry translation attempt errors out
+        if (
+            translated is None
+            and should_translate
+            and existing_rec is not None
+            and existing_rec.translated_text
+            and existing_rec.target_language == target
+            and any(f.startswith("translation_error:") for f in flags)
+        ):
+            translated = existing_rec.translated_text
+            engine = existing_rec.translation_engine
+            prev_v = dict(existing_rec.translation_verification or {})
+            prev_w = list(prev_v.get("warnings") or [])
+            if "translation_retry_failed_kept_previous" not in prev_w:
+                prev_w.append("translation_retry_failed_kept_previous")
+            verification = {
+                **prev_v,
+                "uncertain": True,
+                "warnings": prev_w,
+                "structural_check": True,
+                "semantic_equivalence_proven": False,
+                "previous_translation_preserved": True,
+            }
+
         rec_quality = str(stt_res.get("recognition_quality") or stt_res.get("quality") or "medium")
         provider_status = dict(stt_res.get("provider_status") or {})
         provider_errors = list(stt_res.get("provider_errors") or [])
@@ -822,6 +869,8 @@ class Translator:
         review_needed = bool(
             stt_res.get("review_needed", False)
             or rec_quality != "high"
+            or "provider_unavailable" in flags
+            or (provider_status and provider_status.get("available") is False)
             or translation_uncertain
             or bool(provider_errors)
         )
@@ -839,6 +888,9 @@ class Translator:
             status = "completed"
 
         model_name = str(stt_res.get("model", "") or "")
+        avg_lp = stt_res.get("avg_logprob")
+        no_sp = stt_res.get("no_speech_prob")
+        comp_r = stt_res.get("compression_ratio")
         rec = TranscriptRecord(
             id=rec_id,
             audio_id=stt_res.get("audio_id"),
@@ -847,12 +899,14 @@ class Translator:
             detected_language=lang,
             source_language=str(stt_res.get("source_language", lang) or lang),
             language_probability=lang_prob,
-            confidence=float(stt_res.get("confidence", 0.0) or 0.0),
-            avg_logprob=float(stt_res.get("avg_logprob", 0.0) or 0.0),
-            no_speech_prob=float(stt_res.get("no_speech_prob", 0.0) or 0.0),
-            compression_ratio=float(stt_res.get("compression_ratio", 0.0) or 0.0),
+            confidence=conf,
+            confidence_available=bool(stt_res.get("confidence_available", conf is not None)),
+            language_probability_available=bool(stt_res.get("language_probability_available", lang_prob is not None)),
+            avg_logprob=float(avg_lp) if avg_lp is not None else None,
+            no_speech_prob=float(no_sp) if no_sp is not None else None,
+            compression_ratio=float(comp_r) if comp_r is not None else None,
             translated_text=translated,
-            target_language=target if should_translate else "none",
+            target_language=target if (should_translate or translated is not None) else "none",
             translation_engine=engine,
             translation_provider=engine,
             model=model_name,
@@ -865,6 +919,8 @@ class Translator:
             attempts=list(stt_res.get("attempts", [])),
             provider_status=provider_status,
             provider_errors=provider_errors,
+            selection_reason=str(stt_res.get("selection_reason") or ""),
+            selected_candidate=dict(stt_res.get("selected_candidate") or {}),
             audio_diagnostics=dict(stt_res.get("audio_diagnostics", {})),
             translation_verification=verification,
             eval_consent=False,
@@ -878,7 +934,8 @@ class Translator:
         target_language: str | None = None,
         eval_consent: bool | None = None,
     ) -> TranscriptRecord | None:
-        """Persist a manual correction while keeping `original_transcript` completely immutable."""
+        """Persist a manual correction while keeping `original_transcript` completely immutable.
+        Never overwrites a previously valid translation if a new translation attempt fails."""
         rec = self.records.get(rec_id)
         if rec is None:
             return None
@@ -886,15 +943,54 @@ class Translator:
         if eval_consent is not None:
             rec.eval_consent = bool(eval_consent)
         tgt = target_language or rec.target_language
+        prev_translated = rec.translated_text
+        prev_target = rec.target_language
+        prev_engine = rec.translation_engine
+        prev_provider = rec.translation_provider
+        prev_ver = rec.translation_verification
+        prev_valid = bool(prev_translated and (prev_ver is None or prev_ver.get("passed", True)))
+
         if tgt and tgt != "none" and tgt != rec.detected_language and self.brain is not None:
-            rec.target_language = tgt
-            rec.translated_text, rec.translation_verification = await self.translate_text_with_verification(
-                rec.corrected_transcript,
-                rec.detected_language,
-                tgt,
-            )
-            rec.translation_engine = "qwen"
-            rec.translation_provider = "qwen"
+            try:
+                new_tr, new_ver = await self.translate_text_with_verification(
+                    rec.corrected_transcript,
+                    rec.detected_language,
+                    tgt,
+                )
+                if prev_valid and prev_target == tgt and (not new_tr.strip() or not new_ver.get("passed", True)):
+                    rec.translated_text = prev_translated
+                    rec.translation_engine = prev_engine
+                    rec.translation_provider = prev_provider
+                    rec.translation_verification = {
+                        **(prev_ver or {}),
+                        "uncertain": True,
+                        "warnings": list(dict.fromkeys([*((prev_ver or {}).get("warnings") or []), "translation_retry_failed_kept_previous"])),
+                        "structural_check": True,
+                        "semantic_equivalence_proven": False,
+                        "previous_translation_preserved": True,
+                    }
+                else:
+                    rec.target_language = tgt
+                    rec.translated_text = new_tr
+                    rec.translation_verification = new_ver
+                    rec.translation_engine = "qwen"
+                    rec.translation_provider = "qwen"
+            except Exception as e:
+                log.warning("translation during apply_correction failed: %s", e)
+                if prev_valid and prev_target == tgt:
+                    rec.translated_text = prev_translated
+                    rec.translation_engine = prev_engine
+                    rec.translation_provider = prev_provider
+                    rec.translation_verification = {
+                        **(prev_ver or {}),
+                        "uncertain": True,
+                        "warnings": list(dict.fromkeys([*((prev_ver or {}).get("warnings") or []), f"translation_error:{e}", "translation_retry_failed_kept_previous"])),
+                        "structural_check": True,
+                        "semantic_equivalence_proven": False,
+                        "previous_translation_preserved": True,
+                    }
+                else:
+                    rec.quality_flags.append(f"translation_error:{e}")
         elif target_language == "none":
             rec.target_language = "none"
             rec.translated_text = None
@@ -903,5 +999,12 @@ class Translator:
             rec.translation_verification = None
         if rec.corrected_transcript != rec.original_transcript and "human_corrected" not in rec.quality_flags:
             rec.quality_flags.append("human_corrected")
-        rec.status = "corrected" if rec.corrected_transcript else "empty"
+        tr_uncertain = bool(rec.translation_verification and rec.translation_verification.get("uncertain"))
+        if not rec.corrected_transcript:
+            rec.status = "empty"
+        elif tr_uncertain:
+            rec.status = "uncertain"
+        else:
+            rec.status = "corrected"
+        rec.review_needed = bool(tr_uncertain or rec.recognition_quality != "high")
         return self.records.put(rec)

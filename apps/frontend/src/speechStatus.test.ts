@@ -27,21 +27,33 @@ test("speech inspector status distinguishes high, review-needed, low, provider-u
   assert.equal(low.qualityLabel, "Low quality");
   assert.equal(low.qualityTone, "danger");
 
-  const missingProvider = classifyTranscriptStatus({
+  const unavailableOnly = classifyTranscriptStatus({
     recognition_quality: "high",
-    provider_status: { requested: "malayalam_whisper", available: false, reason: "missing" },
-    provider_errors: [{ provider: "malayalam_whisper", error: "missing" }],
+    review_needed: true,
+    confidence: null,
+    confidence_available: false,
+    provider_status: {
+      requested: "malayalam_whisper",
+      available: false,
+      state: "unavailable",
+      reason: "Model directory not installed",
+      expected_dir: "models/asr/whisper-small-malayalam-v2-ct2",
+    },
+    provider_errors: [],
   });
-  assert.equal(missingProvider.providerUnavailable, true);
-  assert.equal(missingProvider.hasProviderErrors, true);
-  assert.equal(missingProvider.qualityLabel, "Needs review");
+  assert.equal(unavailableOnly.providerUnavailable, true);
+  assert.equal(unavailableOnly.hasProviderErrors, false);
+  assert.equal(unavailableOnly.confidenceAvailable, false);
+  assert.equal(unavailableOnly.qualityLabel, "Needs review");
 
   const trUncertain = classifyTranscriptStatus({
     recognition_quality: "high",
     status: "uncertain",
+    confidence: 0.84,
     translation_verification: { passed: false, uncertain: true, warnings: ["missing_number:8080"] },
   });
   assert.equal(trUncertain.translationUncertain, true);
+  assert.equal(trUncertain.confidenceAvailable, true);
   assert.equal(trUncertain.qualityTone, "warn");
 });
 

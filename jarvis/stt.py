@@ -267,18 +267,23 @@ class AudioBufferStore:
         return n
 
 
-def _compute_confidence(segments: list) -> tuple[float, float | None, float | None, float | None]:
-    """Compute bounded confidence [0..1] + raw Whisper decoder quality metrics."""
+def _compute_confidence(segments: list) -> tuple[float | None, float | None, float | None, float | None]:
+    """Compute bounded confidence [0..1] + raw Whisper decoder quality metrics, or None if unavailable."""
     if not segments:
-        return 0.0, None, None, None
+        return None, None, None, None
+    lps = [getattr(s, "avg_logprob", None) for s in segments]
+    if all(lp is None for lp in lps):
+        return None, None, None, None
     weights = [max(1, len(getattr(s, "tokens", None) or [1])) for s in segments]
     total_w = sum(weights)
-    avg_logprob = sum(float(s.avg_logprob) * w for s, w in zip(segments, weights)) / total_w
-    no_speech = max(float(s.no_speech_prob) for s in segments)
-    comp_ratio = max(float(s.compression_ratio) for s in segments)
+    avg_logprob = sum(float(lp if lp is not None else -1.0) * w for lp, w in zip(lps, weights)) / total_w
+    ns_vals = [float(s.no_speech_prob) for s in segments if getattr(s, "no_speech_prob", None) is not None]
+    cr_vals = [float(s.compression_ratio) for s in segments if getattr(s, "compression_ratio", None) is not None]
+    no_speech = max(ns_vals) if ns_vals else 0.0
+    comp_ratio = max(cr_vals) if cr_vals else 1.0
     prob = math.exp(max(-5.0, min(0.0, avg_logprob)))
     conf = max(0.0, min(1.0, prob * (1.0 - 0.5 * no_speech)))
-    return round(conf, 3), round(avg_logprob, 3), round(no_speech, 3), round(comp_ratio, 2)
+    return round(conf, 3), round(avg_logprob, 3), (round(no_speech, 3) if ns_vals else None), (round(comp_ratio, 2) if cr_vals else None)
 
 
 def _has_repetition_loop(text: str) -> bool:
@@ -319,7 +324,8 @@ def evaluate_transcript_quality(
     """Evaluate ASR quality indicators without confusing confidence or length for truth."""
     text = (result.get("text") or "").strip()
     det_lang = (result.get("detected_language") or "en").lower()
-    lang_prob = float(result.get("language_probability") or 0.0)
+    raw_lang_prob = result.get("language_probability")
+    lang_prob = float(raw_lang_prob) if raw_lang_prob is not None else None
     avg_lp = result.get("avg_logprob")
     no_sp = result.get("no_speech_prob")
     comp_r = result.get("compression_ratio")
@@ -363,7 +369,7 @@ def evaluate_transcript_quality(
         retry_reasons.append(f"high_no_speech_prob:{no_sp}")
 
     req_l = (requested_language or "auto").strip().lower()
-    if req_l in ("auto", "") and lang_prob < 0.45 and text:
+    if req_l in ("auto", "") and lang_prob is not None and lang_prob < 0.45 and text:
         flags.append("low_language_confidence")
         retry_reasons.append(f"low_language_probability:{lang_prob}")
 
@@ -450,7 +456,8 @@ def _candidate_score(
     requested_language: str,
     all_candidates: list[dict] | None = None,
 ) -> float:
-    """Compare alternative transcripts cleanly using quality tier, script match, structural penalties, and cross-pass consistency."""
+    """Compare alternative transcripts cleanly using quality tier, script match, structural penalties, and cross-pass consistency.
+    Never rewards missing/synthetic confidence or mere transcript length over measured quality or script accuracy."""
     text = (candidate.get("text") or "").strip()
     if not text:
         return -10.0
@@ -459,14 +466,17 @@ def _candidate_score(
     score = 2.0 + (2.4 if tier == "high" else (0.6 if tier == "medium" else -1.6))
     avg_lp = candidate.get("avg_logprob")
     no_sp = candidate.get("no_speech_prob")
-    lang_p = float(candidate.get("language_probability") or 0.0)
+    raw_lang_p = candidate.get("language_probability")
     comp_r = float(candidate.get("compression_ratio") or 1.0)
 
+    # Neutral-centered tie-breakers only when real decoder metrics exist (missing metrics stay 0.0 -> never unfairly favoured)
     if avg_lp is not None:
-        score += max(-2.5, min(0.0, float(avg_lp))) * 1.1
-    if no_sp is not None:
-        score -= float(no_sp) * 1.6
-    score += 0.35 * lang_p
+        score += (max(-2.0, min(0.0, float(avg_lp))) + 0.65) * 0.45
+    if no_sp is not None and float(no_sp) > 0.15:
+        score -= (float(no_sp) - 0.15) * 1.6
+    req_l = (requested_language or "auto").lower()
+    if req_l in ("auto", "") and raw_lang_p is not None and candidate.get("language_probability_available", True):
+        score += max(0.0, float(raw_lang_p) - 0.5) * 0.35
 
     # Strong structural penalties — never reward noisy gibberish or length bias
     if "repetition_hallucination" in flags or comp_r >= 2.25:
@@ -607,7 +617,8 @@ class Whisper:
 
         conf, avg_lp, no_sp, comp_r = _compute_confidence(segs)
         detected_lang = getattr(info, "language", None) or (whisper_lang or "en")
-        lang_prob = round(float(getattr(info, "language_probability", 0.0) or 0.0), 3)
+        raw_lp_prob = getattr(info, "language_probability", None)
+        lang_prob = round(float(raw_lp_prob), 3) if raw_lp_prob is not None else None
         dur = round(float(getattr(info, "duration", len(audio) / SR) or 0.0), 2)
         dur_vad = round(float(getattr(info, "duration_after_vad", dur) or 0.0), 2)
         words = []
@@ -626,7 +637,9 @@ class Whisper:
             "text": text,
             "detected_language": detected_lang,
             "language_probability": lang_prob,
+            "language_probability_available": lang_prob is not None,
             "confidence": conf,
+            "confidence_available": conf is not None,
             "avg_logprob": avg_lp,
             "no_speech_prob": no_sp,
             "compression_ratio": comp_r,
@@ -637,31 +650,107 @@ class Whisper:
         }
         return segs, info, res
 
-    def _resolve_special_provider(
+    def _provider_expected_dirs(self, provider_name: str | None = None) -> list[str]:
+        ml_prov = self._providers.get("malayalam_whisper") or self.malayalam_provider
+        ic_prov = self._providers.get("indic_conformer") or self.indic_conformer
+        ml_dirs = [
+            str(getattr(ml_prov, "ct2_dir", "models/asr/whisper-small-malayalam-v2-ct2")),
+            str(getattr(ml_prov, "hf_dir", "models/asr/whisper-small-malayalam-v2")),
+        ]
+        ic_dirs = [str(getattr(ic_prov, "model_dir", "models/asr/indicconformer-ml"))]
+        if provider_name == "malayalam_whisper":
+            return ml_dirs
+        if provider_name == "indic_conformer":
+            return ic_dirs
+        return ml_dirs + ic_dirs
+
+    def _resolve_special_provider_status(
         self, req_lang: str, model_override: str | None = None
-    ) -> tuple[ASRProvider | None, str | None, str | None]:
+    ) -> tuple[ASRProvider | None, dict[str, Any] | None]:
         if model_override in self._providers and model_override != "faster_whisper":
             prov = self._providers[model_override]
+            exp_dirs = self._provider_expected_dirs(model_override)
             if prov.is_available():
-                return prov, model_override, None
-            return None, model_override, f"Local weights for specialist provider {model_override!r} are not installed."
+                return prov, {
+                    "requested": model_override,
+                    "available": True,
+                    "state": "ready",
+                    "reason": "ready",
+                    "expected_dir": exp_dirs[0],
+                    "expected_dirs": exp_dirs,
+                }
+            return None, {
+                "requested": model_override,
+                "available": False,
+                "state": "unavailable",
+                "reason": f"Specialised provider {model_override!r} weights are not installed locally.",
+                "expected_dir": exp_dirs[0],
+                "expected_dirs": exp_dirs,
+            }
 
         if req_lang == "ml":
             configured = (getattr(self.spec, "malayalam_model", "") or "").strip()
             if configured:
+                exp_dirs = self._provider_expected_dirs(configured)
                 if configured in self._providers and configured != "faster_whisper":
                     prov_ml = self._providers[configured]
                     if prov_ml.is_available():
-                        return prov_ml, configured, None
-                    return None, configured, f"Configured Malayalam provider {configured!r} is unavailable locally."
-                return None, configured, f"Configured Malayalam model {configured!r} was not recognized locally."
+                        return prov_ml, {
+                            "requested": configured,
+                            "available": True,
+                            "state": "ready",
+                            "reason": "ready",
+                            "expected_dir": exp_dirs[0],
+                            "expected_dirs": exp_dirs,
+                        }
+                    return None, {
+                        "requested": configured,
+                        "available": False,
+                        "state": "unavailable",
+                        "reason": f"Configured Malayalam provider {configured!r} is not installed locally; falling back to Faster-Whisper.",
+                        "expected_dir": exp_dirs[0],
+                        "expected_dirs": exp_dirs,
+                    }
+                return None, {
+                    "requested": configured,
+                    "available": False,
+                    "state": "unavailable",
+                    "reason": f"Configured Malayalam model {configured!r} was not found locally; falling back to Faster-Whisper.",
+                    "expected_dir": exp_dirs[0],
+                    "expected_dirs": exp_dirs,
+                }
             for auto_prov in (self.malayalam_provider, self.indic_conformer):
                 if auto_prov.is_available():
-                    return auto_prov, auto_prov.name, None
-        return None, None, None
+                    exp_dirs = self._provider_expected_dirs(auto_prov.name)
+                    return auto_prov, {
+                        "requested": auto_prov.name,
+                        "available": True,
+                        "state": "ready",
+                        "reason": "ready",
+                        "expected_dir": exp_dirs[0],
+                        "expected_dirs": exp_dirs,
+                    }
+            exp_dirs = self._provider_expected_dirs()
+            return None, {
+                "requested": "malayalam_asr",
+                "available": False,
+                "state": "unavailable",
+                "reason": "Specialised Malayalam ASR is unavailable (no local weights installed); continuing with Faster-Whisper.",
+                "expected_dir": exp_dirs[0],
+                "expected_dirs": exp_dirs,
+            }
+        return None, None
+
+    def _resolve_special_provider(
+        self, req_lang: str, model_override: str | None = None
+    ) -> tuple[ASRProvider | None, str | None, str | None]:
+        prov, st = self._resolve_special_provider_status(req_lang, model_override=model_override)
+        if st is None:
+            return None, None, None
+        return prov, st.get("requested"), (None if st.get("available") else st.get("reason"))
 
     def _choose_special_provider(self, req_lang: str, model_override: str | None = None) -> ASRProvider | None:
-        prov, _name, _reason = self._resolve_special_provider(req_lang, model_override=model_override)
+        prov, _st = self._resolve_special_provider_status(req_lang, model_override=model_override)
         return prov
 
     def transcribe(
@@ -726,8 +815,10 @@ class Whisper:
                 "text": "",
                 "original_transcript": "",
                 "detected_language": "en" if req_lang in ("auto", "mixed", "") else req_lang,
-                "language_probability": 0.0,
-                "confidence": 0.0,
+                "language_probability": None,
+                "language_probability_available": False,
+                "confidence": None,
+                "confidence_available": False,
                 "avg_logprob": None,
                 "no_speech_prob": 1.0,
                 "compression_ratio": None,
@@ -746,27 +837,28 @@ class Whisper:
                 "attempts": [],
                 "provider_status": {},
                 "provider_errors": [],
+                "selection_reason": "no_speech_energy",
+                "selected_candidate": {
+                    "provider": "none",
+                    "model": target_model,
+                    "reason": "no_speech_energy",
+                    "score": -10.0,
+                    "quality_tier": "low",
+                },
                 "audio_diagnostics": diag.to_dict(),
                 "words": [],
             }
 
         # Unified candidate pipeline: explicit/local Malayalam specialist runs first ONLY on explicit 'ml'
         # (never blindly on 'mixed'/'auto'), and only short-circuits if high quality with zero flags.
-        special, req_special_name, special_unavail_reason = self._resolve_special_provider(
-            req_lang, model_override=model_override
-        )
-        provider_status: dict[str, Any] = {}
+        special, prov_st = self._resolve_special_provider_status(req_lang, model_override=model_override)
+        req_special_name = prov_st.get("requested") if prov_st else None
+        provider_status: dict[str, Any] = dict(prov_st) if prov_st else {}
         provider_errors: list[dict[str, str]] = []
         extra_flags: list[str] = []
-        if req_special_name:
-            provider_status = {
-                "requested": req_special_name,
-                "available": special is not None,
-                "reason": special_unavail_reason or "ready",
-            }
-            if special is None and special_unavail_reason:
-                extra_flags.append("provider_unavailable")
-                provider_errors.append({"provider": req_special_name, "error": special_unavail_reason})
+        if provider_status and not provider_status.get("available", True):
+            # Missing local model is explicitly reported via provider_status + flag, NOT as a runtime provider error.
+            extra_flags.append("provider_unavailable")
 
         attempts: list[dict[str, Any]] = []
         candidates: list[tuple[dict, dict, str]] = []
@@ -798,8 +890,8 @@ class Whisper:
                     "model": res_spec.get("model", special.name),
                     "text": res_spec.get("text", ""),
                     "detected_language": res_spec.get("detected_language", "ml"),
-                    "language_probability": res_spec.get("language_probability", 0.0),
-                    "confidence": res_spec.get("confidence", 0.0),
+                    "language_probability": res_spec.get("language_probability"),
+                    "confidence": res_spec.get("confidence"),
                     "avg_logprob": res_spec.get("avg_logprob"),
                     "compression_ratio": res_spec.get("compression_ratio"),
                     "quality_tier": eval_spec["quality_tier"],
@@ -829,6 +921,14 @@ class Whisper:
                         "attempts": attempts,
                         "provider_status": provider_status,
                         "provider_errors": provider_errors,
+                        "selection_reason": reason_spec,
+                        "selected_candidate": {
+                            "provider": res_spec.get("provider", special.name),
+                            "model": res_spec.get("model", special.name),
+                            "reason": reason_spec,
+                            "score": score_spec,
+                            "quality_tier": eval_spec["quality_tier"],
+                        },
                         "audio_diagnostics": diag.to_dict(),
                     }
                 log.info(
@@ -840,14 +940,16 @@ class Whisper:
             except Exception as e:
                 err_msg = str(e)
                 log.warning("Specialized Malayalam provider %s failed: %s; falling back to Faster-Whisper", special.name, err_msg)
+                provider_status["state"] = "error"
+                provider_status["error"] = err_msg
                 provider_errors.append({"provider": special.name, "error": err_msg})
                 attempts.append({
                     "provider": special.name,
                     "model": req_special_name or special.name,
                     "text": "",
                     "detected_language": req_lang,
-                    "language_probability": 0.0,
-                    "confidence": 0.0,
+                    "language_probability": None,
+                    "confidence": None,
                     "avg_logprob": None,
                     "compression_ratio": None,
                     "quality_tier": "low",
@@ -1051,7 +1153,8 @@ class Whisper:
                         "reason": cand_reason,
                     })
                     candidates.append((cand_res, cand_eval, cand_reason))
-                    break
+                    if cand_eval["quality_tier"] != "low":
+                        break
                 except Exception as e:
                     err_msg = str(e)
                     log.warning("STT retry candidate (%s) failed: %s", cand_model, err_msg)
@@ -1079,8 +1182,8 @@ class Whisper:
                             "model": cand_res["model"],
                             "text": cand_res["text"],
                             "detected_language": cand_res["detected_language"],
-                            "language_probability": cand_res["language_probability"],
-                            "confidence": cand_res["confidence"],
+                            "language_probability": cand_res.get("language_probability"),
+                            "confidence": cand_res.get("confidence"),
                             "avg_logprob": cand_res.get("avg_logprob"),
                             "compression_ratio": cand_res.get("compression_ratio"),
                             "quality_tier": cand_eval["quality_tier"],
@@ -1098,8 +1201,8 @@ class Whisper:
                             "model": sp.name,
                             "text": "",
                             "detected_language": "ml",
-                            "language_probability": 0.0,
-                            "confidence": 0.0,
+                            "language_probability": None,
+                            "confidence": None,
                             "quality_tier": "low",
                             "flags": ["provider_error"],
                             "error": err_msg,
@@ -1109,16 +1212,29 @@ class Whisper:
 
         # Final candidate selection with cross-pass consistency scoring (respecting mixed code-switching guard)
         cand_dicts = [c[0] for c in candidates]
-        best_res, best_eval, _best_reason = candidates[0]
+        has_mixed_non_special = any(
+            c_res.get("provider") not in ("malayalam_whisper", "indic_conformer")
+            and _script_counts(c_res.get("text", ""))["latin"] > 0
+            and _script_counts(c_res.get("text", ""))["malayalam"] > 0
+            and "script_mismatch" not in c_ev["flags"]
+            for c_res, c_ev, _ in candidates
+        )
+        best_res, best_eval, best_reason = candidates[0]
         best_score = -999.0
         for cand_res, cand_eval, cand_reason in candidates:
-            # In mixed mode, avoid dropping technical English Latin tokens in favor of monolingual specialist output
+            # In mixed mode (or when a non-specialist pass cleanly preserved ML+EN code-switching),
+            # prevent a monolingual Malayalam specialist from stripping technical English Latin tokens.
             if (
-                req_lang == "mixed"
-                and cand_res.get("provider") in ("malayalam_whisper", "indic_conformer")
-                and _script_counts(primary_res.get("text", ""))["latin"] > 0
+                cand_res.get("provider") in ("malayalam_whisper", "indic_conformer")
                 and _script_counts(cand_res.get("text", ""))["latin"] == 0
-                and "script_mismatch" not in primary_eval["flags"]
+                and (
+                    has_mixed_non_special
+                    or (
+                        req_lang == "mixed"
+                        and _script_counts(primary_res.get("text", ""))["latin"] > 0
+                        and "script_mismatch" not in primary_eval["flags"]
+                    )
+                )
             ):
                 continue
             sc_val = _candidate_score(cand_res, cand_eval, req_lang, all_candidates=cand_dicts)
@@ -1127,7 +1243,7 @@ class Whisper:
                     att["score"] = sc_val
             if sc_val > best_score:
                 best_score = sc_val
-                best_res, best_eval = cand_res, cand_eval
+                best_res, best_eval, best_reason = cand_res, cand_eval, cand_reason
 
         initial_text = (attempts[0].get("text") if attempts else primary_res.get("text")) or primary_res.get("text", "")
         combined_flags = list(dict.fromkeys([*best_eval["flags"], *extra_flags]))
@@ -1150,5 +1266,13 @@ class Whisper:
             "attempts": attempts,
             "provider_status": provider_status,
             "provider_errors": provider_errors,
+            "selection_reason": best_reason,
+            "selected_candidate": {
+                "provider": best_res.get("provider", fw_model),
+                "model": best_res.get("model", fw_model),
+                "reason": best_reason,
+                "score": best_score,
+                "quality_tier": best_eval["quality_tier"],
+            },
             "audio_diagnostics": diag.to_dict(),
         }

@@ -68,18 +68,29 @@ def _coerce_options(options: ASROptions | dict | None) -> ASROptions:
     return ASROptions()
 
 
-def _segments_metrics(segments: list) -> tuple[float, float | None, float | None, float | None]:
+def _segments_metrics(segments: list) -> tuple[float | None, float | None, float | None, float | None]:
     if not segments:
-        return 0.0, None, None, None
+        return None, None, None, None
+    lps = [getattr(s, "avg_logprob", None) for s in segments]
+    if all(lp is None for lp in lps):
+        return None, None, None, None
     weights = [max(1, len(getattr(s, "tokens", []) or [1])) for s in segments]
     total_w = sum(weights)
-    avg_logprob = sum(float(getattr(s, "avg_logprob", -1.0)) * w for s, w in zip(segments, weights)) / total_w
-    no_speech = max(float(getattr(s, "no_speech_prob", 0.0)) for s in segments)
-    comp_ratio = max(float(getattr(s, "compression_ratio", 1.0)) for s in segments)
+    avg_logprob = sum(float(lp if lp is not None else -1.0) * w for lp, w in zip(lps, weights)) / total_w
+    no_speech_vals = [float(v) for s in segments if (v := getattr(s, "no_speech_prob", None)) is not None]
+    comp_vals = [float(v) for s in segments if (v := getattr(s, "compression_ratio", None)) is not None]
+    no_speech = max(no_speech_vals) if no_speech_vals else None
+    comp_ratio = max(comp_vals) if comp_vals else None
     import math
     prob = math.exp(max(-5.0, min(0.0, avg_logprob)))
-    conf = max(0.0, min(1.0, prob * (1.0 - 0.5 * no_speech)))
-    return round(conf, 3), round(avg_logprob, 3), round(no_speech, 3), round(comp_ratio, 2)
+    ns_factor = 1.0 - 0.5 * (no_speech if no_speech is not None else 0.0)
+    conf = max(0.0, min(1.0, prob * ns_factor))
+    return (
+        round(conf, 3),
+        round(avg_logprob, 3),
+        round(no_speech, 3) if no_speech is not None else None,
+        round(comp_ratio, 2) if comp_ratio is not None else None,
+    )
 
 
 class FasterWhisperProvider(ASRProvider):
@@ -351,8 +362,10 @@ class MalayalamASRProvider(ASRProvider):
                 "model": "whisper-small-malayalam-v2",
                 "text": text,
                 "detected_language": "ml",
-                "language_probability": 1.0,
+                "language_probability": None,
+                "language_probability_available": False,
                 "confidence": conf,
+                "confidence_available": conf is not None,
                 "avg_logprob": avg_lp,
                 "no_speech_prob": no_sp,
                 "compression_ratio": comp_r,
@@ -389,8 +402,10 @@ class MalayalamASRProvider(ASRProvider):
             "model": "whisper-small-malayalam-v2",
             "text": text,
             "detected_language": "ml",
-            "language_probability": 0.95,
-            "confidence": 0.72 if text else 0.0,
+            "language_probability": None,
+            "language_probability_available": False,
+            "confidence": None,
+            "confidence_available": False,
             "avg_logprob": None,
             "no_speech_prob": None,
             "compression_ratio": None,
@@ -476,8 +491,10 @@ class IndicConformerProvider(ASRProvider):
             "model": "indicconformer-ml",
             "text": text,
             "detected_language": "ml",
-            "language_probability": 1.0,
-            "confidence": 0.78 if text else 0.0,
+            "language_probability": None,
+            "language_probability_available": False,
+            "confidence": None,
+            "confidence_available": False,
             "avg_logprob": None,
             "no_speech_prob": None,
             "compression_ratio": None,

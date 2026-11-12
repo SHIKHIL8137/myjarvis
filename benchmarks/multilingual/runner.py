@@ -57,6 +57,7 @@ def _summarize_group(rows: list[dict]) -> dict:
             if lang_checked else None
         ),
         "script_mismatch_count": script_mismatches,
+        "script_mismatch_rate": round(script_mismatches / len(rows), 4) if rows else 0.0,
         "empty_count": empties,
         "hallucination_or_loop_count": hallucinations,
         "low_quality_count": low_q,
@@ -231,8 +232,8 @@ def render_comparison_markdown(report: dict) -> str:
         "",
         "## Model & Preset Summary",
         "",
-        "| Model | Preset | Load (s) | Peak RSS (MB) | Mean Latency (s) | Mean RTF | Lang Acc | Mean WER | Mean CER | Sub Rate | Del Rate | Ins Rate | Script Mismatch | Empty | Hallucinations |",
-        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| Model | Preset | Load (s) | Peak RSS (MB) | Mean Latency (s) | Mean RTF | Lang Acc | Mean WER | Mean CER | Sub Rate | Del Rate | Ins Rate | Script Mismatch | Mismatch Rate | Empty | Hallucinations |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for r in report.get("runs", []):
         o = r["overall"]
@@ -242,20 +243,22 @@ def render_comparison_markdown(report: dict) -> str:
             f"{o['mean_seconds']:.2f} | {o['mean_rtf'] or 0.0:.2f}x | {fmt_pct(o['lang_detection_accuracy'])} | "
             f"{fmt_pct(o['mean_wer'])} | {fmt_pct(o['mean_cer'])} | {fmt_pct(o['mean_sub_rate'])} | "
             f"{fmt_pct(o['mean_del_rate'])} | {fmt_pct(o['mean_ins_rate'])} | "
-            f"{o.get('script_mismatch_count', 0)} | {o.get('empty_count', 0)} | {o.get('hallucination_or_loop_count', 0)} |"
+            f"{o.get('script_mismatch_count', 0)} | {fmt_pct(o.get('script_mismatch_rate'))} | {o.get('empty_count', 0)} | {o.get('hallucination_or_loop_count', 0)} |"
         )
     lines.append("")
     lines.append("## Per-Language Breakdown")
     lines.append("")
-    lines.append("| Model | Preset | Language | Samples | Evaluated | Lang Acc | WER | CER | Script Mismatch | Empty |")
-    lines.append("|---|---|---|---:|---:|---:|---:|---:|---:|---:|")
+    lines.append("> WER/CER are computed strictly on samples with `reference_verified: true`; unverified or missing references report `N/A`.")
+    lines.append("")
+    lines.append("| Model | Preset | Language | Samples | Evaluated | Lang Acc | WER | CER | Script Mismatch | Mismatch Rate | Empty |")
+    lines.append("|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|")
     for r in report.get("runs", []):
         for lang, g in r.get("by_language", {}).items():
             fmt_pct = lambda v: f"{v * 100:.1f}%" if isinstance(v, (int, float)) else "N/A"
             lines.append(
                 f"| {r['model']} | {r['quality']} | `{lang}` | {g['count']} | {g['evaluated_count']} | "
                 f"{fmt_pct(g['lang_detection_accuracy'])} | {fmt_pct(g['mean_wer'])} | {fmt_pct(g['mean_cer'])} | "
-                f"{g.get('script_mismatch_count', 0)} | {g.get('empty_count', 0)} |"
+                f"{g.get('script_mismatch_count', 0)} | {fmt_pct(g.get('script_mismatch_rate'))} | {g.get('empty_count', 0)} |"
             )
     return "\n".join(lines) + "\n"
 

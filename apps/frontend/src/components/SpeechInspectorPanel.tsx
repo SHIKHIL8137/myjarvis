@@ -8,7 +8,9 @@ export interface VoiceAttemptItem {
   language?: string | null;
   quality?: string;
   quality_tier?: string;
-  confidence?: number;
+  confidence?: number | null;
+  confidence_available?: boolean;
+  language_probability?: number | null;
   score?: number;
   detected_language?: string;
   text?: string;
@@ -24,8 +26,10 @@ export interface VoiceTranscriptItem {
   corrected_transcript: string;
   detected_language: string;
   source_language?: string;
-  language_probability?: number;
-  confidence: number;
+  language_probability?: number | null;
+  language_probability_available?: boolean;
+  confidence?: number | null;
+  confidence_available?: boolean;
   translated_text?: string | null;
   target_language?: string;
   translation_engine?: string | null;
@@ -36,11 +40,22 @@ export interface VoiceTranscriptItem {
   created_at?: number;
   status?: string;
   quality_flags?: string[];
+  selection_reason?: string;
+  selected_candidate?: {
+    provider?: string;
+    model?: string;
+    reason?: string;
+    score?: number;
+    quality_tier?: string;
+  } | null;
   attempts?: VoiceAttemptItem[];
   provider_status?: {
     requested?: string;
     available?: boolean;
+    state?: string;
     reason?: string;
+    expected_dir?: string;
+    expected_dirs?: string[];
   };
   provider_errors?: Array<{
     provider?: string;
@@ -64,7 +79,9 @@ export interface VoiceTranscriptItem {
     uncertain?: boolean;
     warnings?: string[];
     score?: number;
+    structural_check?: boolean;
     semantic_equivalence_proven?: boolean;
+    previous_translation_preserved?: boolean;
     check_method?: string;
     note?: string;
   } | null;
@@ -219,7 +236,8 @@ export const SpeechInspectorPanel: React.FC<SpeechInspectorPanelProps> = ({
   };
 
   const diag = active?.audio_diagnostics;
-  const confPct = Math.round((active?.confidence || 0) * 100);
+  const confAvailable = active?.confidence != null && active?.confidence_available !== false;
+  const confPct = confAvailable ? Math.round((active?.confidence || 0) * 100) : null;
   const recQuality = active?.recognition_quality || "medium";
   const statusSummary = classifyTranscriptStatus(active);
   const qualityBadge = { label: statusSummary.qualityLabel, cls: statusSummary.qualityTone };
@@ -242,16 +260,20 @@ export const SpeechInspectorPanel: React.FC<SpeechInspectorPanelProps> = ({
         <div className="speech-inspector-body" style={{ display: "grid", gap: 8 }}>
           {records.length > 1 && (
             <div className="row wrap" style={{ gap: 6 }}>
-              {records.slice(0, 6).map((r) => (
-                <button
-                  key={r.id}
-                  className={r.id === active.id ? "active" : "ghost"}
-                  onClick={() => selectRecord(r)}
-                  style={{ fontSize: 11.5, padding: "4px 8px" }}
-                >
-                  {r.detected_language.toUpperCase()} · {Math.round((r.confidence || 0) * 100)}% · {(r.corrected_transcript || r.original_transcript || "(empty)").slice(0, 22)}
-                </button>
-              ))}
+              {records.slice(0, 6).map((r) => {
+                const rConfKnown = r.confidence != null && r.confidence_available !== false;
+                const rConfLabel = rConfKnown ? `${Math.round((r.confidence || 0) * 100)}%` : "Conf N/A";
+                return (
+                  <button
+                    key={r.id}
+                    className={r.id === active.id ? "active" : "ghost"}
+                    onClick={() => selectRecord(r)}
+                    style={{ fontSize: 11.5, padding: "4px 8px" }}
+                  >
+                    {r.detected_language.toUpperCase()} · {rConfLabel} · {(r.corrected_transcript || r.original_transcript || "(empty)").slice(0, 22)}
+                  </button>
+                );
+              })}
             </div>
           )}
 
@@ -259,13 +281,17 @@ export const SpeechInspectorPanel: React.FC<SpeechInspectorPanelProps> = ({
             <div className="row wrap" style={{ gap: 6 }}>
               <span className="pill info">Lang: {active.detected_language}</span>
               <span className={`pill ${qualityBadge.cls}`}>{qualityBadge.label}</span>
-              <span className={`pill ${confPct >= 75 ? "ok" : confPct >= 50 ? "warn" : "danger"}`}>
-                Conf: {confPct}%
-              </span>
+              {confPct !== null ? (
+                <span className={`pill ${confPct >= 75 ? "ok" : confPct >= 50 ? "warn" : "danger"}`}>
+                  Conf: {confPct}%
+                </span>
+              ) : (
+                <span className="pill warn">Conf: unavailable</span>
+              )}
               {active.model && <span className="chip static">{active.model} · {recQuality}</span>}
               {active.status === "uncertain" && <span className="pill warn">Uncertain</span>}
               {active.provider_status?.available === false && (
-                <span className="pill danger">
+                <span className="pill warn">
                   Provider unavailable: {active.provider_status.requested || "specialist"}
                 </span>
               )}
@@ -285,13 +311,16 @@ export const SpeechInspectorPanel: React.FC<SpeechInspectorPanelProps> = ({
 
           {((active.provider_errors && active.provider_errors.length > 0) || active.provider_status?.available === false) && (
             <div className="card" style={{ padding: "6px 10px", borderColor: "var(--warn, #d97706)" }}>
-              <small className="dim">Provider / Fallback Notes</small>
+              <small className="dim">Provider Status &amp; Fallback Diagnostics</small>
               <div className="mono" style={{ fontSize: 11.5, marginTop: 2 }}>
                 {active.provider_status?.available === false && (
-                  <div>{active.provider_status.requested}: {active.provider_status.reason || "Unavailable locally; fell back."}</div>
+                  <div>
+                    Unavailable ({active.provider_status.requested || "specialist"}): {active.provider_status.reason || "Not installed locally; fell back to Whisper."}
+                    {active.provider_status.expected_dir ? ` · Expected dir: ${active.provider_status.expected_dir}` : ""}
+                  </div>
                 )}
                 {active.provider_errors?.map((pe, idx) => (
-                  <div key={idx}>{pe.provider || pe.model || "provider"}: {pe.error}</div>
+                  <div key={idx}>Runtime error ({pe.provider || pe.model || "provider"}): {pe.error}</div>
                 ))}
               </div>
             </div>
@@ -374,23 +403,28 @@ export const SpeechInspectorPanel: React.FC<SpeechInspectorPanelProps> = ({
 
           {active.translated_text && (
             <div className="card" style={{ padding: "8px 10px" }}>
-              <div className="row between">
+              <div className="row wrap between" style={{ gap: 6 }}>
                 <small className="dim">
                   Translated ({active.target_language}) · {active.translation_engine || "qwen"}
                 </small>
-                {active.translation_verification && (
-                  <span
-                    className={`pill ${active.translation_verification.uncertain ? "warn" : "ok"}`}
-                    title={active.translation_verification.note || "Heuristic structural verification"}
-                  >
-                    {active.translation_verification.uncertain
-                      ? `Translation uncertain: ${(active.translation_verification.warnings || []).join(", ")}`
-                      : "Heuristic anchors OK"}
-                  </span>
-                )}
+                <div className="row wrap" style={{ gap: 6 }}>
+                  {active.translation_verification?.previous_translation_preserved && (
+                    <span className="pill warn">Previous valid translation preserved</span>
+                  )}
+                  {active.translation_verification && (
+                    <span
+                      className={`pill ${active.translation_verification.uncertain ? "warn" : "info"}`}
+                      title={active.translation_verification.note || "Structural anchor check only"}
+                    >
+                      {active.translation_verification.uncertain
+                        ? `Translation uncertain: ${(active.translation_verification.warnings || []).join(", ")}`
+                        : "Structural check passed (not semantic proof)"}
+                    </span>
+                  )}
+                </div>
               </div>
               <p style={{ margin: "4px 0 0", fontSize: 13 }}>{active.translated_text}</p>
-              {active.translation_verification?.uncertain && active.translation_verification.note && (
+              {active.translation_verification?.note && (
                 <small className="dim" style={{ display: "block", marginTop: 4 }}>
                   {active.translation_verification.note}
                 </small>
@@ -432,11 +466,23 @@ export const SpeechInspectorPanel: React.FC<SpeechInspectorPanelProps> = ({
               </div>
               {showAttempts && active.attempts && (
                 <div style={{ marginTop: 6, display: "grid", gap: 4 }}>
-                  {active.attempts.map((a, idx) => (
-                    <div key={idx} className="dim mono" style={{ fontSize: 11 }}>
-                      #{idx + 1} [{a.provider || "fw"}/{a.model}/{a.quality_tier || a.quality || "?"} {a.reason ? `(${a.reason}) ` : ""}lang={a.language || a.detected_language}] score={a.score} conf={Math.round((a.confidence || 0) * 100)}%: {a.error ? `ERROR: ${a.error}` : a.text}
+                  {active.selection_reason && (
+                    <div className="dim mono" style={{ fontSize: 11 }}>
+                      Winner reason: {active.selection_reason}
+                      {active.selected_candidate
+                        ? ` (${active.selected_candidate.provider || "fw"}/${active.selected_candidate.model || "?"}, score=${active.selected_candidate.score ?? "?"})`
+                        : ""}
                     </div>
-                  ))}
+                  )}
+                  {active.attempts.map((a, idx) => {
+                    const aConfKnown = a.confidence != null && a.confidence_available !== false;
+                    const aConfText = aConfKnown ? `${Math.round((a.confidence || 0) * 100)}%` : "unavailable";
+                    return (
+                      <div key={idx} className="dim mono" style={{ fontSize: 11 }}>
+                        #{idx + 1} [{a.provider || "fw"}/{a.model}/{a.quality_tier || a.quality || "?"} {a.reason ? `(${a.reason}) ` : ""}lang={a.language || a.detected_language}] score={a.score} conf={aConfText}: {a.error ? `ERROR: ${a.error}` : a.text}
+                      </div>
+                    );
+                  })}
                 </div>
               )}
             </div>

@@ -123,4 +123,15 @@ Executed with real hardware (`[1] Microphone Array (Realtek(R) Audio)` at 44.1 k
 - **Frontend (`apps/frontend`)**: `npm test` **7 passed, 0 failed** (`graphCore.test.ts` + `speechStatus.test.ts`); `tsc --noEmit && vite build` transformed `43` modules (`dist/assets/index-CT6zLmQu.js` `266.86 kB`).
 - **Separated Synthetic vs Real Benchmarks**:
   - `benchmarks/multilingual/manifest.json` (`15` verified English WAVs): `small balanced` `10.7%` WER / `3.7%` CER / `0` script mismatches / `0` hallucinations; `base balanced` `12.9%` WER / `3.5%` CER / `0` script mismatches / `0` hallucinations.
-  - `benchmarks/multilingual/manifest_live.json` (`4` live mic WAVs, no fabricated references, `WER=N/A`): `en` (`2/2` clean), `ml` (`1` `script_mismatch` flagged on generic `small`), `mixed` (`1` `empty` short-circuit on silent input, `0` hallucinations).
+  - `manifest_live.json` (`4` live mic WAVs, no fabricated references, `WER=N/A`): `en` (`2/2` clean), `ml` (`1` `script_mismatch` flagged on generic `small`), `mixed` (`1` `empty` short-circuit on silent input, `0` hallucinations).
+
+## Final Speech Pipeline Reliability Fixes Verification (2026-11-12)
+
+- **Full Python Test Suite (`.\.venv\Scripts\pytest.exe -q -rs`)**: **233 passed, 4 skipped, 0 failed** (`236.48s`).
+  - Skipped (host prerequisites absent): Docker daemon not active (`test_p10_11_hardening.py:221`, `test_p10_12_hardening.py:165`) and `JARVIS_PG_TEST_URL` / `JARVIS_PG_SCRATCH_URL` unset (`test_p10_11_hardening.py:378`, `test_p10_pgvector_memory.py:193`).
+- **Focused Speech Suite (`tests/test_speech_pipeline_upgrade.py tests/test_multilingual_stt.py tests/test_speech.py -k "not mic"`)**: **28 passed, 3 deselected, 0 failed** (`11.92s`), including `test_final_reliability_provider_availability_honest_confidence_and_preservation`.
+- **Static Checks**: `ruff check jarvis/stt.py jarvis/asr_providers.py jarvis/translator.py jarvis/api.py tests/test_speech_pipeline_upgrade.py benchmarks/multilingual/runner.py` (`All checks passed!`) and `mypy jarvis/stt.py jarvis/asr_providers.py jarvis/translator.py benchmarks/multilingual/runner.py` (`Success: no issues found in 4 source files`) exited `0`.
+- **Frontend (`apps/frontend`)**: `npm test` **7 passed, 0 failed** (`graphCore.test.ts` + `speechStatus.test.ts`); `tsc --noEmit && vite build` transformed `43` modules (`dist/assets/index-Ubz16Thc.js` `267.95 kB`).
+- **Separated Synthetic vs Real Benchmarks**:
+  - `benchmarks/multilingual/manifest.json` (`15` verified English WAVs): `base balanced` `12.9%` WER / `3.5%` CER (`2.10s` mean latency, `0` script mismatches, `0` hallucinations); `small balanced` `10.7%` WER / `3.7%` CER (`3.55s` mean latency, `0` script mismatches, `0` hallucinations).
+  - `benchmarks/multilingual/manifest_live.json` (`4` live mic WAVs, `Verified Reference Counts: {}`, `WER/CER = N/A`): `small balanced` flagged `ml` `script_mismatch` (`1/1` = `100.0%` mismatch rate, `25.0%` overall) and `mixed` silent input short-circuited (`1` empty, `0` hallucinations). Malayalam evaluation procedure documented in [benchmarks/multilingual/README.md](benchmarks/multilingual/README.md).

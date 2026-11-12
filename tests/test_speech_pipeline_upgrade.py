@@ -24,7 +24,7 @@ from jarvis.audio_preprocess import (
 from jarvis.brain import Brain
 from jarvis.config import load_settings
 from jarvis.db.engine import DatabaseManager
-from jarvis.stt import AudioBufferStore, Whisper, evaluate_transcript_quality
+from jarvis.stt import AudioBufferStore, Whisper, _candidate_score, evaluate_transcript_quality
 from jarvis.translator import (
     TranscriptRecord,
     TranscriptStore,
@@ -485,13 +485,16 @@ def test_malayalam_provider_fallback_matrix_and_mixed_guard(tmp_path, monkeypatc
     assert r_err["provider_errors"] and r_err["provider_errors"][0]["provider"] == "malayalam_whisper"
     assert any(a.get("error") for a in r_err["attempts"])
 
-    # 5. Specialist configured but missing on disk -> provider_status + provider_unavailable flag + FW works
+    # 5. Specialist configured but missing on disk -> provider_status (unavailable, NOT provider_errors) + expected_dir + FW works
     sp_unavail = _FakeSpecialProvider("unavailable")
     w.malayalam_provider = sp_unavail
     w._providers["malayalam_whisper"] = sp_unavail
     r_unavail = w.transcribe(audio, language="ml", save_audio=False)
     assert r_unavail["provider"] == "faster_whisper"
     assert r_unavail["provider_status"]["available"] is False
+    assert r_unavail["provider_status"].get("state") == "unavailable"
+    assert r_unavail["provider_status"].get("expected_dir")
+    assert r_unavail["provider_errors"] == []
     assert "provider_unavailable" in r_unavail["quality_flags"]
 
     # 6. Mixed Malayalam-English does NOT blindly use monolingual specialist or drop tech English tokens
@@ -617,4 +620,207 @@ async def test_phase4_and_5_guards_translation_and_api_visibility(tmp_path, monk
         assert body["review_needed"] is False
         assert body["status"] == "completed"
         assert body["provider_errors"] == []
+
+
+@pytest.mark.anyio
+async def test_final_reliability_provider_availability_honest_confidence_and_preservation(tmp_path, monkeypatch):
+    """Covers uninstalled Malayalam provider status, unavailable vs error, honest None confidence & ranking, mixed preservation, translation non-overwrite, and API/selection visibility."""
+    audio = _speech_like(1.5, 16000, amp=0.25)
+
+    # 1. No Malayalam provider installed locally + malayalam_model="" -> explicit provider_status + FW fallback + review_needed on script_mismatch + no fake provider_errors
+    s = load_settings()
+    s.stt.model = "base"
+    s.stt.malayalam_model = ""
+    s.stt.audio_store_dir = str(tmp_path / "aud_uninst")
+    w = Whisper(s.stt)
+    monkeypatch.setattr(w.malayalam_provider, "is_available", lambda: False)
+    monkeypatch.setattr(w.indic_conformer, "is_available", lambda: False)
+
+    class _ScriptMismatchFW:
+        def transcribe(self, audio_arr, **kw):
+            return [_DummySegment("open project directory today", avg_logprob=-0.22, no_speech_prob=0.05)], _DummyInfo("ml", 0.91)
+
+    monkeypatch.setattr(w, "load", lambda m=None: _ScriptMismatchFW())
+    r_ml_miss = w.transcribe(audio, language="ml", save_audio=False)
+    assert r_ml_miss["provider"] == "faster_whisper"
+    assert r_ml_miss["provider_status"]["available"] is False
+    assert r_ml_miss["provider_status"]["state"] == "unavailable"
+    assert r_ml_miss["provider_status"]["expected_dir"]
+    assert len(r_ml_miss["provider_status"]["expected_dirs"]) >= 2
+    assert r_ml_miss["provider_errors"] == []
+    assert "provider_unavailable" in r_ml_miss["quality_flags"]
+    assert "script_mismatch" in r_ml_miss["quality_flags"]
+    assert r_ml_miss["recognition_quality"] == "low"
+    assert r_ml_miss["review_needed"] is True
+    assert r_ml_miss["selection_reason"]
+    assert r_ml_miss["selected_candidate"]["provider"] == "faster_whisper"
+
+    # 2. Honest None confidence in MalayalamASRProvider (HF branch) and IndicConformerProvider (no hardcoded 0.72/0.78/1.0)
+    ml_dir = tmp_path / "ml_hf"
+    ml_dir.mkdir()
+    (ml_dir / "config.json").write_text("{}", encoding="utf-8")
+
+    class _FakeHF:
+        def __call__(self, *args, **kwargs):
+            return {"text": "ഇന്ന് കാലാവസ്ഥ നല്ലതാണ്"}
+
+    ml_prov = MalayalamASRProvider(model_dir=ml_dir, ct2_dir=tmp_path / "missing_ct2")
+    monkeypatch.setattr(ml_prov, "_has_ct2", lambda: False)
+    monkeypatch.setattr(ml_prov, "_has_hf", lambda: True)
+    ml_prov._hf_pipe = _FakeHF()
+    ml_out = ml_prov.transcribe(audio)
+    assert ml_out["confidence"] is None
+    assert ml_out["confidence_available"] is False
+    assert ml_out["language_probability"] is None
+    assert ml_out["language_probability_available"] is False
+
+    ic_dir = tmp_path / "ic_onnx"
+    ic_dir.mkdir()
+    (ic_dir / "model.onnx").write_text("stub", encoding="utf-8")
+    (ic_dir / "tokens.txt").write_text("a 0\n", encoding="utf-8")
+
+    class _FakeStream:
+        def __init__(self):
+            self.result = type("Res", (), {"text": "ഇന്ന് സമയം എന്താണ്"})()
+
+        def accept_waveform(self, sr, samples):
+            return None
+
+    class _FakeSherpa:
+        def create_stream(self):
+            return _FakeStream()
+
+        def decode_stream(self, stream):
+            return None
+
+    ic_prov = IndicConformerProvider(model_dir=ic_dir)
+    monkeypatch.setattr(ic_prov, "is_available", lambda: True)
+    ic_prov._recognizer = _FakeSherpa()
+    ic_out = ic_prov.transcribe(audio)
+    assert ic_out["confidence"] is None
+    assert ic_out["confidence_available"] is False
+    assert ic_out["language_probability"] is None
+    assert ic_out["language_probability_available"] is False
+
+    # 3. Candidate ranking fairness when confidence/logprob is None:
+    # Unmeasured candidate (avg_logprob=None) with equal quality_tier must NOT unfairly outscore clean measured FW (-0.20),
+    # while clean Malayalam specialist (avg_logprob=None) MUST still beat wrong-script FW!
+    clean_measured_fw = {
+        "provider": "faster_whisper",
+        "text": "ഇന്ന് കാലാവസ്ഥ നല്ലതാണ്",
+        "detected_language": "ml",
+        "language_probability": 0.94,
+        "avg_logprob": -0.20,
+        "no_speech_prob": 0.04,
+        "duration_s": 1.6,
+    }
+    clean_unmeasured_sp = {
+        "provider": "malayalam_whisper",
+        "text": "ഇന്ന് കാലാവസ്ഥ നല്ലതാണ്",
+        "detected_language": "ml",
+        "language_probability": None,
+        "avg_logprob": None,
+        "no_speech_prob": None,
+        "duration_s": 1.6,
+    }
+    wrong_script_fw = {
+        "provider": "faster_whisper",
+        "text": "njan project open cheyyam",
+        "detected_language": "ml",
+        "language_probability": 0.92,
+        "avg_logprob": -0.18,
+        "no_speech_prob": 0.04,
+        "duration_s": 1.6,
+    }
+    ev_fw = evaluate_transcript_quality(clean_measured_fw, requested_language="ml")
+    ev_sp = evaluate_transcript_quality(clean_unmeasured_sp, requested_language="ml")
+    ev_wrong = evaluate_transcript_quality(wrong_script_fw, requested_language="ml")
+    assert _candidate_score(clean_measured_fw, ev_fw, "ml") >= _candidate_score(clean_unmeasured_sp, ev_sp, "ml")
+    assert _candidate_score(clean_unmeasured_sp, ev_sp, "ml") > _candidate_score(wrong_script_fw, ev_wrong, "ml")
+
+    # 4. Mixed-language candidate preservation: code-switched non-specialist wins over monolingual specialist
+    mixed_cand = {
+        "provider": "faster_whisper",
+        "text": "Server restart ചെയ്യൂ port 8080ൽ",
+        "detected_language": "ml",
+        "language_probability": 0.90,
+        "avg_logprob": -0.25,
+        "no_speech_prob": 0.05,
+        "duration_s": 1.6,
+    }
+    mono_sp = {
+        "provider": "malayalam_whisper",
+        "text": "സെർവർ റീസ്റ്റാർട്ട് ചെയ്യൂ പോർട്ട്",
+        "detected_language": "ml",
+        "language_probability": None,
+        "avg_logprob": None,
+        "no_speech_prob": None,
+        "duration_s": 1.6,
+    }
+    assert _candidate_score(mixed_cand, evaluate_transcript_quality(mixed_cand, requested_language="ml"), "ml") > _candidate_score(
+        mono_sp, evaluate_transcript_quality(mono_sp, requested_language="ml"), "ml"
+    )
+
+    # 5. Translation apply_correction never overwrites valid previous translation when retry fails
+    class _ToggleBrain:
+        def __init__(self):
+            self.fail = False
+
+        async def complete(self, *args, **kwargs):
+            if self.fail:
+                raise RuntimeError("ollama timeout")
+            return "Restart the Server on port 8080 tomorrow."
+
+    tb = _ToggleBrain()
+    tr = Translator(w, brain=tb)
+    rec = await tr.process_stt(
+        {
+            "text": "Server restart ചെയ്യൂ port 8080ൽ tomorrow",
+            "detected_language": "ml",
+            "language_probability": None,
+            "confidence": None,
+            "confidence_available": False,
+            "language_probability_available": False,
+            "provider_status": r_ml_miss["provider_status"],
+            "selection_reason": "only_candidate",
+        },
+        s.translation,
+        target_override="en",
+    )
+    assert rec.confidence is None
+    assert rec.confidence_available is False
+    assert rec.review_needed is True
+    assert rec.translated_text == "Restart the Server on port 8080 tomorrow."
+    assert rec.translation_verification and rec.translation_verification.get("structural_check") is True
+
+    tb.fail = True
+    updated = await tr.apply_correction(rec.id, "Server restart ചെയ്യൂ port 8080ൽ tomorrow", target_language="en")
+    assert updated is not None
+    assert updated.translated_text == "Restart the Server on port 8080 tomorrow."
+    assert updated.translation_verification is not None
+    assert updated.translation_verification.get("previous_translation_preserved") is True
+    assert "translation_retry_failed_kept_previous" in updated.translation_verification.get("warnings", [])
+
+    # 6. End-to-end /api/voice/hear exposes provider_status (unavailable, no errors), selection_reason, and review_needed cleanly
+    s_api = load_settings()
+    s_api.stt.malayalam_model = ""
+    s_api.stt.audio_store_dir = str(tmp_path / "aud_api2")
+    asst = Assistant(s_api, data_dir=tmp_path / "api_data", brain=Brain(s_api))
+    monkeypatch.setattr(asst, "_warm_speech", lambda: None)
+    monkeypatch.setattr(asst.stt.malayalam_provider, "is_available", lambda: False)
+    monkeypatch.setattr(asst.stt.indic_conformer, "is_available", lambda: False)
+    monkeypatch.setattr(asst.stt, "load", lambda m=None: _ScriptMismatchFW())
+    app = create_app(s_api, assistant=asst)
+    wav = _wav_bytes(_speech_like(1.1, sr=16000, channels=1), sr=16000)
+    with TestClient(app) as client:
+        r = client.post("/api/voice/hear?language=ml", content=wav, headers=H)
+        assert r.status_code == 200
+        body = r.json()
+        assert body["provider_status"]["available"] is False
+        assert body["provider_status"]["state"] == "unavailable"
+        assert body["provider_errors"] == []
+        assert body["review_needed"] is True
+        assert body["selection_reason"]
+        assert body["selected_candidate"]["provider"] == "faster_whisper"
+
 

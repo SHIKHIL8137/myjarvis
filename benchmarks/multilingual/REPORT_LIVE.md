@@ -6,14 +6,20 @@
 
 ## Model & Preset Summary
 
-| Model | Preset | Load (s) | Peak RSS (MB) | Mean Latency (s) | Mean RTF | Lang Acc | Mean WER | Mean CER | Sub Rate | Del Rate | Ins Rate | Script Mismatch | Empty | Hallucinations |
-|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| small | balanced | 3.97 | 778.9 | 2.77 | 0.56x | 100.0% | N/A | N/A | N/A | N/A | N/A | 1 | 1 | 0 |
+| Model | Preset | Load (s) | Peak RSS (MB) | Mean Latency (s) | Mean RTF | Lang Acc | Mean WER | Mean CER | Sub Rate | Del Rate | Ins Rate | Script Mismatch | Mismatch Rate | Empty | Hallucinations |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| base | balanced | 1.31 | 907.4 | 2.67 | 0.59x | 100.0% | N/A | N/A | N/A | N/A | N/A | 0 | 0.0% | 1 | 0 |
+| small | balanced | 2.57 | 907.4 | 2.49 | 0.51x | 100.0% | N/A | N/A | N/A | N/A | N/A | 1 | 25.0% | 1 | 0 |
 
 ## Per-Language Breakdown
 
-| Model | Preset | Language | Samples | Evaluated | Lang Acc | WER | CER | Script Mismatch | Empty |
-|---|---|---|---:|---:|---:|---:|---:|---:|---:|
-| small | balanced | `en` | 2 | 0 | 100.0% | N/A | N/A | 0 | 0 |
-| small | balanced | `mixed` | 1 | 0 | 100.0% | N/A | N/A | 0 | 1 |
-| small | balanced | `ml` | 1 | 0 | 100.0% | N/A | N/A | 1 | 0 |
+> WER/CER are computed strictly on samples with `reference_verified: true`; unverified or missing references report `N/A`.
+
+| Model | Preset | Language | Samples | Evaluated | Lang Acc | WER | CER | Script Mismatch | Mismatch Rate | Empty |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| base | balanced | `en` | 2 | 0 | 100.0% | N/A | N/A | 0 | 0.0% | 0 |
+| base | balanced | `mixed` | 1 | 0 | 100.0% | N/A | N/A | 0 | 0.0% | 1 |
+| base | balanced | `ml` | 1 | 0 | 100.0% | N/A | N/A | 0 | 0.0% | 0 |
+| small | balanced | `en` | 2 | 0 | 100.0% | N/A | N/A | 0 | 0.0% | 0 |
+| small | balanced | `mixed` | 1 | 0 | 100.0% | N/A | N/A | 0 | 0.0% | 1 |
+| small | balanced | `ml` | 1 | 0 | 100.0% | N/A | N/A | 1 | 100.0% | 0 |
