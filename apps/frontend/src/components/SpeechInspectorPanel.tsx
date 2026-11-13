@@ -104,9 +104,40 @@ const LANG_OPTIONS = [
   ["ta", "Tamil"],
 ];
 
-const MODEL_OPTIONS = ["base", "small", "small.en", "tiny", "medium", "malayalam_whisper", "indic_conformer"];
-const QUALITY_OPTIONS = ["fast", "balanced", "high"];
+const MODEL_OPTIONS = ["small.en", "medium.en", "small", "base", "tiny", "malayalam_whisper", "indic_conformer"];
+const QUALITY_OPTIONS = ["accurate", "high", "balanced", "fast"];
 const PREP_OPTIONS = ["light", "standard", "off"];
+
+function computeLevenshtein(a: string[], b: string[]): number {
+  const m = a.length;
+  const n = b.length;
+  const d: number[][] = Array.from({ length: m + 1 }, () => Array(n + 1).fill(0));
+  for (let i = 0; i <= m; i++) d[i][0] = i;
+  for (let j = 0; j <= n; j++) d[0][j] = j;
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      const cost = a[i - 1].toLowerCase() === b[j - 1].toLowerCase() ? 0 : 1;
+      d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + cost);
+    }
+  }
+  return d[m][n];
+}
+
+function calculateMetrics(ref: string, hyp: string): { wer: number; cer: number } | null {
+  const cleanRef = ref.trim();
+  const cleanHyp = hyp.trim();
+  if (!cleanRef || cleanRef === cleanHyp) return { wer: 0, cer: 0 };
+  const refWords = cleanRef.split(/\s+/).filter(Boolean);
+  const hypWords = cleanHyp.split(/\s+/).filter(Boolean);
+  const wordDist = computeLevenshtein(refWords, hypWords);
+  const wer = refWords.length > 0 ? (wordDist / refWords.length) * 100 : 0;
+
+  const refChars = cleanRef.replace(/\s+/g, "").split("");
+  const hypChars = cleanHyp.replace(/\s+/g, "").split("");
+  const charDist = computeLevenshtein(refChars, hypChars);
+  const cer = refChars.length > 0 ? (charDist / refChars.length) * 100 : 0;
+  return { wer: Math.round(wer * 10) / 10, cer: Math.round(cer * 10) / 10 };
+}
 
 export const SpeechInspectorPanel: React.FC<SpeechInspectorPanelProps> = ({
   records,
@@ -358,7 +389,17 @@ export const SpeechInspectorPanel: React.FC<SpeechInspectorPanelProps> = ({
 
           <div className="card" style={{ padding: "8px 10px" }}>
             <div className="row between" style={{ marginBottom: 4 }}>
-              <small className="dim">Corrected / Verified Transcript</small>
+              <div className="row" style={{ gap: 6 }}>
+                <small className="dim">Corrected / Verified Reference</small>
+                {active.original_transcript && currentDraft && currentDraft !== active.original_transcript && (() => {
+                  const m = calculateMetrics(currentDraft, active.original_transcript);
+                  return m ? (
+                    <span className={`pill ${m.wer === 0 ? "ok" : m.wer <= 20 ? "warn" : "danger"}`} style={{ fontSize: 10 }}>
+                      WER: {m.wer}% · CER: {m.cer}% vs Original
+                    </span>
+                  ) : null;
+                })()}
+              </div>
               <button className="ghost" style={{ fontSize: 11, padding: "2px 6px" }} onClick={() => copyText("Corrected transcript", currentDraft)}>
                 Copy Corrected
               </button>
@@ -390,14 +431,32 @@ export const SpeechInspectorPanel: React.FC<SpeechInspectorPanelProps> = ({
                 </select>
                 <button disabled={busy} onClick={saveCorrection}>Save Correction</button>
               </div>
-              <button
-                className="ghost"
-                disabled={busy || Boolean(active.eval_consent)}
-                onClick={saveConsentSample}
-                title="Opt-in local save of corrected sample for offline speech benchmarking"
-              >
-                {active.eval_consent ? "Saved to Eval Dataset" : "Approve for Local Eval"}
-              </button>
+              <div className="row wrap" style={{ gap: 6 }}>
+                <button
+                  className="ghost"
+                  disabled={busy}
+                  onClick={() => {
+                    setDraftCorrection(`[INCORRECT] ${active.original_transcript}`);
+                    saveCorrection();
+                  }}
+                  title="Mark transcript as inaccurate"
+                  style={{ fontSize: 11 }}
+                >
+                  Mark Inaccurate
+                </button>
+                <button
+                  className="ghost"
+                  disabled={busy || Boolean(active.eval_consent)}
+                  onClick={async () => {
+                    await saveCorrection();
+                    await saveConsentSample();
+                  }}
+                  title="Save verified ground truth reference for local STT benchmarks"
+                  style={{ fontSize: 11 }}
+                >
+                  {active.eval_consent ? "✓ Verified Benchmark Ref" : "Save as Benchmark Ref"}
+                </button>
+              </div>
             </div>
           </div>
 

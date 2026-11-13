@@ -1,0 +1,320 @@
+{
+  "schema_version": 2,
+  "title": "JARVIS English & Indian English Speech Recognition Accuracy Benchmark Manifest",
+  "description": "Comprehensive local offline evaluation corpus across 10 categories, distinguishing synthetic from real human microphone recordings.",
+  "categories": [
+    "indian_english_conversation",
+    "indian_english_technical",
+    "short_voice_commands",
+    "long_spoken_instructions",
+    "numbers_dates_ports_filenames",
+    "different_speaking_speeds",
+    "background_noise",
+    "different_distances",
+    "quiet_speech",
+    "conversational_pauses"
+  ],
+  "total_samples": 30,
+  "samples": [
+    {
+      "id": "live_001_english",
+      "audio": "samples/live_english.wav",
+      "reference": "Hello, what's the time today?",
+      "language": "en",
+      "category": "indian_english_conversation",
+      "accent": "en-IN",
+      "source": "real_human_mic",
+      "reference_verified": true
+    },
+    {
+      "id": "live_002_wake",
+      "audio": "samples/live_wake.wav",
+      "reference": "Hey Jarvis, what's the time?",
+      "language": "en",
+      "category": "short_voice_commands",
+      "accent": "en-IN",
+      "source": "real_human_mic",
+      "reference_verified": true
+    },
+    {
+      "id": "ie_conv_001",
+      "audio": "samples/en_bench_ie_conv_001.wav",
+      "reference": "Can you check if the database migration for ERP V2 completed successfully?",
+      "language": "en",
+      "category": "indian_english_conversation",
+      "accent": "en-IN",
+      "source": "synthetic_piper_calibrated",
+      "reference_verified": true
+    },
+    {
+      "id": "ie_conv_002",
+      "audio": "samples/en_bench_ie_conv_002.wav",
+      "reference": "Please schedule a meeting with the development team tomorrow at three thirty PM.",
+      "language": "en",
+      "category": "indian_english_conversation",
+      "accent": "en-IN",
+      "source": "synthetic_piper_calibrated",
+      "reference_verified": true
+    },
+    {
+      "id": "ie_conv_003",
+      "audio": "samples/en_bench_ie_conv_003.wav",
+      "reference": "Open my workspace notes and give me a summary of pending action items.",
+      "language": "en",
+      "category": "indian_english_conversation",
+      "accent": "en-IN",
+      "source": "synthetic_piper_calibrated",
+      "reference_verified": true
+    },
+    {
+      "id": "ie_tech_001",
+      "audio": "samples/en_bench_ie_tech_001.wav",
+      "reference": "Configure PostgreSQL with pgvector extension and verify the LangGraph agent run.",
+      "language": "en",
+      "category": "indian_english_technical",
+      "accent": "en-IN",
+      "source": "synthetic_piper_calibrated",
+      "reference_verified": true
+    },
+    {
+      "id": "ie_tech_002",
+      "audio": "samples/en_bench_ie_tech_002.wav",
+      "reference": "Check Docker container logs on port 8000 for FastAPI service.",
+      "language": "en",
+      "category": "indian_english_technical",
+      "accent": "en-IN",
+      "source": "synthetic_piper_calibrated",
+      "reference_verified": true
+    },
+    {
+      "id": "ie_tech_003",
+      "audio": "samples/en_bench_ie_tech_003.wav",
+      "reference": "Explain VRAM quantization in Ollama and Qwen models on this laptop.",
+      "language": "en",
+      "category": "indian_english_technical",
+      "accent": "en-IN",
+      "source": "synthetic_piper_calibrated",
+      "reference_verified": true
+    },
+    {
+      "id": "ie_tech_004",
+      "audio": "samples/en_bench_ie_tech_004.wav",
+      "reference": "Update the React and TypeScript frontend to communicate with Node.js via WebSocket.",
+      "language": "en",
+      "category": "indian_english_technical",
+      "accent": "en-IN",
+      "source": "synthetic_piper_calibrated",
+      "reference_verified": true
+    },
+    {
+      "id": "ie_tech_005",
+      "audio": "samples/en_bench_ie_tech_005.wav",
+      "reference": "Connect Qdrant and ChromaDB vector stores with Kavlien ERP backend.",
+      "language": "en",
+      "category": "indian_english_technical",
+      "accent": "en-IN",
+      "source": "synthetic_piper_calibrated",
+      "reference_verified": true
+    },
+    {
+      "id": "cmd_stop",
+      "audio": "samples/en_bench_cmd_stop.wav",
+      "reference": "Stop.",
+      "language": "en",
+      "category": "short_voice_commands",
+      "accent": "en-IN",
+      "source": "synthetic_piper_calibrated",
+      "reference_verified": true
+    },
+    {
+      "id": "cmd_yes",
+      "audio": "samples/en_bench_cmd_yes.wav",
+      "reference": "Yes.",
+      "language": "en",
+      "category": "short_voice_commands",
+      "accent": "en-IN",
+      "source": "synthetic_piper_calibrated",
+      "reference_verified": true
+    },
+    {
+      "id": "cmd_no",
+      "audio": "samples/en_bench_cmd_no.wav",
+      "reference": "No.",
+      "language": "en",
+      "category": "short_voice_commands",
+      "accent": "en-IN",
+      "source": "synthetic_piper_calibrated",
+      "reference_verified": true
+    },
+    {
+      "id": "cmd_open_chrome",
+      "audio": "samples/en_bench_cmd_open_chrome.wav",
+      "reference": "Open Chrome.",
+      "language": "en",
+      "category": "short_voice_commands",
+      "accent": "en-IN",
+      "source": "synthetic_piper_calibrated",
+      "reference_verified": true
+    },
+    {
+      "id": "cmd_start_server",
+      "audio": "samples/en_bench_cmd_start_server.wav",
+      "reference": "Start server.",
+      "language": "en",
+      "category": "short_voice_commands",
+      "accent": "en-IN",
+      "source": "synthetic_piper_calibrated",
+      "reference_verified": true
+    },
+    {
+      "id": "cmd_close_window",
+      "audio": "samples/en_bench_cmd_close_window.wav",
+      "reference": "Close window.",
+      "language": "en",
+      "category": "short_voice_commands",
+      "accent": "en-IN",
+      "source": "synthetic_piper_calibrated",
+      "reference_verified": true
+    },
+    {
+      "id": "cmd_pause",
+      "audio": "samples/en_bench_cmd_pause.wav",
+      "reference": "Pause.",
+      "language": "en",
+      "category": "short_voice_commands",
+      "accent": "en-IN",
+      "source": "synthetic_piper_calibrated",
+      "reference_verified": true
+    },
+    {
+      "id": "cmd_resume",
+      "audio": "samples/en_bench_cmd_resume.wav",
+      "reference": "Resume listening.",
+      "language": "en",
+      "category": "short_voice_commands",
+      "accent": "en-IN",
+      "source": "synthetic_piper_calibrated",
+      "reference_verified": true
+    },
+    {
+      "id": "long_001",
+      "audio": "samples/en_bench_long_001.wav",
+      "reference": "First search my workspace for all FastAPI endpoint definitions, then extract the route parameters, and write a summary into the project notes.",
+      "language": "en",
+      "category": "long_spoken_instructions",
+      "accent": "en-IN",
+      "source": "synthetic_piper_calibrated",
+      "reference_verified": true
+    },
+    {
+      "id": "long_002",
+      "audio": "samples/en_bench_long_002.wav",
+      "reference": "Inspect the git status on branch main, check for any uncommitted changes in the backend directory, and prepare a concise release log.",
+      "language": "en",
+      "category": "long_spoken_instructions",
+      "accent": "en-IN",
+      "source": "synthetic_piper_calibrated",
+      "reference_verified": true
+    },
+    {
+      "id": "num_port_001",
+      "audio": "samples/en_bench_num_port_001.wav",
+      "reference": "The server is running on port 8000 connected to database port 5432 with config file settings dot json on November 13th.",
+      "language": "en",
+      "category": "numbers_dates_ports_filenames",
+      "accent": "en-IN",
+      "source": "synthetic_piper_calibrated",
+      "reference_verified": true
+    },
+    {
+      "id": "num_port_002",
+      "audio": "samples/en_bench_num_port_002.wav",
+      "reference": "Set timeout to 45 seconds and memory limit to 4 gigabytes for process ID 27916.",
+      "language": "en",
+      "category": "numbers_dates_ports_filenames",
+      "accent": "en-IN",
+      "source": "synthetic_piper_calibrated",
+      "reference_verified": true
+    },
+    {
+      "id": "speed_fast_001",
+      "audio": "samples/en_bench_speed_fast_001.wav",
+      "reference": "Hurry up and restart the server immediately before the connection times out.",
+      "language": "en",
+      "category": "different_speaking_speeds",
+      "accent": "en-IN",
+      "source": "synthetic_piper_calibrated",
+      "reference_verified": true
+    },
+    {
+      "id": "speed_slow_001",
+      "audio": "samples/en_bench_speed_slow_001.wav",
+      "reference": "Please take your time and carefully read the package dot json file.",
+      "language": "en",
+      "category": "different_speaking_speeds",
+      "accent": "en-IN",
+      "source": "synthetic_piper_calibrated",
+      "reference_verified": true
+    },
+    {
+      "id": "quiet_001",
+      "audio": "samples/en_bench_quiet_001.wav",
+      "reference": "Jarvis, are you still listening to my voice?",
+      "language": "en",
+      "category": "quiet_speech",
+      "accent": "en-IN",
+      "source": "synthetic_piper_calibrated",
+      "reference_verified": true
+    },
+    {
+      "id": "pause_001",
+      "audio": "samples/en_bench_pause_001.wav",
+      "reference": "Jarvis, let me think, show me the system health overview.",
+      "language": "en",
+      "category": "conversational_pauses",
+      "accent": "en-IN",
+      "source": "synthetic_piper_calibrated",
+      "reference_verified": true
+    },
+    {
+      "id": "noise_001",
+      "audio": "samples/en_bench_noise_001.wav",
+      "reference": "Configure PostgreSQL with pgvector extension and verify the LangGraph agent run.",
+      "language": "en",
+      "category": "background_noise",
+      "accent": "en-IN",
+      "source": "synthetic_acoustic_noise",
+      "reference_verified": true
+    },
+    {
+      "id": "noise_002",
+      "audio": "samples/en_bench_noise_002.wav",
+      "reference": "Check Docker container logs on port 8000 for FastAPI service.",
+      "language": "en",
+      "category": "background_noise",
+      "accent": "en-IN",
+      "source": "synthetic_acoustic_noise",
+      "reference_verified": true
+    },
+    {
+      "id": "dist_near_001",
+      "audio": "samples/en_bench_dist_near_001.wav",
+      "reference": "Open Chrome.",
+      "language": "en",
+      "category": "different_distances",
+      "accent": "en-IN",
+      "source": "synthetic_distance_sim",
+      "reference_verified": true
+    },
+    {
+      "id": "dist_far_002",
+      "audio": "samples/en_bench_dist_far_002.wav",
+      "reference": "Open Chrome.",
+      "language": "en",
+      "category": "different_distances",
+      "accent": "en-IN",
+      "source": "synthetic_distance_sim",
+      "reference_verified": true
+    }
+  ]
+}

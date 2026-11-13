@@ -1,21 +1,53 @@
 # Jarvis Configurable Speech Recognition Vocabulary Hints
 # Add one term or comma-separated terms per line. Lines starting with # are ignored.
 # Updated at runtime without modifying Python source code.
+#
+# Core Personal & Assistant Identifiers
 Jarvis
-Ollama
-Qwen
-FastAPI
+Kavlien
+ERP
+ERP_V2
+
+# Web & Full-Stack Technologies
 React
 Node.js
 TypeScript
-MongoDB
-PostgreSQL
-VRAM
-quantization
-Silero
-Malayalam
-LangGraph
-pgvector
+JavaScript
+Python
+FastAPI
+WebSocket
+REST
+API
 uvicorn
 Alembic
 
+# Databases & Vector Stores
+MongoDB
+PostgreSQL
+Redis
+pgvector
+Qdrant
+ChromaDB
+
+# AI, Models & Inference Runtimes
+Ollama
+Qwen
+Whisper
+Faster-Whisper
+Hugging Face
+LangGraph
+Silero
+VRAM
+quantization
+
+# Developer Tools & Cloud Infrastructure
+Docker
+Kubernetes
+EKS
+AWS
+Vercel
+Cloudflare
+GitHub
+OpenCode
+VS Code
+Graphify

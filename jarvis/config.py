@@ -57,11 +57,11 @@ class TTSSpec(BaseModel):
 
 
 class STTSpec(BaseModel):
-    model: str = "small"
+    model: str = "small.en"
     compute_type: str = "int8"
     cpu_threads: int = Field(6, ge=1, le=32)
-    language: str = "auto"  # "auto" | "en" | "ml" | "mixed" | "hi" | "ta" | ...
-    quality: str = "balanced"  # "fast" | "balanced" | "accurate"
+    language: str = "en"  # "en" (English accuracy profile) | "auto" | "ml" | "mixed" | ...
+    quality: str = "accurate"  # "fast" | "balanced" | "accurate"
     preprocessing_profile: str = "light"  # "off" | "light" | "standard"
     beam_size: int | None = Field(None, ge=1, le=10)
     best_of: int | None = Field(None, ge=1, le=10)
@@ -80,7 +80,7 @@ class STTSpec(BaseModel):
     tamil_model: str = ""
     max_retry_attempts: int = Field(2, ge=0, le=3)
     retry_on_low_quality: bool = True
-    max_cached_models: int = Field(2, ge=1, le=3)
+    max_cached_models: int = Field(1, ge=1, le=3)
     preserve_original_audio: bool = True
     audio_store_dir: str = "data/audio"
 

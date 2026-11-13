@@ -44,7 +44,8 @@ SR = TARGET_SR
 QUALITY_PRESETS: dict[str, dict[str, Any]] = {
     "fast": {"beam_size": 1, "best_of": 1, "temperature": 0.0, "condition_on_previous_text": False},
     "balanced": {"beam_size": 3, "best_of": 3, "temperature": [0.0, 0.2], "condition_on_previous_text": False},
-    "accurate": {"beam_size": 5, "best_of": 5, "temperature": [0.0, 0.2, 0.4], "condition_on_previous_text": True},
+    "accurate": {"beam_size": 5, "best_of": 5, "temperature": [0.0, 0.2, 0.4], "condition_on_previous_text": False},
+    "high": {"beam_size": 5, "best_of": 5, "temperature": [0.0, 0.2, 0.4], "condition_on_previous_text": False},
 }
 
 SUPPORTED_LANGUAGES = {
@@ -992,9 +993,10 @@ class Whisper:
         if len(hints) > 380:
             hints = hints[:380].rsplit(",", 1)[0].strip()
         ascii_hints = bool(hints) and all(ord(ch) < 128 for ch in hints)
-        hotwords = hints if (hints and is_multi and not (ascii_hints and whisper_lang not in (None, "en"))) else None
+        hotwords = hints if (hints and not (ascii_hints and whisper_lang not in (None, "en"))) else None
         initial_prompt = None
-        if not is_short and hints and (whisper_lang == "en" or not is_multi or (whisper_lang is not None and not ascii_hints)):
+        # Only inject full initial_prompt context on longer utterances (>= 2.0s) to protect short voice commands
+        if raw_dur >= 2.0 and hints and (whisper_lang == "en" or not is_multi or (whisper_lang is not None and not ascii_hints)):
             initial_prompt = hints
 
         use_segment_multi = bool(multilingual) if multilingual is not None else (is_multi and whisper_lang is None)
@@ -1086,11 +1088,22 @@ class Whisper:
             log.info("STT retry triggered (%s) for audio_id=%s", ", ".join(primary_eval["retry_reasons"]), audio_id)
             retry_count = 0
 
-            # Candidate A: try a genuinely different Faster-Whisper model / decoding configuration
+            # Candidate A: try a genuinely higher-capacity local model or robust no-VAD / accurate configuration
             local_models = self.faster_whisper.discover_local_models()
             acc = QUALITY_PRESETS["accurate"]
             alt_specs: list[tuple[str, str | None, int, int, bool, str]] = []
-            alt_model = "small" if (not custom_loaded and fw_model == "base" and "small" in local_models) else fw_model
+            if not custom_loaded:
+                if "medium.en" in local_models and fw_model != "medium.en" and req_lang in ("en", "auto", ""):
+                    alt_model = "medium.en"
+                elif "small.en" in local_models and fw_model not in ("small.en", "medium.en") and req_lang in ("en", "auto", ""):
+                    alt_model = "small.en"
+                elif "small" in local_models and fw_model == "base":
+                    alt_model = "small"
+                else:
+                    alt_model = fw_model
+            else:
+                alt_model = fw_model
+
             alt_specs.append((
                 alt_model,
                 whisper_lang,
@@ -1100,7 +1113,7 @@ class Whisper:
                 f"fallback_{alt_model}_accurate",
             ))
             if use_vad:
-                alt_specs.append((fw_model, whisper_lang, acc["beam_size"], acc["best_of"], False, f"fallback_{fw_model}_novad"))
+                alt_specs.append((alt_model if alt_model != fw_model else fw_model, whisper_lang, acc["beam_size"], acc["best_of"], False, f"fallback_{alt_model}_novad"))
             if is_multi and req_lang == "mixed" and primary_res.get("detected_language") not in ("ml", "en", "mixed"):
                 alt_specs.append((alt_model, "ml", acc["beam_size"], acc["best_of"], False if is_short else use_vad, "fallback_mixed_ml_hint"))
             if is_multi and whisper_lang is not None and "language_mismatch" in primary_eval["flags"]:

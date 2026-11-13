@@ -832,7 +832,13 @@ class Assistant:
         primary_key = self.brain.current
         fallbacks: list[str] = []
         if gw is not None and active_prov != "ollama":
-            primary_key, fallbacks = gw.select_model_for_task(role)
+            routed_primary, fallbacks = gw.select_model_for_task(role)
+            if self.brain.current.startswith(f"{active_prov}:") or (getattr(self.brain, "provider", "") == active_prov and self.brain.current != self.settings.boot_brain):
+                primary_key = self.brain.current
+                if routed_primary != primary_key and routed_primary not in fallbacks:
+                    fallbacks.insert(0, routed_primary)
+            else:
+                primary_key = routed_primary
             use_gateway = True
 
         if use_gateway and gw is not None:
