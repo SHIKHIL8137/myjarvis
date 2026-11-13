@@ -308,7 +308,7 @@ class ProvidersSpec(BaseModel):
     anthropic_base_url: str = "https://api.anthropic.com/v1"
     anthropic_model: str = "claude-3-5-sonnet-latest"
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
-    openrouter_model: str = "qwen/qwen3-coder:free"
+    openrouter_model: str = "qwen/qwen3-coder"
     gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta"
     gemini_model: str = "gemini-2.5-flash"
     huggingface_base_url: str = "https://router.huggingface.co/v1"
