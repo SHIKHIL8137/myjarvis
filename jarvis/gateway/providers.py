@@ -29,7 +29,7 @@ class CloudGatewayError(RuntimeError):
 def parse_model_key(model_key: str, settings: Settings) -> tuple[str, str]:
     """Return (provider_name, model_id) from qualified key or local brain config."""
     k = (model_key or settings.boot_brain).strip()
-    for prov in ("openrouter", "huggingface", "gemini", "openai", "anthropic", "custom", "opencode"):
+    for prov in ("openrouter", "huggingface", "gemini", "openai", "anthropic", "custom"):
         if k.startswith(prov + ":"):
             return prov, k.split(":", 1)[1]
     if k in settings.brains:
@@ -519,7 +519,16 @@ class AnthropicAdapter:
 
 
 async def opencode_provider_bridge(prompt_text: str, *, workdir: str, model: str | None = None, bin_name: str = "opencode", timeout_s: int = 60) -> str:
-    """Delegate a single non-interactive coding turn to `opencode run --format json` when opted in."""
+    """DEPRECATED legacy bridge: OpenCode is an Agent Application and Runtime Instance, not a model provider.
+    Delegates strictly to `jarvis.integrations.opencode_adapter.run_opencode_task`.
+    """
+    import warnings
+    warnings.warn(
+        "opencode_provider_bridge in gateway.providers is deprecated. OpenCode is an Agent Application; "
+        "use jarvis.integrations.opencode_adapter or the RuntimeRegistry instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     from ..integrations.opencode_adapter import run_opencode_task
     res = await asyncio.to_thread(run_opencode_task, prompt_text, workdir=workdir, model=model, bin_name=bin_name, timeout_s=timeout_s)
     return str(res.get("final_text") or res.get("stdout") or "")

@@ -24,12 +24,92 @@ ALLOWED_INTENTS = frozenset(
         "security_audit",
         "empty",
         "hardware_stop",
+        "task_steering",
+        "project_exploration",
+    }
+)
+ALLOWED_REQUEST_TYPES = frozenset(
+    {
+        "general_conversation",
+        "question_explanation",
+        "project_exploration",
+        "file_folder_operation",
+        "research",
+        "coding",
+        "document_analysis",
+        "memory_retrieval",
+        "memory_update",
+        "scheduling",
+        "system_control",
+        "voice_command",
+        "follow_up",
+        "task_steering",
+        "clarification_response",
     }
 )
 ALLOWED_COMPLEXITIES = frozenset({"trivial", "standard", "complex_reasoning", "heavy_coding"})
 ALLOWED_RISK_TIERS = frozenset({"READ", "WRITE", "EXECUTE"})
 ALLOWED_WORKFLOWS = frozenset({"fast_command", "direct_chat", "assistant_graph", "workforce_graph", "clarify"})
 ALLOWED_CLASSIFIER_SOURCES = frozenset({"layer1_rules", "heuristic", "llm", "laya_isolated", "laya_shadow_fallback"})
+
+@dataclass
+class RequestTarget:
+    type: str = "none"  # "project", "file", "directory", "task", "system", "none"
+    name: str = ""
+    path: str = ""
+    target_id: str | None = None
+    sub_item: str | None = None
+
+
+@dataclass
+class StructuredRequest:
+    request_type: str = "general_conversation"
+    intent: str = "general_chat"
+    target: RequestTarget = field(default_factory=RequestTarget)
+    requested_operations: list[str] = field(default_factory=list)
+    execution_mode: str = "direct"  # "direct" | "background"
+    requires_filesystem: bool = False
+    requires_web: bool = False
+    requires_confirmation: bool = False
+    confidence: float = 0.85
+    original_text: str = ""
+    language: str = "en"
+    meta: dict[str, object] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "request_type": self.request_type,
+            "intent": self.intent,
+            "target": asdict(self.target),
+            "requested_operations": list(self.requested_operations),
+            "execution_mode": self.execution_mode,
+            "requires_filesystem": self.requires_filesystem,
+            "requires_web": self.requires_web,
+            "requires_confirmation": self.requires_confirmation,
+            "confidence": self.confidence,
+            "original_text": self.original_text,
+            "language": self.language,
+            "meta": dict(self.meta),
+        }
+
+
+@dataclass
+class ConversationContext:
+    conversation_id: str = "default"
+    current_request_id: str = ""
+    active_task_id: str | None = None
+    current_project_id: str | None = None
+    selected_workspace: str | None = None
+    active_project_path: str | None = None
+    active_project_name: str | None = None
+    pending_clarification: dict[str, object] | None = None
+    current_language: str = "en"
+    response_language: str = "en"
+    recent_turns: list[dict[str, str]] = field(default_factory=list)
+    active_execution_context: dict[str, object] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
 
 SENSITIVE_OPERATION_CATEGORIES = frozenset(
     {
@@ -207,9 +287,13 @@ class DecisionEnvelope:
     requires_owner_approval: bool = False
     sensitive_flags: list[str] = field(default_factory=list)
     shadow_comparison: dict | None = None
+    structured_request: StructuredRequest | None = None
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        d = asdict(self)
+        if self.structured_request:
+            d["structured_request"] = self.structured_request.to_dict()
+        return d
 
 
 @dataclass

@@ -200,7 +200,7 @@ export const SettingsPanel: React.FC<ShellProps> = ({ onNotify }) => {
     try {
       const [s, m, c, d, p, a, o, sk, dc] = await Promise.all([
         apiFetch<ConsolidatedSettings>("/v2/settings"),
-        apiFetch<{ models: ModelItem[] }>("/models"),
+        apiFetch<{ models: ModelItem[] }>("/models").catch(() => ({ models: [] })),
         apiFetch<{ capabilities: CapabilityItem[] }>("/v2/gateway/capabilities").catch(() => ({ capabilities: [] })),
         apiFetch<DeviceInfo>("/v2/settings/devices").catch(() => ({})),
         apiFetch<{ permissions: FsPermItem[] }>("/v2/filesystem/permissions").catch(() => ({ permissions: [] })),

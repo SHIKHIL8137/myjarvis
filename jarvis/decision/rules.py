@@ -10,7 +10,7 @@ DEV_KEYWORDS = re.compile(
     r"\b(?:repo(?:sitory)?|codebase|refactor|implement|bug\s*fix|unit\s*test|pytest|endpoint|"
     r"migration|alembic|worktree|opencode|graphify|architecture|pull\s+request|git\s+diff|backend|frontend|"
     r"fix\s+(?:the\s+|this\s+)?bug|debug\s+(?:the\s+|this\s+)?(?:error|failure|issue|module)|"
-    r"find\s+bugs|(?:review|analyze|inspect|audit|check)\s+(?:(?:my|the|this)\s+)?(?:[A-Za-z0-9_.-]+\s+)?"
+    r"find\s+bugs|(?:review|analyze|inspect|audit|check|explore)\s+(?:(?:my|the|this)\s+)?(?:[A-Za-z0-9_.-]+\s+)?"
     r"(?:project|repo|codebase|app|code)|project(?:'s)?\b[^\n]{0,40}\b(?:code|tests?|bugs?|modules?))\b",
     re.I,
 )
@@ -27,13 +27,13 @@ WEB_RESEARCH_RE = re.compile(
     re.I,
 )
 FILESYSTEM_OPS_RE = re.compile(
-    r"\b(?:(?:list|show|find|search|inspect|read|open|create|write|edit|save|delete)\s+"
+    r"\b(?:(?:list|show|find|search|inspect|read|open|create|write|edit|save|delete|explore)\s+"
     r"(?:(?:[A-Za-z0-9_.-]+\s+){0,4})?"
     r"(?:files?|folders?|directories|projects?|workspace\s+files?|pdf\s+documents?|documents?|downloads?|desktop|reports?\b)|"
-    r"(?:list|show|find|search|inspect|read|open|create|write|edit|save|delete)\b[^\n]{0,70}"
+    r"(?:list|show|find|search|inspect|read|open|create|write|edit|save|delete|explore)\b[^\n]{0,70}"
     r"(?:my\s+|the\s+|that\s+|this\s+)?(?:documents|downloads|desktop|pictures|folder|directory|project)\b|"
-    r"(?:list|show|find|search|inspect|read|open)\s+(?:its\s+|the\s+)?(?:backend|frontend|src|app|apps|packages|client|server|database|docs|tests|config)\b|"
-    r"\b(?:read|open|show|inspect|check)\s+(?:its\s+|the\s+)?[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,8}\b[^\n]{0,40}\b(?:in|inside|from)?|"
+    r"(?:list|show|find|search|inspect|read|open|explore)\s+(?:its\s+|the\s+)?(?:backend|frontend|src|app|apps|packages|client|server|database|docs|tests|config)\b|"
+    r"\b(?:read|open|show|inspect|check|explore)\s+(?:its\s+|the\s+)?[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,8}\b[^\n]{0,40}\b(?:in|inside|from)?|"
     r"\b(?:folder|directory)\s+structure\b|"
     r"what\s+files\s+are\s+in\b|[A-Za-z]:\\|\\\\[A-Za-z0-9_.-]+\\)",
     re.I,

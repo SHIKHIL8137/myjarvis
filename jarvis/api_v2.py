@@ -447,6 +447,26 @@ def create_v2_router(fallback=None) -> APIRouter:
     async def list_worktrees(project_id: str | None = None, a=Depends(get_a)):
         return {"worktrees": a.orchestrator.workforce.list_worktrees(project_id=project_id)}
 
+    # ---- Evidence-Based Dynamic Runtime Registry -----------------------------------------------------
+    @router.get("/runtimes")
+    async def get_runtimes_summary(a=Depends(get_a)):
+        reg = getattr(a.orchestrator, "runtime_registry", None)
+        if not reg:
+            from ..core.runtime_registry import RuntimeRegistryService
+            reg = RuntimeRegistryService(a.settings, data_dir=a.data_dir)
+            a.orchestrator.runtime_registry = reg
+        return reg.get_summary()
+
+    @router.post("/runtimes/discover")
+    async def force_discover_runtimes(a=Depends(get_a)):
+        reg = getattr(a.orchestrator, "runtime_registry", None)
+        if not reg:
+            from ..core.runtime_registry import RuntimeRegistryService
+            reg = RuntimeRegistryService(a.settings, data_dir=a.data_dir)
+            a.orchestrator.runtime_registry = reg
+        reg.discover_runtimes(force=True)
+        return reg.get_summary()
+
     @router.post("/workforce/runs")
     async def trigger_workforce_run(body: WorkforceRunIn, a=Depends(get_a)):
         return await asyncio.to_thread(a.orchestrator.start_workforce_workflow, **body.model_dump())
@@ -1262,6 +1282,11 @@ def create_v2_router(fallback=None) -> APIRouter:
             "recent_runs": runs,
             "quiet_hours": dict(getattr(a.settings.preferences, "quiet_hours", {}) or {}),
         }
+
+    @router.get("/assistant/briefing")
+    async def get_assistant_briefing(kind: str = "morning", a=Depends(get_a)):
+        """Generate a truthful, data-driven daily briefing (schedule, tasks, reminders, blockers)."""
+        return await a.orchestrator.routines.generate_briefing(kind=kind, assistant=a)
 
     @router.post("/routines")
     async def create_routine(body: RoutineCreateIn, a=Depends(get_a)):

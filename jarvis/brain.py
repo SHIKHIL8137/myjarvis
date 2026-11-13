@@ -100,10 +100,42 @@ class Brain:
     # ---- specs ---------------------------------------------------------------------------------------
     @property
     def spec(self) -> BrainSpec:
-        return self.settings.brains.get(self.current) or self.adhoc[self.current]
+        if self.current in self.settings.brains:
+            return self.settings.brains[self.current]
+        if self.current in self.adhoc:
+            return self.adhoc[self.current]
+        for prefix in ("openai", "anthropic", "openrouter", "gemini", "huggingface", "custom"):
+            if str(self.current).startswith(f"{prefix}:"):
+                prov, model_id = str(self.current).split(":", 1)
+                url_map = {
+                    "openai": self.settings.providers.openai_base_url,
+                    "anthropic": self.settings.providers.anthropic_base_url,
+                    "openrouter": self.settings.providers.openrouter_base_url,
+                    "gemini": self.settings.providers.gemini_base_url,
+                    "huggingface": self.settings.providers.huggingface_base_url,
+                    "custom": self.settings.providers.custom_base_url,
+                }
+                spec = BrainSpec(base_url=url_map.get(prov, self.settings.providers.openrouter_base_url), model=model_id, thinking=False)
+                setattr(spec, "provider", prov)
+                self.adhoc[self.current] = spec
+                return spec
+        return self.settings.brains.get(self.settings.boot_brain) or next(iter(self.settings.brains.values()))
+
+    @property
+    def ollama_host(self) -> str:
+        for b in self.settings.brains.values():
+            prov = getattr(b, "provider", "ollama")
+            base = getattr(b, "base_url", "")
+            if prov == "ollama" and base:
+                cleaned = base.rsplit("/v1", 1)[0]
+                if not any(d in cleaned.lower() for d in ("openrouter.ai", "openai.com", "anthropic.com", "googleapis.com", "huggingface.co")):
+                    return cleaned
+        return "http://127.0.0.1:11434"
 
     @property
     def host(self) -> str:
+        if self.provider == "ollama":
+            return self.ollama_host
         return self.spec.base_url.rsplit("/v1", 1)[0]
 
     @property
@@ -129,11 +161,11 @@ class Brain:
     # ---- ollama state --------------------------------------------------------------------------------
     async def _get(self, path: str, timeout: float = 5):
         try:
-            r = await self.client.get(self.host + path, timeout=timeout)
+            r = await self.client.get(self.ollama_host + path, timeout=timeout)
             r.raise_for_status()
             return r.json()
         except (httpx.HTTPError, OSError) as e:
-            raise BrainError(f"Ollama is not reachable at {self.host} ({type(e).__name__}). Start the Ollama app and try again.") from e
+            raise BrainError(f"Ollama is not reachable at {self.ollama_host} ({type(e).__name__}). Start the Ollama app and try again.") from e
 
     async def installed(self) -> list[str]:
         return [m["name"] for m in (await self._get("/api/tags"))["models"]]
@@ -150,7 +182,10 @@ class Brain:
 
     async def catalogue(self) -> list[dict]:
         """Every selectable model: configured local brains, installed Ollama models, and optional cloud entries."""
-        inst = await self.installed()
+        try:
+            inst = await self.installed()
+        except Exception:
+            inst = []
         out = [{
             "key": k,
             "model": s.model,
@@ -183,17 +218,23 @@ class Brain:
         ]
         for prov_name, prov_model in cloud_specs:
             if has_provider_api_key(prov_name):
-                k = f"{prov_name}:{prov_model}"
-                out.append({
-                    "key": k,
-                    "model": prov_model,
-                    "provider": prov_name,
-                    "local": False,
-                    "thinking": False,
-                    "tools": prov_name != "gemini",
-                    "installed": bool(p.allow_cloud and self.settings.internet.enabled),
-                    "current": self.current == k,
-                })
+                models_to_list = [prov_model]
+                if self.current.startswith(f"{prov_name}:"):
+                    curr_m = self.current.split(":", 1)[1]
+                    if curr_m not in models_to_list:
+                        models_to_list.append(curr_m)
+                for m_id in models_to_list:
+                    k = f"{prov_name}:{m_id}"
+                    out.append({
+                        "key": k,
+                        "model": m_id,
+                        "provider": prov_name,
+                        "local": False,
+                        "thinking": False,
+                        "tools": prov_name != "gemini",
+                        "installed": bool(p.allow_cloud and self.settings.internet.enabled),
+                        "current": self.current == k,
+                    })
         return out
 
     async def resolve_choice(self, want: str) -> str | None:
@@ -217,7 +258,10 @@ class Brain:
             return f"gemini:{self.settings.providers.gemini_model}"
         if q.startswith("huggingface") or q == "hf":
             return f"huggingface:{self.settings.providers.huggingface_model}"
-        inst = await self.installed()
+        try:
+            inst = await self.installed()
+        except Exception:
+            inst = []
         for m in inst:
             if m.lower() == q:
                 return m
@@ -266,14 +310,19 @@ class Brain:
 
     async def unload(self, model: str) -> None:
         try:
-            await self.client.post(self.host + "/api/generate", json={"model": model, "keep_alive": 0}, timeout=15)
+            await self.client.post(self.ollama_host + "/api/generate", json={"model": model, "keep_alive": 0}, timeout=15)
         except httpx.HTTPError:
             log.warning("could not unload %s", model)
 
     async def warm(self) -> float:
+        if self.provider != "ollama":
+            return 0.0
         t = time.time()
-        await self.client.post(self.host + "/api/generate", timeout=300, json={
-            "model": self.spec.model, "prompt": "", "keep_alive": self.spec.keep_alive, "options": {"num_ctx": self.spec.num_ctx}})
+        try:
+            await self.client.post(self.ollama_host + "/api/generate", timeout=300, json={
+                "model": self.spec.model, "prompt": "", "keep_alive": self.spec.keep_alive, "options": {"num_ctx": self.spec.num_ctx}})
+        except httpx.HTTPError:
+            log.warning("could not warm %s", self.spec.model)
         return time.time() - t
 
     # ---- chat ----------------------------------------------------------------------------------------
@@ -318,6 +367,39 @@ class Brain:
                     json_body={"model": self.spec.model, "messages": messages, "max_tokens": self.spec.max_tokens},
                     headers=hdrs,
                 )
+                res_status = getattr(res, "status_code", 200)
+                if res_status >= 400:
+                    err_msg = ""
+                    try:
+                        err_data = json.loads(res.body.decode("utf-8", errors="replace"))
+                        err_obj = err_data.get("error")
+                        if isinstance(err_obj, dict):
+                            err_msg = err_obj.get("message") or str(err_obj)
+                        elif err_obj:
+                            err_msg = str(err_obj)
+                        else:
+                            err_msg = err_data.get("message") or res.body.decode("utf-8", errors="replace")
+                    except Exception:
+                        err_msg = res.body.decode("utf-8", errors="replace")
+
+                    # If OpenRouter reports that :free slug is retired and recommends the base model slug, retry once
+                    if prov == "openrouter" and self.spec.model.endswith(":free") and ("unavailable for free" in err_msg.lower() or "use this slug instead" in err_msg.lower()):
+                        fallback_model = self.spec.model.removesuffix(":free")
+                        log.info("Retrying OpenRouter with base model %s", fallback_model)
+                        res = await safe_request(
+                            "POST",
+                            url,
+                            net_spec,
+                            allowed_hosts={host} if host else None,
+                            json_body={"model": fallback_model, "messages": messages, "max_tokens": self.spec.max_tokens},
+                            headers=hdrs,
+                        )
+                        retry_status = getattr(res, "status_code", 200)
+                        if retry_status >= 400:
+                            raise BrainError(f"Cloud provider {prov} error ({retry_status}): {err_msg}")
+                    else:
+                        raise BrainError(f"Cloud provider {prov} error ({res_status}): {err_msg}")
+
                 data = json.loads(res.body.decode("utf-8"))
                 txt = data["choices"][0]["message"]["content"]
             elif prov == "gemini":
@@ -379,7 +461,7 @@ class Brain:
         if not _allow_think_fallback:
             body["think"] = False
         try:
-            async with self.client.stream("POST", self.host + "/api/chat", json=body) as r:
+            async with self.client.stream("POST", self.ollama_host + "/api/chat", json=body) as r:
                 if r.status_code == 404:
                     raise BrainError(f"Model {self.spec.model!r} not found in Ollama. Run `ollama pull {self.spec.model}`.")
                 if r.status_code == 400 and tools:

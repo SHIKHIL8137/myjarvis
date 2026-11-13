@@ -12,6 +12,7 @@ from langgraph.types import Command
 from .. import graph_live
 from ..config import DATA, SECRETS_PATH, Settings
 from ..core.event_bus import EventBus
+from ..core.runtime_registry import RuntimeRegistryService
 from ..db.engine import DatabaseManager
 from ..db.models import AgentRunRow, AgentStepRow, LLMUsageLogRow, WorktreeRow
 from ..decision.calibration import DecisionCalibrationService
@@ -35,6 +36,7 @@ from .checkpointer import DBBackedCheckpointSaver
 from .command_history import CommandHistoryService
 from .multistep import MultiStepExecutor
 from .profiles import AgentWorkforceCoordinator
+from .project_explorer import ProjectExplorerAgent
 from .research import DeepResearchEngine, run_deep_research_background_task
 from ..departments.assistant.routines import RoutineSchedulerService
 from ..undo import UndoService
@@ -76,7 +78,9 @@ class AgentOrchestrator:
         self.multistep = MultiStepExecutor(fs_access=self.fs_access, tasks=self.tasks, bus=self.bus)
         self.projects = ProjectRegistryService(self.db)
         self.workforce = DevWorkforceService(self.db, self.projects)
+        self.project_explorer = ProjectExplorerAgent(self.fs_access)
         self.agent_profiles = AgentWorkforceCoordinator(user_dir=self.data_dir / "agents")
+        self.runtime_registry = RuntimeRegistryService(self.settings, data_dir=self.data_dir)
         self.documents = DocumentService(self.data_dir / "outputs" / "documents")
         self.reminders = ReminderService(self.db, bus=self.bus)
         self.routines = RoutineSchedulerService(

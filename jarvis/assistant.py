@@ -240,6 +240,7 @@ class Assistant:
         self.used_tools: set[str] = set()  # real capability/web tools invoked during this session
         self.active_project: dict | None = None  # resolved project root context for follow-up continuity
         self.pending_clarification: dict | None = None  # pending folder/project disambiguation state
+        self.active_task_id: str | None = None  # last/active durable task id for conversational steering
         self.os_state = "Idle"
 
         online_fn = lambda: bool(self.settings.internet.enabled and audit.is_online_enabled())  # noqa: E731
@@ -1740,13 +1741,19 @@ class Assistant:
             except Exception:
                 continue
 
+        exp_report = await self.orchestrator.project_explorer.explore_project(root, task_id=task_id, project_name=name)
+        exp_prefix = ""
+        if exp_report and exp_report.manifests:
+            mf_str = ", ".join(f"`{m['file']}` ({m['ecosystem']})" for m in exp_report.manifests)
+            exp_prefix = f"Stack: {mf_str}. "
+
         # Note: Read permission NEVER authorizes shell command execution. Report read-only verification honestly.
         graph_live.filesystem_activity(self, task_id=task_id, folder_path=root, files=files, operation="inspect_project")
-        tools_used = ["filesystem_access", "ast_static_review", "test_inventory"]
+        tools_used = ["filesystem_access", "ast_static_review", "test_inventory", "project_explorer"]
         listed_names = ", ".join(f["relative_path"] for f in files[:8]) or "none"
         findings_txt = f"Review findings: {'; '.join(smells[:5])}. " if smells else ""
         summary = (
-            f"Project `{name}` (`{root}`): found {len(files)} files ({listed_names}) — "
+            f"Project `{name}` (`{root}`): {exp_prefix}found {len(files)} files ({listed_names}) — "
             f"{len(backend_files)} backend modules with {analyzed_funcs} functions/handlers, {len(test_files)} test files with {test_cases_found} test cases. "
             + ("No AST syntax errors found. " if not ast_issues else f"Syntax issues: {'; '.join(ast_issues)}. ")
             + findings_txt
@@ -3689,23 +3696,38 @@ class Assistant:
                     return
 
                 self._set_os_state("Planning", source=source)
-                plan = await self.orchestrator.decision.decide(text)
-                task_row = await self.orchestrator.tasks.create_task(
-                    text,
-                    source=source,
-                    intent=plan.decision.intent,
-                    status="planning",
-                    selected_agents=[plan.agent_role] if plan.agent_role else [],
-                    current_step=f"Planning {plan.workflow}",
+                plan = await self.orchestrator.decision.decide(text, context=self.get_conversation_context())
+
+                is_direct_chat = (
+                    plan.workflow == "direct_chat"
+                    or plan.decision.intent in ("general_chat", "question_explanation", "empty")
+                    or (
+                        plan.decision.structured_request is not None
+                        and plan.decision.structured_request.request_type in ("general_conversation", "question_explanation")
+                    )
                 )
-                current_task_id = task_row["task_id"]
+
+                if is_direct_chat:
+                    current_task_id = None
+                else:
+                    task_row = await self.orchestrator.tasks.create_task(
+                        text,
+                        source=source,
+                        intent=plan.decision.intent,
+                        status="planning",
+                        selected_agents=[plan.agent_role] if plan.agent_role else [],
+                        current_step=f"Planning {plan.workflow}",
+                    )
+                    current_task_id = task_row["task_id"]
+                    self.active_task_id = current_task_id
+
                 await self.orchestrator.command_history.record(
                     text,
                     task_category=classify_task_category(text, intent=plan.decision.intent, department=plan.decision.department),
                     intent=plan.decision.intent,
                     department=plan.decision.department,
                     task_id=current_task_id,
-                    status="running",
+                    status="running" if current_task_id else "completed",
                     replayable=(plan.decision.intent != "task_status"),
                     source=source,
                 )
@@ -4206,6 +4228,20 @@ class Assistant:
         if state != self.os_state or detail:
             self.os_state = state
             graph_live.emit_assistant_state(self.bus, state, source=source, detail=detail, **extra)
+
+    def get_conversation_context(self):
+        from .decision.schemas import ConversationContext
+        proj_name = (self.active_project or {}).get("name") or (self.active_project or {}).get("project_name")
+        proj_path = (self.active_project or {}).get("root_path") or (self.active_project or {}).get("path")
+        recent = [{"role": m.get("role", ""), "content": m.get("content", "")} for m in self.history.window()]
+        return ConversationContext(
+            conversation_id="default",
+            active_task_id=self.active_task_id,
+            active_project_path=proj_path,
+            active_project_name=proj_name,
+            pending_clarification=self.pending_clarification,
+            recent_turns=recent,
+        )
 
     # ---- status --------------------------------------------------------------------------------------
     async def status(self) -> dict:

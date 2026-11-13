@@ -13,7 +13,8 @@ from .classifier import (
 )
 from .laya_adapter import IsolatedLayaClassifier
 from .rules import enforce_security_boundary, evaluate_layer1
-from .schemas import DecisionEnvelope, RoutingPlan
+from .schemas import ConversationContext, DecisionEnvelope, RoutingPlan
+from .request import build_structured_request, is_conversational_turn
 
 
 class DecisionEngine:
@@ -155,6 +156,20 @@ class DecisionEngine:
                 allowed_tools=["graphify_query", "graphify_affected", "git_worktree", "opencode_run", "qa_verify"],
             )
 
+        if (
+            env.intent in ("general_chat", "question_explanation", "empty")
+            and env.structured_request
+            and is_conversational_turn(env.structured_request)
+            and not env.needs_live_web
+        ):
+            return RoutingPlan(
+                decision=env,
+                workflow="direct_chat",
+                primary_model=local_default,
+                fallback_models=[],
+                agent_role="assistant_coordinator",
+            )
+
         if env.department == "assistant" or env.needs_live_web:
             chain = [local_think if env.complexity == "complex_reasoning" else local_default] + cloud
             role = (
@@ -203,18 +218,23 @@ class DecisionEngine:
         res = await self.heuristic_classifier.classify(text)
         return enforce_security_boundary(text, res.envelope)
 
-    async def decide(self, text: str, *, fast_llm: LLMJsonFn | None = None) -> RoutingPlan:
+    async def decide(self, text: str, *, fast_llm: LLMJsonFn | None = None, context: ConversationContext | None = None) -> RoutingPlan:
+        structured = build_structured_request(text, context=context)
+
         l1 = evaluate_layer1(text)
         if l1 is not None:
+            l1.structured_request = structured
             return self.route_for_decision(enforce_security_boundary(text, l1))
 
         mode = self._effective_mode()
         if mode == "disabled":
             env = await self._run_primary_baseline(text, fast_llm=fast_llm)
+            env.structured_request = structured
             return self.route_for_decision(env)
 
         if mode == "shadow":
             primary = await self._run_primary_baseline(text, fast_llm=fast_llm)
+            primary.structured_request = structured
             try:
                 laya_res = await self.laya_classifier.classify(text)
                 primary.shadow_comparison = self._record_shadow(primary, laya_res)
@@ -226,6 +246,7 @@ class DecisionEngine:
             try:
                 laya_res = await self.laya_classifier.classify(text)
                 env = enforce_security_boundary(text, laya_res.envelope)
+                env.structured_request = structured
                 return self.route_for_decision(env)
             except Exception as exc:
                 env = DecisionEnvelope(
@@ -240,6 +261,7 @@ class DecisionEngine:
                     clarifying_question="The experimental Laya classifier could not decide right now; please rephrase or clarify your request.",
                     notes=["laya_primary_unavailable", f"error:{str(exc)[:100]}"],
                     classifier_source="laya_isolated",
+                    structured_request=structured,
                 )
                 return self.route_for_decision(enforce_security_boundary(text, env))
 
@@ -247,9 +269,11 @@ class DecisionEngine:
         try:
             laya_res = await self.laya_classifier.classify(text)
             env = enforce_security_boundary(text, laya_res.envelope)
+            env.structured_request = structured
             return self.route_for_decision(env)
         except Exception as exc:
             env = await self._run_primary_baseline(text, fast_llm=fast_llm)
             env.classifier_source = "laya_shadow_fallback"
             env.notes.append(f"laya_fallback:{str(exc)[:100]}")
+            env.structured_request = structured
             return self.route_for_decision(env)

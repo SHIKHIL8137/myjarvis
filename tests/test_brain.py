@@ -154,3 +154,44 @@ def test_unpaired_closing_think_and_truncated_fallback_never_leak(settings):
     b2.current = "local_thinking"
     out2 = run(b2.complete([{"role": "user", "content": "Say hello"}]))
     assert calls == [True, False] and out2 == "Good day, sir."
+
+
+def test_cloud_model_catalogue_and_ollama_host_isolation(settings, monkeypatch):
+    """Ensure cloud models isolate ollama_host from cloud base_url and catalogue() never crashes when Ollama is offline."""
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-fake-key-test")
+    settings.providers.allow_cloud = True
+    settings.internet.enabled = True
+
+    calls = []
+
+    def handler(req):
+        calls.append((req.method, str(req.url)))
+        if "/api/tags" in str(req.url):
+            # Ollama tags call
+            assert "127.0.0.1:11434" in str(req.url) or "localhost" in str(req.url)
+            assert "openrouter" not in str(req.url)
+            return httpx.Response(200, json={"models": [{"name": "qwen3:4b-instruct"}]})
+        return httpx.Response(200, json={})
+
+    b = make(settings, handler)
+    # Simulate current active model set to openrouter
+    b.current = "openrouter:qwen/qwen3-coder:free"
+
+    assert "openrouter.ai" in b.host
+    assert "127.0.0.1:11434" in b.ollama_host
+
+    # Catalogue should work and query local Ollama, not openrouter
+    cat = run(b.catalogue())
+    assert any(m["provider"] == "openrouter" for m in cat)
+    assert not any("openrouter.ai" in url for _, url in calls)
+
+    # When Ollama is offline (ConnectError), catalogue still succeeds gracefully
+    def offline_handler(req):
+        raise httpx.ConnectError("Connection refused")
+
+    b_offline = make(settings, offline_handler)
+    b_offline.current = "openrouter:qwen/qwen3-coder:free"
+    cat_offline = run(b_offline.catalogue())
+    assert isinstance(cat_offline, list) and len(cat_offline) > 0
+    assert any(m["provider"] == "openrouter" for m in cat_offline)
+

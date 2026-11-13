@@ -103,6 +103,15 @@ def _attach_sqlite_pragmas(engine) -> None:
             cur.close()
 
 
+def _ensure_alembic_version_sync(conn) -> None:
+    """Ensure alembic_version table is stamped with current schema head if missing."""
+    insp = inspect(conn)
+    tables = set(insp.get_table_names())
+    if "alembic_version" not in tables:
+        conn.execute(text("CREATE TABLE IF NOT EXISTS alembic_version (version_num VARCHAR(32) NOT NULL PRIMARY KEY)"))
+        conn.execute(text("INSERT OR IGNORE INTO alembic_version (version_num) VALUES ('0011_p5_undo_journal')"))
+
+
 def _reconcile_columns_sync(conn) -> None:
     """Safely add newly introduced P10 columns to existing databases created prior to Alembic upgrade."""
     insp = inspect(conn)
@@ -162,12 +171,14 @@ class DatabaseManager:
             self._probe_pgvector_sync(conn)
             Base.metadata.create_all(conn)
             _reconcile_columns_sync(conn)
+            _ensure_alembic_version_sync(conn)
 
     async def init_schema(self) -> None:
         async with self.async_engine.begin() as conn:
             await conn.run_sync(self._probe_pgvector_sync)
             await conn.run_sync(Base.metadata.create_all)
             await conn.run_sync(_reconcile_columns_sync)
+            await conn.run_sync(_ensure_alembic_version_sync)
 
     async def session(self) -> AsyncIterator[AsyncSession]:
         async with self.async_session() as s:

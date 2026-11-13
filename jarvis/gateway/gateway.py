@@ -9,6 +9,7 @@ import time
 from typing import AsyncIterator
 from urllib.parse import urlsplit
 
+from .. import audit
 from ..brain import Brain
 from ..config import get_provider_api_key, has_provider_api_key
 from ..core.resources import ResourceGovernor
@@ -407,7 +408,8 @@ class ModelGateway:
         if not key:
             return {"ok": False, "provider": prov, "error": "missing API key", "key_configured": False, "breaker": self.breaker_status(prov)}
 
-        if self.settings.offline_enforced or not self.settings.providers.allow_cloud:
+        online_allowed = bool(self.settings.internet.enabled and audit.is_online_enabled())
+        if (self.settings.offline_enforced and not online_allowed) or not self.settings.providers.allow_cloud:
             return {
                 "ok": False,
                 "provider": prov,
@@ -457,7 +459,7 @@ class ModelGateway:
             "selected": eligible[0] if eligible else None,
             "rejections": rejections,
             "privacy_level": project_privacy_level,
-            "online_enabled": bool(self.settings.internet.enabled and not self.settings.offline_enforced),
+            "online_enabled": bool(self.settings.internet.enabled and (not self.settings.offline_enforced or audit.is_online_enabled())),
             "breakers": {k: self.breaker_status(k) for k in ("ollama", "openrouter", "gemini", "huggingface", "openai", "anthropic", "custom")},
         }
 
