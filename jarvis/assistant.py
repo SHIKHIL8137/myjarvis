@@ -3698,13 +3698,18 @@ class Assistant:
                 self._set_os_state("Planning", source=source)
                 plan = await self.orchestrator.decision.decide(text, context=self.get_conversation_context())
 
+                has_fs_intent = (
+                    plan.decision.intent in ("filesystem_ops", "dev_review", "project_exploration", "clarification_needed")
+                    or (plan.decision.structured_request is not None and (
+                        getattr(plan.decision.structured_request, "requires_filesystem", False)
+                        or getattr(plan.decision.structured_request, "request_type", "") in ("project_exploration", "file_folder_operation", "clarification_response", "task_steering")
+                    ))
+                )
                 is_direct_chat = (
                     plan.workflow == "direct_chat"
-                    or plan.decision.intent in ("general_chat", "question_explanation", "empty")
-                    or (
-                        plan.decision.structured_request is not None
-                        and plan.decision.structured_request.request_type in ("general_conversation", "question_explanation")
-                    )
+                    and not has_fs_intent
+                    and plan.decision.intent in ("general_chat", "question_explanation", "empty")
+                    and not getattr(plan.decision, "requires_owner_approval", False)
                 )
 
                 if is_direct_chat:

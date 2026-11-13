@@ -1,6 +1,7 @@
 """Async & sync database engine manager supporting SQLite+WAL locally and PostgreSQL 18 + pgvector."""
 import logging
 import os
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator
 
@@ -180,6 +181,7 @@ class DatabaseManager:
             await conn.run_sync(_reconcile_columns_sync)
             await conn.run_sync(_ensure_alembic_version_sync)
 
+    @asynccontextmanager
     async def session(self) -> AsyncIterator[AsyncSession]:
         async with self.async_session() as s:
             yield s

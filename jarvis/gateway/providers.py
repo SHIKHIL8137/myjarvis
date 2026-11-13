@@ -100,14 +100,14 @@ class OpenAICompatAdapter:
     async def health_check(self, api_key: str | None = None, transport_factory=None) -> dict:
         if not api_key:
             return {"ok": False, "provider": self.name, "error": "missing API key"}
-        url = self.base_url + "/models"
+        url = self.base_url + ("/auth/key" if self.name == "openrouter" else "/models")
         host = (urlsplit(url).hostname or "").lower()
         allow = self.allowed_hosts or ({host} if host else set())
         t0 = time.perf_counter()
         res = await safe_request(
             "GET",
             url,
-            InternetSpec(enabled=True, timeout_s=8.0),
+            InternetSpec(enabled=True, timeout_s=8.0, max_fetch_bytes=2_000_000),
             allowed_hosts=allow,
             headers={"Authorization": f"Bearer {api_key}"},
             transport_factory=transport_factory,
@@ -208,8 +208,67 @@ class OpenAICompatAdapter:
             if isinstance(e, CloudGatewayError):
                 raise
             msg_e = str(e)
-            retryable = any(code in msg_e for code in ("429", "502", "503", "504", "Timeout"))
-            raise CloudGatewayError(f"{self.name} failed: {e}", category="upstream_transient" if retryable else "upstream", retryable=retryable) from e
+            if self.name == "openrouter" and body.get("model", "").endswith(":free") and ("unavailable for free" in msg_e.lower() or "use this slug instead" in msg_e.lower()):
+                fallback_model = body["model"].removesuffix(":free")
+                body["model"] = fallback_model
+                try:
+                    async for raw_ln in safe_stream_lines(
+                        "POST",
+                        url,
+                        net_spec,
+                        allowed_hosts=allow,
+                        json_body=body,
+                        headers=headers,
+                        transport_factory=transport_factory,
+                    ):
+                        if req.cancel_event and req.cancel_event.is_set():
+                            raise CloudGatewayError("Request cancelled by caller", category="cancelled", retryable=False)
+                        ln = raw_ln.strip()
+                        if not ln:
+                            continue
+                        if ln.startswith("{"):
+                            data = json.loads(ln)
+                            msg = (data.get("choices") or [{}])[0].get("message") or {}
+                            txt = msg.get("content") or ""
+                            usage = data.get("usage") or {}
+                            if txt:
+                                saw_text += txt
+                                yield GatewayEvent(type="token", text=txt)
+                            if msg.get("tool_calls"):
+                                yield GatewayEvent(type="tool_calls", calls=list(msg["tool_calls"]))
+                            prompt_tok = int(usage.get("prompt_tokens") or 0)
+                            comp_tok = int(usage.get("completion_tokens") or len(saw_text.split()))
+                            break
+                        if not ln.startswith("data:"):
+                            continue
+                        payload = ln[5:].strip()
+                        if payload == "[DONE]":
+                            break
+                        chunk = json.loads(payload)
+                        if chunk.get("usage"):
+                            prompt_tok = int(chunk["usage"].get("prompt_tokens") or prompt_tok)
+                            comp_tok = int(chunk["usage"].get("completion_tokens") or comp_tok)
+                        choice = (chunk.get("choices") or [{}])[0]
+                        delta = choice.get("delta") or {}
+                        if delta.get("content"):
+                            t = str(delta["content"])
+                            saw_text += t
+                            yield GatewayEvent(type="token", text=t)
+                        for tc in delta.get("tool_calls") or []:
+                            idx = int(tc.get("index", 0))
+                            entry = tool_buf.setdefault(idx, {"id": tc.get("id") or f"call_{idx}", "function": {"name": "", "arguments": ""}})
+                            fn = tc.get("function") or {}
+                            if fn.get("name"):
+                                entry["function"]["name"] += str(fn["name"])
+                            if fn.get("arguments"):
+                                entry["function"]["arguments"] += str(fn["arguments"])
+                except Exception as retry_e:
+                    msg_retry = str(retry_e)
+                    retryable = any(code in msg_retry for code in ("429", "502", "503", "504", "Timeout"))
+                    raise CloudGatewayError(f"{self.name} failed: {retry_e}", category="upstream_transient" if retryable else "upstream", retryable=retryable) from retry_e
+            else:
+                retryable = any(code in msg_e for code in ("429", "502", "503", "504", "Timeout"))
+                raise CloudGatewayError(f"{self.name} failed: {e}", category="upstream_transient" if retryable else "upstream", retryable=retryable) from e
 
         if tool_buf:
             calls_out = []

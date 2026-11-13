@@ -259,6 +259,10 @@ export const OperationsDrawer: React.FC<OperationsDrawerProps> = ({
   // Agents (P3)
   const [profiles, setProfiles] = useState<AgentProfileItem[]>([]);
   const [agentDiagnostics, setAgentDiagnostics] = useState<string[]>([]);
+  const [runtimesData, setRuntimesData] = useState<{
+    applications: Array<{ id: string; name: string; evidence_level: string; executable_path?: string; version?: string; capabilities?: Record<string, any> }>;
+    counts: Record<string, number>;
+  } | null>(null);
 
   // Research (P2)
   const [researchReports, setResearchReports] = useState<ResearchReportItem[]>([]);
@@ -273,6 +277,8 @@ export const OperationsDrawer: React.FC<OperationsDrawerProps> = ({
   const [newRoutineTrigger, setNewRoutineTrigger] = useState("every_n_minutes");
   const [newRoutineMins, setNewRoutineMins] = useState("30");
   const [newRoutineAction, setNewRoutineAction] = useState("notification");
+  const [briefingOutput, setBriefingOutput] = useState<{ kind?: string; briefing?: string; generated_at?: string } | null>(null);
+  const [loadingBriefing, setLoadingBriefing] = useState(false);
 
   // Actions & Undo (P5)
   const [undoEntries, setUndoEntries] = useState<UndoEntryItem[]>([]);
@@ -284,9 +290,13 @@ export const OperationsDrawer: React.FC<OperationsDrawerProps> = ({
         const res = await apiFetch<{ tasks: TaskItem[] }>("/v2/tasks?limit=40");
         setTasksList(res.tasks || []);
       } else if (tab === "agents") {
-        const res = await apiFetch<{ profiles: AgentProfileItem[]; diagnostics: string[] }>("/v2/agents");
-        setProfiles(res.profiles || []);
-        setAgentDiagnostics(res.diagnostics || []);
+        const [aRes, rRes] = await Promise.all([
+          apiFetch<{ profiles: AgentProfileItem[]; diagnostics: string[] }>("/v2/agents"),
+          apiFetch<{ applications: Array<{ id: string; name: string; evidence_level: string; executable_path?: string; version?: string; capabilities?: Record<string, any> }>; counts: Record<string, number> }>("/v2/runtimes").catch(() => null),
+        ]);
+        setProfiles(aRes.profiles || []);
+        setAgentDiagnostics(aRes.diagnostics || []);
+        if (rRes) setRuntimesData(rRes);
       } else if (tab === "research") {
         const res = await apiFetch<{ reports: ResearchReportItem[] }>("/v2/research?limit=30");
         setResearchReports(res.reports || []);
@@ -548,6 +558,63 @@ export const OperationsDrawer: React.FC<OperationsDrawerProps> = ({
       {/* ---------------- P3 AGENTS TAB ---------------- */}
       {tab === "agents" && (
         <div>
+          {/* External Coding Runtimes & Applications */}
+          <div className="card" style={{ marginBottom: 12, border: "1px solid rgba(0,229,255,0.25)" }}>
+            <div className="row between wrap" style={{ marginBottom: 6 }}>
+              <div>
+                <strong>Discovered Coding Applications & Runtimes</strong>
+                <div className="dim" style={{ fontSize: 11.5 }}>
+                  Live verified execution runtimes discovered on host (OpenCode CLI, Claude Code, Antigravity).
+                </div>
+              </div>
+              <button
+                className="ghost"
+                onClick={async () => {
+                  try {
+                    const r = await apiFetch<{ applications: any[]; counts: any }>("/v2/runtimes/discover", { method: "POST" });
+                    setRuntimesData(r);
+                    onNotify("Re-scanned installed agent applications & runtimes.");
+                  } catch (e) {
+                    onNotify((e as Error).message);
+                  }
+                }}
+              >
+                Re-scan Runtimes
+              </button>
+            </div>
+            {runtimesData && runtimesData.applications ? (
+              <div className="task-cards-list">
+                {runtimesData.applications.map((app) => {
+                  const tone = app.evidence_level === "auth_verified" || app.evidence_level === "capability_tested"
+                    ? "ok"
+                    : app.evidence_level === "installed"
+                    ? "info"
+                    : "dim";
+                  return (
+                    <div key={app.id} className="task-mini-card" style={{ padding: "6px 8px" }}>
+                      <div className="row between wrap">
+                        <div className="row" style={{ gap: 6 }}>
+                          <strong>{app.name}</strong>
+                          <span className={`pill ${tone} mono`} style={{ fontSize: 10 }}>
+                            {app.evidence_level.replace(/_/g, " ").toUpperCase()}
+                          </span>
+                        </div>
+                        {app.version && <span className="mono dim" style={{ fontSize: 10.5 }}>v{app.version}</span>}
+                      </div>
+                      {app.executable_path && (
+                        <div className="mono dim" style={{ fontSize: 10, marginTop: 2, wordBreak: "break-all" }}>
+                          {app.executable_path}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            ) : (
+              <div className="dim" style={{ fontSize: 11.5 }}>Scanning runtime ecosystem…</div>
+            )}
+          </div>
+
           <div className="row between wrap" style={{ marginBottom: 8 }}>
             <div>
               <strong>Workforce Agent Profiles</strong>
@@ -741,6 +808,69 @@ export const OperationsDrawer: React.FC<OperationsDrawerProps> = ({
       {/* ---------------- P4 ROUTINES TAB ---------------- */}
       {tab === "routines" && (
         <div>
+          {/* Daily Briefing Generator */}
+          <div className="card" style={{ marginBottom: 12, border: "1px solid rgba(0,229,255,0.25)" }}>
+            <div className="row between wrap" style={{ marginBottom: 6 }}>
+              <div>
+                <strong>Daily Assistant Executive Briefing</strong>
+                <div className="dim" style={{ fontSize: 11.5 }}>
+                  Consolidated briefing across calendar, reminders, email drafts, and system health.
+                </div>
+              </div>
+              <div className="row" style={{ gap: 6 }}>
+                <button
+                  className="active"
+                  disabled={loadingBriefing}
+                  onClick={async () => {
+                    try {
+                      setLoadingBriefing(true);
+                      const res = await apiFetch<{ kind: string; summary?: string; briefing?: string; date?: string }>("/v2/assistant/briefing?kind=morning");
+                      setBriefingOutput({ kind: res.kind, briefing: res.summary || res.briefing || "", generated_at: res.date });
+                      onNotify("Morning briefing generated.");
+                    } catch (e) {
+                      onNotify((e as Error).message);
+                    } finally {
+                      setLoadingBriefing(false);
+                    }
+                  }}
+                >
+                  {loadingBriefing ? "Generating…" : "Morning Briefing"}
+                </button>
+                <button
+                  className="ghost"
+                  disabled={loadingBriefing}
+                  onClick={async () => {
+                    try {
+                      setLoadingBriefing(true);
+                      const res = await apiFetch<{ kind: string; summary?: string; briefing?: string; date?: string }>("/v2/assistant/briefing?kind=end_of_day");
+                      setBriefingOutput({ kind: res.kind, briefing: res.summary || res.briefing || "", generated_at: res.date });
+                      onNotify("End-of-day review generated.");
+                    } catch (e) {
+                      onNotify((e as Error).message);
+                    } finally {
+                      setLoadingBriefing(false);
+                    }
+                  }}
+                >
+                  End-of-Day Review
+                </button>
+              </div>
+            </div>
+            {briefingOutput && (
+              <div style={{ marginTop: 8, padding: 8, background: "rgba(0,0,0,0.3)", borderRadius: 6 }}>
+                <div className="row between" style={{ marginBottom: 4 }}>
+                  <span className="pill info mono" style={{ fontSize: 10.5 }}>
+                    {(briefingOutput.kind || "briefing").toUpperCase()} BRIEFING
+                  </span>
+                  <span className="mono dim" style={{ fontSize: 10 }}>{briefingOutput.generated_at}</span>
+                </div>
+                <div style={{ whiteSpace: "pre-wrap", fontSize: 12, lineHeight: 1.45, fontFamily: "inherit" }}>
+                  {briefingOutput.briefing}
+                </div>
+              </div>
+            )}
+          </div>
+
           {quietHours.enabled && (
             <div className="card" style={{ borderColor: "rgba(100,181,246,0.4)", marginBottom: 8 }}>
               <div className="row between wrap">
