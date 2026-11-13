@@ -440,7 +440,14 @@ export const VoiceDock: React.FC<VoiceDockProps> = ({
       return;
     }
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+          channelCount: 1,
+        },
+      });
       const ctx = new AudioContext();
       const src = ctx.createMediaStreamSource(stream);
       const proc = ctx.createScriptProcessor(2048, 1, 1);
@@ -466,7 +473,10 @@ export const VoiceDock: React.FC<VoiceDockProps> = ({
         };
       }
       src.connect(proc);
-      proc.connect(ctx.destination);
+      const muteGain = ctx.createGain();
+      muteGain.gain.setValueAtTime(0, ctx.currentTime);
+      proc.connect(muteGain);
+      muteGain.connect(ctx.destination);
       webMicRef.current = { stream, ctx, chunks, rate: ctx.sampleRate };
       setBrowserRec(true);
       onBrowserRecChange?.(true);

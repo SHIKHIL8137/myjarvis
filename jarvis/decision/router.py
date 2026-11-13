@@ -59,7 +59,7 @@ class DecisionEngine:
         paid_set = {x.lower() for x in p.paid_providers}
         chain: list[str] = []
 
-        if has_provider_api_key("openrouter") and (p.openrouter_model.endswith(":free") or p.allow_paid_models):
+        if has_provider_api_key("openrouter") and ("openrouter" not in paid_set or p.openrouter_model.endswith(":free") or "free" in p.openrouter_model or p.allow_paid_models):
             chain.append(f"openrouter:{p.openrouter_model}")
         if has_provider_api_key("gemini") and ("gemini" not in paid_set or p.allow_paid_models):
             chain.append(f"gemini:{p.gemini_model}")

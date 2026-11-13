@@ -113,6 +113,7 @@ interface ModelItem {
   installed: boolean;
   current: boolean;
   thinking: boolean;
+  local?: boolean;
 }
 
 interface CapabilityItem {
@@ -327,15 +328,15 @@ export const SettingsPanel: React.FC<ShellProps> = ({ onNotify }) => {
             </p>
             <div className="grid-2">
               <label className="field">
-                Active Local Brain (Ollama)
-                <span className="field-hint">Model used for normal Jarvis conversations.</span>
+                Active Brain &amp; Conversation Model
+                <span className="field-hint">Select local Ollama or connected cloud model (e.g. OpenRouter) for conversations.</span>
                 <select
                   value={models.find((m) => m.current)?.key || ""}
                   onChange={(e) => mutate(`Switched brain to ${e.target.value}`, () => apiFetch("/models/switch", { method: "POST", body: { model: e.target.value } }))}
                 >
                   {models.map((m) => (
                     <option key={m.key} value={m.key} disabled={!m.installed}>
-                      {m.model} ({m.provider}{m.thinking ? ", thinking" : ""}{m.installed ? "" : ", not installed"})
+                      {m.model} ({m.provider}{m.local ? ", local" : ", cloud"}{m.thinking ? ", thinking" : ""}{m.installed ? "" : ", not available"})
                     </option>
                   ))}
                 </select>

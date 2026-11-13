@@ -219,6 +219,10 @@ class Brain:
         for prov_name, prov_model in cloud_specs:
             if has_provider_api_key(prov_name):
                 models_to_list = [prov_model]
+                if prov_name == "openrouter":
+                    for cand in ("openrouter/free", "qwen/qwen3-coder"):
+                        if cand not in models_to_list:
+                            models_to_list.append(cand)
                 if self.current.startswith(f"{prov_name}:"):
                     curr_m = self.current.split(":", 1)[1]
                     if curr_m not in models_to_list:
@@ -272,6 +276,14 @@ class Brain:
 
     async def switch(self, key_or_model: str) -> dict:
         """Select a configured brain, installed Ollama model, or gated cloud adapter. Never pulls models."""
+        if key_or_model.startswith("openrouter/"):
+            key_or_model = f"openrouter:{key_or_model}"
+        elif key_or_model == "openrouter:qwen/qwen3-coder:free":
+            key_or_model = "openrouter:openrouter/free"
+        elif not key_or_model.startswith(("openai:", "anthropic:", "openrouter:", "gemini:", "huggingface:")):
+            if "/" in key_or_model and has_provider_api_key("openrouter"):
+                key_or_model = f"openrouter:{key_or_model}"
+
         if key_or_model.startswith(("openai:", "anthropic:", "openrouter:", "gemini:", "huggingface:")):
             prov, model_id = key_or_model.split(":", 1)
             self._cloud_allowed(prov)
@@ -358,7 +370,8 @@ class Brain:
                 host = (urlsplit(url).hostname or "").lower()
                 hdrs = {"Authorization": f"Bearer {key}"}
                 if prov == "openrouter":
-                    hdrs["HTTP-Referer"] = "https://localhost.jarvis.local"
+                    hdrs["HTTP-Referer"] = "https://github.com/shikhil/myjarvis"
+                    hdrs["X-Title"] = "Jarvis Personal Assistant"
                 res = await safe_request(
                     "POST",
                     url,
