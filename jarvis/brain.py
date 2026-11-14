@@ -395,6 +395,7 @@ class Brain:
                     except Exception:
                         err_msg = res.body.decode("utf-8", errors="replace")
 
+                    err_msg = scrub_messages([{"role": "user", "content": err_msg}])[0][0]["content"]  # upstream bodies may echo the key
                     # If OpenRouter reports that :free slug is retired and recommends the base model slug, retry once
                     if prov == "openrouter" and self.spec.model.endswith(":free") and ("unavailable for free" in err_msg.lower() or "use this slug instead" in err_msg.lower()):
                         fallback_model = self.spec.model.removesuffix(":free")
@@ -414,7 +415,8 @@ class Brain:
                         raise BrainError(f"Cloud provider {prov} error ({res_status}): {err_msg}")
 
                 data = json.loads(res.body.decode("utf-8"))
-                txt = data["choices"][0]["message"]["content"]
+                choice_msg = data.get("choices", [{}])[0].get("message", {})
+                txt = choice_msg.get("content") or choice_msg.get("reasoning") or ""
             elif prov == "gemini":
                 url = f"{self.settings.providers.gemini_base_url.rstrip('/')}/models/{self.spec.model}:generateContent"
                 host = (urlsplit(url).hostname or "").lower()
@@ -428,6 +430,7 @@ class Brain:
                     body["systemInstruction"] = {"parts": [{"text": "\n".join(sys_parts)}]}
                 res = await safe_request("POST", url, net_spec, allowed_hosts={host} if host else None, json_body=body, headers={"x-goog-api-key": key})
                 data = json.loads(res.body.decode("utf-8"))
+                txt = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "") or ""
                 parts = ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
                 txt = "".join(p.get("text", "") for p in parts)
             elif prov == "anthropic":
@@ -452,6 +455,7 @@ class Brain:
         except Exception as e:
             raise BrainError(f"Cloud request failed: {e}") from e
 
+        txt = txt or ""
         self.last_stats = {"ttft": time.time() - t0, "tokens": len(txt.split()), "tps": 0.0, "total": time.time() - t0, "model": self.spec.model, "truncated": False}
         yield {"type": "token", "text": txt}
 

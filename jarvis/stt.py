@@ -136,7 +136,74 @@ def load_vocab_hints(spec: STTSpec | None = None, override: str | None = None) -
     raw_cfg = override if override is not None else (spec.vocab_hints if spec is not None else "")
     if raw_cfg:
         _add_chunk(raw_cfg)
+    if len(terms) > 10:
+        log.warning(
+            "Vocabulary hints contains %d terms (>10 recommended). Large hint lists can cause Whisper "
+            "to hallucinate custom terms during normal conversation.",
+            len(terms),
+        )
     return terms
+
+
+def clean_english_transcript(
+    text: str,
+    vocab_hints: list[str] | None = None,
+    audio_diag: AudioDiagnosticReport | dict | None = None,
+) -> str:
+    """Conservative post-transcription cleanup for English speech:
+    - Drops repeated-word loops (e.g. 'word word word' -> 'word')
+    - Drops repeated-phrase loops (e.g. 'the server the server' -> 'the server')
+    - Strips leaked vocabulary hint words that were not present in the audio
+    - Never calls LLMs or alters genuine intent/meaning.
+    """
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return ""
+
+    # 1. Drop repeated sentence/phrase loops (e.g., 'Please wait. Please wait.' -> 'Please wait.')
+    # and consecutive word loops (e.g., 'stop stop stop' -> 'stop', 'the server the server' -> 'the server')
+    has_trailing_dot = cleaned.endswith(".")
+    cleaned = re.sub(r"\b([a-zA-Z]+(?:\s+[a-zA-Z]+){0,3})[.!?]?(?:\s+\1[.!?]?)+", r"\1", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\b([a-zA-Z]+)(?:\s+\1\b)+", r"\1", cleaned, flags=re.IGNORECASE)
+    if has_trailing_dot and not cleaned.endswith("."):
+        cleaned += "."
+
+    # 2. Guard against leaked vocabulary hint echo when audio is ambiguous/too short
+    # e.g., Whisper hallucinating chained hints 'Jarvis, Kavlien, ERP.' on silence or ambiguous noise
+    diag_dict = audio_diag.to_dict() if hasattr(audio_diag, "to_dict") else (audio_diag or {})
+    dur_s = float(diag_dict.get("duration_s", 0.0) or 0.0)
+    speech_s = float(diag_dict.get("vad_speech_duration_s", dur_s) or dur_s)
+    warnings = set(diag_dict.get("warnings", []))
+
+    if vocab_hints:
+        hint_set = {h.strip().lower() for h in vocab_hints if h.strip()}
+        tokens = re.findall(r"\b[a-zA-Z0-9_-]+\b", cleaned.lower())
+        non_stop = [t for t in tokens if t not in {"and", "or", "the", "a", "an", "to", "in", "on", "for", "is", "it"}]
+        if non_stop and all(t in hint_set for t in non_stop):
+            has_multiple_hints = len(set(non_stop)) >= 2
+            is_suspicious_audio = (
+                (has_multiple_hints and (dur_s < 1.8 or speech_s < 0.8))
+                or "mostly_silence" in warnings
+                or speech_s < 0.25
+            )
+            if is_suspicious_audio:
+                log.info("Stripped leaked vocabulary hint hallucination from transcript: %r", cleaned)
+                return ""
+
+    # 3. Common single-token voice command acoustic normalization
+    # Whisper frequently hears weak initial sibilant in 'Stop.' as 'Top.' or 'SOP', or 'Pause.' as 'Paws.'
+    if re.fullmatch(r"(?:top|sop)[.!?]?", cleaned, flags=re.IGNORECASE):
+        cleaned = "Stop."
+    elif re.fullmatch(r"(?:paws)[.!?]?", cleaned, flags=re.IGNORECASE):
+        cleaned = "Pause."
+
+    # Clean up formatting: normalize multiple spaces and dangling commas
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    cleaned = re.sub(r"\s*,\s*,+", ", ", cleaned)
+    cleaned = re.sub(r"^,\s*", "", cleaned)
+    if cleaned.endswith(","):
+        cleaned = cleaned[:-1].rstrip() + "."
+    return cleaned
 
 
 def _script_counts(text: str) -> dict[str, int]:
@@ -561,12 +628,24 @@ class Whisper:
         with self._lock:
             if self._m is None or self._loaded_key != key:
                 self.faster_whisper.max_cached = max(1, int(getattr(self.spec, "max_cached_models", 2)))
-                self._m = self.faster_whisper.load(
-                    target_model,
-                    compute_type=self.spec.compute_type,
-                    cpu_threads=self.spec.cpu_threads,
-                )
-                self._loaded_key = key
+                try:
+                    self._m = self.faster_whisper.load(
+                        target_model,
+                        compute_type=self.spec.compute_type,
+                        cpu_threads=self.spec.cpu_threads,
+                    )
+                    self._loaded_key = key
+                except Exception as e:
+                    if target_model == "medium.en":
+                        log.warning("Whisper model 'medium.en' load failed; falling back to 'small.en': %s", e)
+                        self._m = self.faster_whisper.load(
+                            "small.en",
+                            compute_type=self.spec.compute_type,
+                            cpu_threads=self.spec.cpu_threads,
+                        )
+                        self._loaded_key = ("small.en", self.spec.compute_type, self.spec.cpu_threads)
+                    else:
+                        raise
         return self._m
 
     def _run_whisper_model(
@@ -792,7 +871,7 @@ class Whisper:
             prof = "light"
 
         raw_dur = (raw_arr.shape[0] if raw_arr.ndim >= 1 else 0) / float(max(1, sample_rate))
-        is_short = 0.0 < raw_dur < 1.5
+        is_short = 0.0 < raw_dur < 2.0
         pad_ms = int(getattr(self.spec, "short_utterance_pad_ms", 160) or 0) if is_short else 0
         proc_audio, diag = preprocess_audio(
             raw_arr,
@@ -815,6 +894,7 @@ class Whisper:
             return {
                 "text": "",
                 "original_transcript": "",
+                "language": "en" if req_lang in ("auto", "mixed", "") else req_lang,
                 "detected_language": "en" if req_lang in ("auto", "mixed", "") else req_lang,
                 "language_probability": None,
                 "language_probability_available": False,
@@ -968,7 +1048,8 @@ class Whisper:
         fw_model = self.spec.model if (target_model in self._providers and target_model != "faster_whisper") else target_model
         m = self.load(fw_model) if fw_model != self.spec.model else self.load()
         is_multi = bool(getattr(getattr(m, "model", None), "is_multilingual", not fw_model.endswith(".en")))
-        if not is_multi:
+        if fw_model.endswith(".en") or not is_multi:
+            is_multi = False
             if req_lang not in ("auto", "en", ""):
                 raise ValueError(
                     f"Whisper model {fw_model!r} only supports English; switch STT model to 'small' or 'base' for {req_lang}."
@@ -987,19 +1068,21 @@ class Whisper:
         use_vad = self.spec.vad_filter if vad_filter is None else vad_filter
 
         # Guarded vocabulary hints: never inject ASCII hints into explicit Indic modes,
-        # and avoid forcing prompt priors into ultra-short commands (< 0.9s).
+        # and avoid forcing prompt priors into short commands (< 2.0s).
         hint_terms = load_vocab_hints(self.spec, override=vocab_hints)
         hints = ", ".join(hint_terms)
         if len(hints) > 380:
             hints = hints[:380].rsplit(",", 1)[0].strip()
         ascii_hints = bool(hints) and all(ord(ch) < 128 for ch in hints)
-        hotwords = hints if (hints and not (ascii_hints and whisper_lang not in (None, "en"))) else None
+        # Stop passing hints as hotwords or initial_prompt for utterances under 2 s
+        hotwords = None
         initial_prompt = None
-        # Only inject full initial_prompt context on longer utterances (>= 2.0s) to protect short voice commands
-        if raw_dur >= 2.0 and hints and (whisper_lang == "en" or not is_multi or (whisper_lang is not None and not ascii_hints)):
-            initial_prompt = hints
+        if raw_dur >= 2.0 and hints and not (ascii_hints and whisper_lang not in (None, "en")):
+            hotwords = hints
+            if whisper_lang in (None, "en") or not is_multi or not ascii_hints:
+                initial_prompt = hints
 
-        use_segment_multi = bool(multilingual) if multilingual is not None else (is_multi and whisper_lang is None)
+        use_segment_multi = False if fw_model.endswith(".en") else (bool(multilingual) if multilingual is not None else (is_multi and whisper_lang is None))
         vad_params = {
             "threshold": self.spec.vad_threshold,
             "min_speech_duration_ms": self.spec.min_speech_duration_ms,
@@ -1174,7 +1257,8 @@ class Whisper:
                     provider_errors.append({"provider": "faster_whisper", "error": err_msg})
 
             # Candidate B: optional specialist Malayalam fallback only if not yet tried and Malayalam requested/detected
-            if retry_count < max_retries and (
+            # Never run specialist Malayalam fallback if English-only model is active
+            if not fw_model.endswith(".en") and retry_count < max_retries and (
                 req_lang in ("ml", "mixed") or primary_res.get("detected_language") == "ml"
             ):
                 for sp in (self.malayalam_provider, self.indic_conformer):
@@ -1264,10 +1348,19 @@ class Whisper:
             reason for _r, ev, _rsn in candidates for reason in ev.get("retry_reasons", [])
         ))
 
+        raw_output_text = best_res.get("text", "")
+        det_lang = best_res.get("detected_language") or (whisper_lang or "en")
+        cleaned_text = raw_output_text
+        if det_lang == "en" or fw_model.endswith(".en") or req_lang == "en":
+            cleaned_text = clean_english_transcript(raw_output_text, vocab_hints=hint_terms, audio_diag=diag)
+
         return {
             **best_res,
-            "original_transcript": best_res["text"],
+            "text": cleaned_text,
+            "original_transcript": raw_output_text,
             "initial_pass_transcript": initial_text,
+            "language": det_lang,
+            "detected_language": det_lang,
             "task": task,
             "audio_id": audio_id,
             "seconds": round(time.perf_counter() - t_total, 2),

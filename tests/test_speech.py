@@ -1,6 +1,5 @@
 """TTS cleaning/chunking, STT parsing, Speaker control, wake word, VoiceLoop resource handling (mocked mic) + real-model loops."""
 import io
-import threading
 import time
 import types
 import wave
@@ -170,7 +169,7 @@ def test_voice_loop_piper_to_whisper_roundtrip():
     sentence = "Good afternoon sir the local voice is live"
     r = stt.transcribe(wav_to_float(tts.wav_bytes(sentence + ".")))
     got = set(r["text"].lower().replace(",", "").replace(".", "").split())
-    assert len(got & set(sentence.lower().split())) >= 8, r  # allow one small difference
+    assert len(got & set(sentence.lower().split())) >= 7, r  # allow one small difference
 
 
 @needs_piper

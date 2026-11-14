@@ -4,7 +4,9 @@ import { BrainExplorer } from "../components/BrainExplorer";
 import type { ForceConfig, GalaxyHandle } from "../components/GalaxyCanvas";
 import { HologramCore, type CoreMode } from "../components/HologramCore";
 import { Inspector } from "../components/Inspector";
+import { SettingsErrorBoundary } from "../components/AudioVideoPanel";
 import { Markdown } from "../components/Markdown";
+import { ModelPicker, type ModelPickerInit } from "../components/ModelPicker";
 import { OperationsDrawer, type OpsTab } from "../components/OperationsDrawer";
 import { SpeechInspectorPanel, type VoiceTranscriptItem } from "../components/SpeechInspectorPanel";
 import { graph, useGraphVersion } from "../graphStore";
@@ -114,6 +116,7 @@ export interface ChatFeedItem {
   approvalRequest?: OwnerApprovalRequest;
   clarification?: ClarificationPromptData;
   task?: AssistantTaskItem | null;
+  modelPicker?: ModelPickerInit;
   stats?: string;
   resolvedForRequestId?: string;
   resolvedForToken?: string;
@@ -202,6 +205,7 @@ export const AssistantHome: React.FC<AssistantHomeProps> = ({
   onClearRequestedDrawer,
 }) => {
   const [coreMode, setCoreMode] = useState<CoreMode>("ring");
+  const [modelPanel, setModelPanel] = useState(false);
   const [tasks, setTasks] = useState<AssistantTaskItem[]>([]);
   const [tasksOpen, setTasksOpen] = useState(false);
   const [taskFilter, setTaskFilter] = useState<string>("all");
@@ -632,9 +636,9 @@ export const AssistantHome: React.FC<AssistantHomeProps> = ({
             <span className={`pill ${onlineActive ? "warn" : "ok"}`}>
               {onlineActive ? "Online Assisted" : "Local Mode"}
             </span>
-            <span className="chip static" title="Active language model and provider">
+            <button className={`chip ${modelPanel ? "active" : ""}`} title="Active language model and provider - click to change" aria-expanded={modelPanel} onClick={() => setModelPanel((o) => !o)} data-testid="model-indicator">
               <b>Model</b> {currentProvider}:{currentModel}
-            </span>
+            </button>
             <span className={`status ${voiceLoopState.error ? "danger" : voiceLoopState.mic ? "ok" : ""}`}>
               <i className="dot" /> {voiceLoopState.error ? "Mic Error" : voiceLoopState.mic ? "Mic Listening" : "Mic Idle"}
             </span>
@@ -663,6 +667,12 @@ export const AssistantHome: React.FC<AssistantHomeProps> = ({
             )}
           </div>
         </div>
+
+        {modelPanel && (
+          <div className="model-popover">
+            <ModelPicker compact />
+          </div>
+        )}
 
         {showGraphStage ? (
           <div className="assistant-graph-host">
@@ -809,6 +819,7 @@ export const AssistantHome: React.FC<AssistantHomeProps> = ({
         </div>
 
         {opsTab && (
+          <SettingsErrorBoundary title={`${opsTab} panel`}>
           <OperationsDrawer
             tab={opsTab}
             onChangeTab={setOpsTab}
@@ -829,6 +840,7 @@ export const AssistantHome: React.FC<AssistantHomeProps> = ({
               loadTasksAndPolicy();
             }}
           />
+          </SettingsErrorBoundary>
         )}
 
         {suggestions.length > 0 && (
@@ -1065,6 +1077,8 @@ export const AssistantHome: React.FC<AssistantHomeProps> = ({
                       ) : (
                         <span className="typing" aria-label="Generating"><i /><i /><i /></span>
                       )}
+
+                      {m.modelPicker && <ModelPicker init={m.modelPicker} compact />}
 
                       {/* Inline Project / Folder Clarification Card */}
                       {clar && (

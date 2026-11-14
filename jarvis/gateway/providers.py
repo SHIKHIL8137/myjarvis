@@ -21,7 +21,10 @@ class CloudGatewayError(RuntimeError):
     """Raised when cloud adapter fails or violates offline/budget/paid/firewall policy rules."""
 
     def __init__(self, message: str, *, category: str = "policy", retryable: bool = False):
-        super().__init__(message)
+        from ..security.pii_firewall import redact_secrets
+
+        # upstream error bodies sometimes echo (part of) the API key: nothing that reaches logs, the API or the UI may contain it
+        super().__init__(redact_secrets(str(message), mask_email=False)[0])
         self.category = category
         self.retryable = retryable
 

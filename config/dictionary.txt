@@ -1,0 +1,4 @@
+# JARVIS dictation dictionary (optional).
+# One entry per line:  word        -> fixes its capitalisation  (e.g.  Kubernetes)
+#                      heard => written   -> replaces what Whisper heard  (e.g.  erp v2 => ERP_V2)
+# Matching is case-insensitive and whole-word. Lines starting with # are ignored.

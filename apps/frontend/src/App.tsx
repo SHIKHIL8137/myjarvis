@@ -9,6 +9,8 @@ import { startGraph } from "./graphStore";
 import { connState, onConnState, onEvent, type ConnState } from "./live";
 import type { Inspectable, View } from "./shell";
 
+// captured before the shell rewrites an empty hash to #/assistant
+const INITIAL_HASH = typeof location === "undefined" ? "" : location.hash;
 type PrimaryDest = "assistant" | "settings";
 
 interface UiPreferences {
@@ -147,6 +149,12 @@ export const App: React.FC = () => {
       setStateDetail("");
     }
   }, []);
+
+  // First run: send the owner to Settings, where the setup wizard is shown, unless a destination was already chosen.
+  useEffect(() => {
+    if (INITIAL_HASH && INITIAL_HASH !== "#/" && INITIAL_HASH !== "#") return; // the user opened a specific page
+    apiFetch<{ completed: boolean }>("/v2/setup/state").then((s) => { if (!s.completed) navigate("settings"); }).catch(() => undefined);
+  }, [navigate]);
 
   const refreshStatus = useCallback(async () => {
     const [st, ov, sCfg] = await Promise.allSettled([
@@ -287,6 +295,12 @@ export const App: React.FC = () => {
       removeEventListener("unhandledrejection", onReject);
     };
   }, [notify, refreshStatus, applyUiDirective]);
+
+  // The live stream is the fastest signal that the backend went away (or came back): re-probe immediately instead of waiting for the 30 s poll.
+  useEffect(() => {
+    const t = window.setTimeout(() => { void refreshStatus(); }, live === "online" ? 200 : 2500);
+    return () => clearTimeout(t);
+  }, [live, refreshStatus]);
 
   const closeConfirm = (ok: boolean) => {
     dialog.current?.close();

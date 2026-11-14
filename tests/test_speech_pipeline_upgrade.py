@@ -803,6 +803,7 @@ async def test_final_reliability_provider_availability_honest_confidence_and_pre
 
     # 6. End-to-end /api/voice/hear exposes provider_status (unavailable, no errors), selection_reason, and review_needed cleanly
     s_api = load_settings()
+    s_api.stt.model = "base"
     s_api.stt.malayalam_model = ""
     s_api.stt.audio_store_dir = str(tmp_path / "aud_api2")
     asst = Assistant(s_api, data_dir=tmp_path / "api_data", brain=Brain(s_api))

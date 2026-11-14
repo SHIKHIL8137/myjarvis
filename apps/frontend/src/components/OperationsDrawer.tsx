@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useState } from "react";
 import { apiFetch } from "../api/client";
 import { MemoryPanel } from "../features/MemoryPanel";
 import { fmtTime, type ShellProps } from "../shell";
+import { partialReportText } from "./partialReport";
 
 export type OpsTab =
   | "tasks"
@@ -76,7 +77,7 @@ interface TaskItem {
   step_count?: number;
   budget_step_limit?: number;
   pause_reason?: string;
-  partial_report?: string;
+  partial_report?: string | { summary?: string } | null;  // the API sends an object ({} when empty), older builds a string
   created_at?: number;
   meta?: Record<string, any>;
 }
@@ -238,7 +239,7 @@ export const OperationsDrawer: React.FC<OperationsDrawerProps> = ({
   const [newAliasDesc, setNewAliasDesc] = useState("");
 
   // Memory & Desktop
-  const [memCats, setMemCats] = useState<{ counts?: Record<string, number>; enabled?: Record<string, boolean> } | null>(null);
+  const [memCats, setMemCats] = useState<{ counts?: Record<string, number>; enabled?: boolean | Record<string, boolean>; toggles?: Record<string, boolean> } | null>(null);
   const [actionsReg, setActionsReg] = useState<{ actions: ActionSpecItem[]; pending: PendingActionItem[]; history: Array<Record<string, any>> }>({
     actions: [],
     pending: [],
@@ -322,7 +323,7 @@ export const OperationsDrawer: React.FC<OperationsDrawerProps> = ({
         const res = await apiFetch<{ aliases: AliasItem[] }>("/v2/filesystem/aliases");
         setAliases(res.aliases || []);
       } else if (tab === "memory") {
-        const cats = await apiFetch<{ counts: Record<string, number>; enabled: Record<string, boolean> }>("/v2/memory/categories");
+        const cats = await apiFetch<{ counts: Record<string, number>; enabled?: boolean | Record<string, boolean>; toggles?: Record<string, boolean> }>("/v2/memory/categories");
         setMemCats(cats);
       } else if (tab === "desktop") {
         const reg = await apiFetch<typeof actionsReg>("/v2/actions/registry?limit=12");
@@ -513,9 +514,9 @@ export const OperationsDrawer: React.FC<OperationsDrawerProps> = ({
                       </div>
                     )}
 
-                    {t.partial_report && (
+                    {partialReportText(t.partial_report) && (
                       <div className="dim" style={{ fontSize: 11.5, marginTop: 4, background: "rgba(255,255,255,0.03)", padding: 6, borderRadius: 4 }}>
-                        <strong>Partial Report:</strong> {t.partial_report.slice(0, 240)}
+                        <strong>Partial Report:</strong> {partialReportText(t.partial_report).slice(0, 240)}
                       </div>
                     )}
 
@@ -1257,8 +1258,9 @@ export const OperationsDrawer: React.FC<OperationsDrawerProps> = ({
               </div>
               <div className="row wrap" style={{ gap: 6 }}>
                 {Object.entries(memCats.counts || {}).map(([cat, cnt]) => {
-                  const enabled = memCats.enabled?.[cat] ?? true;
-                  const toggleable = cat in (memCats.enabled || {});
+                  const toggles = memCats.toggles ?? (typeof memCats.enabled === "object" && memCats.enabled ? memCats.enabled : {});  // API: `enabled` is the master switch (boolean), `toggles` the per-category map
+                  const enabled = toggles[cat] ?? true;
+                  const toggleable = cat in toggles;
                   return (
                     <button
                       key={cat}

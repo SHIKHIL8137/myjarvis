@@ -522,14 +522,16 @@ class VoiceLoop:
 
         is_real_sd = getattr(getattr(sd, "InputStream", None), "__module__", "") == "sounddevice"
         candidates: list[tuple[int, int]] = []
-        if is_real_sd and prefer_native and nat_sr and nat_sr != req_sr:
-            candidates.append((nat_sr, 1))
+        if is_real_sd and prefer_native and nat_sr:
             if nat_ch == 2:
                 candidates.append((nat_sr, 2))
-        candidates.append((req_sr, 1))
-        if nat_sr and nat_sr != req_sr and (nat_sr, 1) not in candidates:
             candidates.append((nat_sr, 1))
-        candidates.append((req_sr, 2))
+        if nat_ch == 2 and (req_sr, 2) not in candidates:
+            candidates.append((req_sr, 2))
+        if (req_sr, 1) not in candidates:
+            candidates.append((req_sr, 1))
+        if nat_sr and (nat_sr, 1) not in candidates:
+            candidates.append((nat_sr, 1))
 
         first_err: Exception | None = None
         for sr_try, ch_try in candidates:
@@ -785,6 +787,10 @@ class VoiceLoop:
                         with self._state_lock:
                             if self.audio_state == VoiceState.INTERRUPTED and self._barge_seed:
                                 rec_buf = list(self._barge_seed)
+                                raw_rec_buf = [
+                                    (f.reshape(-1, 1) if f.ndim == 1 else f.copy())
+                                    for f in self._barge_seed
+                                ]
                                 self._barge_seed.clear()
                                 rec_samples = sum(len(x) for x in rec_buf)
                                 silence_run_ms = 0.0
@@ -866,6 +872,7 @@ class VoiceLoop:
                                 speech_run_ms = silence_run_ms = listen_idle_ms = 0.0
                                 if ptt_hit:
                                     rec_buf = list(pre_roll)
+                                    raw_rec_buf = list(raw_pre_roll)
                                     rec_samples = sum(len(x) for x in rec_buf)
                                     has_voiced_in_rec = False
                                     self._transition(VoiceState.SPEECH_DETECTED, reason="ptt")
@@ -879,9 +886,12 @@ class VoiceLoop:
                             if self._ptt_trigger.is_set():
                                 self._ptt_trigger.clear()
                                 rec_buf = list(pre_roll)
+                                raw_rec_buf = list(raw_pre_roll)
                                 rec_samples = sum(len(x) for x in rec_buf)
                                 onset_buf.clear()
+                                raw_onset_buf.clear()
                                 pre_roll.clear()
+                                raw_pre_roll.clear()
                                 speech_run_ms = silence_run_ms = listen_idle_ms = 0.0
                                 has_voiced_in_rec = False
                                 self._transition(VoiceState.SPEECH_DETECTED, reason="ptt")
@@ -980,11 +990,16 @@ class VoiceLoop:
                                         self._transition(self._entry_state(), reason="ptt_timeout")
                             elif silence_run_ms >= a.silence_ms or utt_dur_s >= a.max_utterance_s:
                                 payload = np.concatenate(rec_buf)
-                                raw_payload = (
-                                    np.concatenate(raw_rec_buf, axis=0)
-                                    if len(raw_rec_buf) == len(rec_buf) and raw_rec_buf
-                                    else None
-                                )
+                                raw_payload = None
+                                if len(raw_rec_buf) == len(rec_buf) and raw_rec_buf:
+                                    try:
+                                        norm_raw = [
+                                            (f if f.ndim == 2 else f.reshape(-1, 1))
+                                            for f in raw_rec_buf
+                                        ]
+                                        raw_payload = np.concatenate(norm_raw, axis=0)
+                                    except Exception:
+                                        raw_payload = None
                                 rec_buf.clear()
                                 raw_rec_buf.clear()
                                 rec_samples = 0

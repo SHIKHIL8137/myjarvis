@@ -18,12 +18,11 @@ import sys
 import time
 
 import jiwer
-import numpy as np
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-from jarvis.config import STTSpec, load_settings  # noqa: E402
+from jarvis.config import STTSpec  # noqa: E402
 from jarvis.stt import SR, Whisper, list_local_models, wav_to_float  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -115,21 +114,20 @@ def run_benchmark(model_filter: list[str] | None = None) -> dict:
     available = list_local_models()
     print("=" * 80)
     print("JARVIS PRODUCTION SPEECH-TO-TEXT BENCHMARK")
-    print(f"Host Hardware: AMD Ryzen 5 5600H (6 threads) | 16 GB RAM | Windows 11")
+    print("Host Hardware: AMD Ryzen 5 5600H (6 threads) | 16 GB RAM | Windows 11")
     print(f"Available Local Models: {available}")
     print(f"Loaded {len(samples)} benchmark audio samples across 10 categories")
     print("=" * 80)
 
     # Filter targets
-    targets = model_filter or [m for m in ("small.en", "small", "base", "medium.en") if m in available]
+    targets = model_filter or [m for m in ("small.en", "medium.en", "distil-large-v3") if m in available]
 
     test_configs = []
     for m in targets:
         if m not in available:
             continue
-        if m in ("small.en", "medium.en"):
+        if m in ("small.en", "medium.en", "distil-large-v3"):
             test_configs.append({"model": m, "quality": "accurate", "cpu_threads": 6, "language": "en"})
-            test_configs.append({"model": m, "quality": "balanced", "cpu_threads": 6, "language": "en"})
         elif m == "small":
             test_configs.append({"model": m, "quality": "balanced", "cpu_threads": 6, "language": "en"})
         elif m == "base":
@@ -272,6 +270,7 @@ def run_benchmark(model_filter: list[str] | None = None) -> dict:
     print(f"\nSaved structured benchmark results to {out_json}")
 
     # Generate Markdown Report
+    generate_markdown_report(report_dict, ROOT / "STT_BENCHMARK_REPORT.md")
     generate_markdown_report(report_dict, ROOT / "STT_MODEL_BENCHMARK_REPORT.md")
     return report_dict
 
@@ -290,7 +289,7 @@ def generate_markdown_report(report_data: dict, out_md_path: Path):
         f"- **Date**: {report_data.get('timestamp')}",
         f"- **Hardware Environment**: {report_data.get('machine')}",
         f"- **Inference Backend**: {report_data.get('engine')}",
-        f"- **Standardized Metrics**: `jiwer` normalized WER (Word Error Rate) & CER (Character Error Rate)",
+        "- **Standardized Metrics**: `jiwer` normalized WER (Word Error Rate) & CER (Character Error Rate)",
         f"- **Evaluated Candidates**: {', '.join(report_data.get('models_evaluated', []))}",
         "",
         "## 1. Executive Model Comparison Table",
@@ -318,7 +317,7 @@ def generate_markdown_report(report_data: dict, out_md_path: Path):
 
     # Show category breakdown for the best model and small.en
     for r in results:
-        if r["model"] in ("small.en", "medium.en") and r["quality"] == "accurate":
+        if r["model"] in ("small.en", "medium.en", "distil-large-v3") and r["quality"] == "accurate":
             lines.append(f"### Model: `{r['model']}` ({r['quality']})")
             lines.append("")
             lines.append("| Category | Samples | Mean WER | Mean CER | Latency (s) |")

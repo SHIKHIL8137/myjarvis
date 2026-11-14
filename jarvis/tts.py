@@ -6,6 +6,7 @@ import logging
 import queue
 import re
 import threading
+from collections import deque
 import time
 import wave
 
@@ -387,6 +388,7 @@ class Speaker:
         self.speaking = False
         self.errors: list[str] = []
         self.last_error: str | None = None
+        self.recent_text: deque[str] = deque(maxlen=12)  # what JARVIS just said: lets the intent judge recognise its own echo
 
     def start(self):
         with self._cv:
@@ -422,6 +424,7 @@ class Speaker:
         if not txt:
             return 0
         self.start()
+        self.recent_text.append(txt)
         with self._cv:
             if self._pending == 0 and self.chunks_played >= self.chunks_queued:
                 self.chunks_queued = 0
@@ -451,6 +454,7 @@ class Speaker:
         chunks = split_chunks(clean_for_speech(text), self.tts.spec.chunk_chars)
         if not chunks:
             return 0
+        self.recent_text.extend(chunks)
         with self._cv:
             if self._pending == 0 and self.chunks_played >= self.chunks_queued:
                 self.chunks_queued = 0

@@ -32,6 +32,7 @@ export interface UiDirective {
   open_drawer?: string | null;
   focus?: string;
   open?: string;
+  model_picker?: { provider?: string; free?: boolean | null; task?: string; q?: string } | null;
 }
 
 interface VoiceDockProps extends ShellProps {
@@ -206,6 +207,7 @@ export const VoiceDock: React.FC<VoiceDockProps> = ({
         approvalRequest: (ev.approval as OwnerApprovalRequest) || m.approvalRequest,
         clarification: (ev.clarification as ChatFeedItem["clarification"]) || m.clarification,
         task: (ev.task as AssistantTaskItem) || m.task,
+        modelPicker: (ev.ui as UiDirective | undefined)?.model_picker || m.modelPicker,
         stats: statsStr,
       }));
     }

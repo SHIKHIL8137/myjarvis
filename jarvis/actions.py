@@ -7,6 +7,7 @@ import shlex
 import subprocess
 import threading
 import time
+from collections.abc import Callable
 from typing import Any
 from urllib.parse import urlsplit
 import uuid
@@ -356,6 +357,7 @@ class ActionExecutor:
         self._pending: dict[str, PendingApproval] = {}
         self._history: list[dict] = []
         self._lock = threading.RLock()
+        self.screen_guard: Callable[[], str | None] | None = None  # set by Assistant: reason a screenshot must be refused (blocked windows)
 
     def list_action_registry(self) -> list[dict[str, Any]]:
         """Return full metadata registry of available actions, schemas, risk tiers, timeouts & confirmation status."""
@@ -411,8 +413,10 @@ class ActionExecutor:
                 raise ActionPermissionError("Exposing browser cookies, tokens, or credentials to LLM is forbidden")
         if action in ("keyboard_type", "mouse_click") and not bool(getattr(self.spec, "allow_input_automation", False)):
             raise ActionPermissionError("Desktop keyboard/mouse automation is disabled (allow_input_automation=false)")
-        if action == "take_screenshot" and not bool(getattr(self.spec, "allow_screenshots", True)):
+        if action == "take_screenshot" and not bool(getattr(self.spec, "allow_screenshots", False)):
             raise ActionPermissionError("Screenshots are disabled in Actions settings")
+        if action == "take_screenshot" and self.screen_guard is not None and (why := self.screen_guard()):
+            raise ActionPermissionError(f"Screenshot blocked: {why}")
         if action == "media_control" and not bool(getattr(self.spec, "allow_media_controls", True)):
             raise ActionPermissionError("Media controls are disabled in Actions settings")
         if action == "focus_window" and not bool(getattr(self.spec, "allow_window_controls", True)):

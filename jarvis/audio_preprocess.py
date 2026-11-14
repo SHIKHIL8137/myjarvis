@@ -327,7 +327,7 @@ def preprocess_audio(
             a = np.clip(a, -0.95, 0.95).astype(np.float32)
             diag.gain_applied_db = round(20.0 * math.log10(target_gain), 2)
 
-    if pad_short_ms > 0 and 0 < len(a) < int(1.2 * dst_sr):
+    if pad_short_ms > 0 and 0 < len(a) < int(2.0 * dst_sr):
         pad = np.zeros(int(dst_sr * (pad_short_ms / 1000.0)), dtype=np.float32)
         a = np.concatenate([pad, a, pad]).astype(np.float32)
 

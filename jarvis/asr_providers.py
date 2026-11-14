@@ -107,8 +107,11 @@ class FasterWhisperProvider(ASRProvider):
     def discover_local_models(self) -> list[str]:
         found: list[str] = []
         if self.download_root.exists():
-            for p in sorted(self.download_root.glob("models--*--faster-whisper-*")):
-                name = p.name.split("faster-whisper-", 1)[-1]
+            for p in sorted(self.download_root.glob("models--*--faster*whisper-*")):
+                if "faster-distil-whisper-" in p.name:
+                    name = "distil-" + p.name.split("faster-distil-whisper-", 1)[-1]
+                else:
+                    name = p.name.split("faster-whisper-", 1)[-1]
                 if any((p / "snapshots").glob("*/*")):
                     found.append(name)
             # Also support direct CTranslate2 directories placed under models/whisper/ or models/asr/
@@ -150,11 +153,40 @@ class FasterWhisperProvider(ASRProvider):
                     local_files_only=True,
                 )
             except Exception as e:
-                avail = self.discover_local_models()
-                raise RuntimeError(
-                    f"Whisper model {model_name!r} is not available locally. "
-                    f"Installed: {avail or ['none']}. ({e})"
-                ) from e
+                # Automatic fallback from medium.en to small.en if medium.en is missing
+                if model_name == "medium.en":
+                    log.warning(
+                        "Whisper model 'medium.en' is not available locally. Falling back to 'small.en'. "
+                        "To download medium.en offline: python -c \"from faster_whisper import WhisperModel; "
+                        "WhisperModel('medium.en', download_root='models/whisper')\""
+                    )
+                    try:
+                        fb_target = self._resolve_model_target("small.en")
+                        m = WhisperModel(
+                            fb_target,
+                            device="cpu",
+                            compute_type=compute_type,
+                            cpu_threads=int(cpu_threads),
+                            download_root=str(self.download_root),
+                            local_files_only=True,
+                        )
+                        model_name = "small.en"
+                        key = (model_name, compute_type, int(cpu_threads))
+                    except Exception as fb_err:
+                        avail = self.discover_local_models()
+                        raise RuntimeError(
+                            f"Whisper model 'medium.en' not found, and fallback 'small.en' also failed ({fb_err}). "
+                            f"Installed models: {avail or ['none']}.\n"
+                            f"To download offline: python -c \"from faster_whisper import WhisperModel; WhisperModel('medium.en', download_root='models/whisper')\""
+                        ) from fb_err
+                else:
+                    avail = self.discover_local_models()
+                    download_cmd = f"python -c \"from faster_whisper import WhisperModel; WhisperModel('{model_name}', download_root='models/whisper')\""
+                    raise RuntimeError(
+                        f"Whisper model {model_name!r} is not available locally. "
+                        f"Installed: {avail or ['none']}. ({e}).\n"
+                        f"To download offline: {download_cmd}"
+                    ) from e
             # Warm up once cleanly for consistent interactive latency
             m.transcribe(np.zeros(SR, dtype=np.float32))
             self._cache[key] = m
@@ -187,10 +219,12 @@ class FasterWhisperProvider(ASRProvider):
         model_name = opt.model_name or "base"
         m = self.load(model_name, compute_type=opt.compute_type, cpu_threads=opt.cpu_threads)
         is_multi = bool(getattr(getattr(m, "model", None), "is_multilingual", not model_name.endswith(".en")))
+        if model_name.endswith(".en"):
+            is_multi = False
         req_lang = (opt.language or "auto").strip().lower()
 
         whisper_lang: str | None = None
-        if not is_multi:
+        if not is_multi or model_name.endswith(".en"):
             if req_lang not in ("auto", "en", ""):
                 raise ValueError(
                     f"Whisper model {model_name!r} only supports English; switch STT model to 'small' or 'base' for {req_lang}."
@@ -217,7 +251,7 @@ class FasterWhisperProvider(ASRProvider):
             "compression_ratio_threshold": float(opt.extra.get("compression_ratio_threshold", 2.4)),
             "log_prob_threshold": float(opt.extra.get("log_prob_threshold", -1.0)),
         }
-        use_segment_multi = bool(opt.multilingual) if opt.multilingual is not None else (is_multi and whisper_lang is None)
+        use_segment_multi = False if model_name.endswith(".en") else (bool(opt.multilingual) if opt.multilingual is not None else (is_multi and whisper_lang is None))
         if use_segment_multi:
             kwargs["multilingual"] = True
 

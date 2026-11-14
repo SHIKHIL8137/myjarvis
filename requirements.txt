@@ -30,7 +30,9 @@ python-pptx==1.0.2
 openpyxl==3.1.5
 cryptography==50.0.2
 APScheduler==3.11.3
+mcp==2.3.0  # official MCP SDK (verified on Python 3.14.6)
 pytest==9.2.0
 ruff==0.17.4
 mypy==2.4.1
 pip-audit==2.10.1
+pyinstaller==6.22.3  # build-only: scripts/build-windows.ps1

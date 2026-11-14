@@ -21,6 +21,7 @@ def _setup_actions(assistant, *, allow_input: bool = False):
     assistant.actions.spec.confirm_levels = ["modify", "destructive", "system"]
     assistant.actions.spec.allowed_url_domains = ["docs.python.org", "github.com"]
     assistant.actions.spec.allow_screenshots = True
+    assistant.actions.screen_guard = None  # keep this test independent of whatever windows are open on the dev machine
     assistant.actions.spec.allow_media_controls = True
     assistant.actions.spec.allow_window_controls = True
     assistant.actions.spec.allow_input_automation = allow_input

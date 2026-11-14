@@ -15,6 +15,7 @@ ACTION_RISK_TIERS: dict[str, str] = {
     "graphify_affected": "READ",
     "reminders_list": "READ",
     "email_summarize": "READ",
+    "mcp_read": "READ",
     # WRITE (Policy / scoped auto or confirm)
     "create_note": "WRITE",
     "create_document": "WRITE",
@@ -106,6 +107,13 @@ class ApprovalService:
             if expired_any:
                 s.commit()
             return out
+
+    def list_active(self) -> list[dict]:
+        """Unexpired requests that are still pending or approved-but-not-yet-consumed."""
+        now = time.time()
+        with self.db.sync_session() as s:
+            rows = s.query(ApprovalRequestRow).filter(ApprovalRequestRow.status.in_(("pending", "approved"))).all()
+            return [self._to_dict(r) for r in rows if r.expires_at >= now]
 
     def decide(self, token: str, *, approved: bool, decided_by: str = "owner") -> dict:
         with self.db.sync_session() as s:

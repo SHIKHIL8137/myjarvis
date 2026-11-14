@@ -18,10 +18,28 @@ WEB_EXPLICIT = re.compile(
     re.I,
 )
 REMEMBER = re.compile(
-    r"^\W*(?:hey\s+)?(?:jarvis\W+)?(?:please\s+)?(?:remember(?:\s+that|\s+this)?|save\s+(?:this\s+)?to\s+memory|note\s+that)\b[:\s-]*(.*)$",
+    r"^\W*(?:hey\s+)?(?:jarvis\W+)?(?:please\s+|pls\s+|kindly\s+)?(?:(?:remember|rem(?:em|e)b[ae]r)(?:\s+that|\s+this)?|"
+    r"(?:do\s*n[o']?t|don'?t|do\s+not)\s+forget(?:\s+that)?|keep\s+in\s+mind(?:\s+that)?|"
+    r"(?:make|take|save|add)\s+(?:a\s+)?(?:quick\s+)?note(?:\s+that)?|(?:save|add)\s+(?:this\s+)?to\s+(?:my\s+)?memory|"
+    r"note\s+(?:down\s+)?that|write\s+down\s+that|take\s+note\s+that|"
+    r"(?:i\s+(?:want|need|would\s+like)\s+you\s+to|i'?d\s+like\s+you\s+to)\s+(?:please\s+)?remember(?:\s+that)?|(?:can|could|would)\s+you\s+(?:please\s+)?remember\s+that|"
+    r"just\s+so\s+(?:you|u)\s+know(?:\s+that)?|for\s+your\s+information)\b[:\s,-]*(.*)$",
     re.I | re.S,
 )
-STOP = re.compile(r"^\W*(?:jarvis\W+)?(?:stop(?:\s+talking|\s+speaking)?|quiet|silence|shut\s+up|cancel)\W*$", re.I)
+STOP = re.compile(
+    r"^\W*(?:(?:ok(?:ay)?|alright|now|just|please|hey)\W+)*(?:jarvis\W+)?(?:please\W+)?"
+    r"(?:stop(?:\s+talking|\s+speaking)?|quiet|silence|shut\s+up|cancel|enough|be\s+quiet|that'?s\s+enough)(?:\W+(?:please|now|already|it|that|this|jarvis))*\W*$",
+    re.I,
+)
+
+
+def is_stop_typo(text: str) -> bool:
+    """A single mistyped stop word ('stoop', 'cancle', 'quite'): close to a stop command, and nothing else was said."""
+    import difflib
+
+    words = re.findall(r"[a-z]+", (text or "").lower())
+    return len(words) == 1 and len(words[0]) >= 4 and bool(difflib.get_close_matches(words[0], ["stop", "cancel", "quiet", "silence"], n=1, cutoff=0.8))
+
 PAUSE_VOICE = re.compile(r"^\W*(?:hey\s+)?(?:jarvis\W+)?(?:pause|mute)\s+(?:listening|voice|microphone|mic)\W*$", re.I)
 RESUME_VOICE = re.compile(r"^\W*(?:hey\s+)?(?:jarvis\W+)?(?:resume|unmute|start)\s+(?:listening|voice|microphone|mic)\W*$", re.I)
 
@@ -56,9 +74,14 @@ FORGET_MEMORY = re.compile(
     re.I,
 )
 RECALL_MEMORY = re.compile(
-    r"^\W*(?:hey\s+)?(?:jarvis\W+)?(?:what\s+do\s+you\s+remember\s+about|search\s+(?:my\s+)?memory\s+(?:for|about)|recall)\s+(.+)$",
+    r"^\W*(?:hey\s+)?(?:jarvis\W+)?(?:what\s+do\s+you\s+remember\s+about|tell\s+me\s+what\s+you\s+remember\s+about|"
+    r"do\s+you\s+remember(?:\s+(?:what|anything|that))?(?:\s+i\s+(?:said|told\s+you))?\s+about|what\s+did\s+i\s+(?:tell\s+you|say)\s+about|"
+    r"search\s+(?:my\s+)?memory\s+(?:for|about)|recall)\s+(.+)$",
     re.I,
 )
+RECALL_PREFERENCE = re.compile(r"^\W*(?:hey\s+)?(?:jarvis\W+)?what\s+(\w+)\s+do\s+i\s+(?:like|prefer|use|love|hate)\W*$", re.I)
+# "forget everything we said before ..." asks to drop CONTEXT, it must never delete a stored memory
+_CONTEXT_FORGET = re.compile(r"\b(?:we\s+(?:said|discussed|talked)|earlier|previous(?:ly)?|before|everything|conversation|context|chat)\b", re.I)
 SEARCH_HISTORY = re.compile(
     r"^\W*(?:hey\s+)?(?:jarvis\W+)?(?:search\s+(?:conversation\s+)?history\s+(?:for|about)|what\s+did\s+we\s+discuss(?:\s+about)?)\s*(.*)$",
     re.I,
@@ -202,7 +225,7 @@ async def route_intent(a, text: str) -> dict | None:
             )
         return None
 
-    if STOP.match(text):
+    if STOP.match(text) or is_stop_typo(text):
         a.speaker.stop()
         if hasattr(a, "actions"):
             a.actions.tasks.cancel_active()
@@ -417,6 +440,11 @@ async def route_intent(a, text: str) -> dict | None:
         except Exception as e:
             return _res("set_voice_rate", f"Invalid speech speed: {e}", ok=False)
 
+    from .model_chat import handle_chat as _model_chat
+
+    if (mres := await _model_chat(a, text)) is not None:
+        return _res("model_catalog", mres["reply"], ok=mres["ok"], ui=mres["ui"])
+
     if WHICH_MODEL.match(text):
         return _res(
             "which_model",
@@ -586,7 +614,7 @@ async def route_intent(a, text: str) -> dict | None:
             except Exception as e:
                 return _res("update_memory", f"Could not update memory {rec_id}: {e}", ok=False)
 
-    if m := FORGET_MEMORY.match(text):
+    if (m := FORGET_MEMORY.match(text)) and not _CONTEXT_FORGET.search(text):
         if hasattr(a, "memory_store"):
             q = m.group(1).strip(" .?!")
             # Try exact id first
@@ -603,7 +631,7 @@ async def route_intent(a, text: str) -> dict | None:
                 choices = ", ".join(f"{r.id}: {r.text[:35]}" for r, _ in hits[:3])
                 return _res("forget_memory", f"Multiple memories matched '{q}'. Say 'forget memory <id>' for: {choices}.", ok=False)
 
-    if m := RECALL_MEMORY.match(text):
+    if m := RECALL_MEMORY.match(text) or RECALL_PREFERENCE.match(text):
         if hasattr(a, "memory_store"):
             q = m.group(1).strip(" .?!")
             mem_hits = a.memory_store.search(q, limit=4)

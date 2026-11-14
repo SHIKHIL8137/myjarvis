@@ -952,3 +952,14 @@ dialog.confirm::backdrop { background: rgba(2, 4, 9, 0.72); }
     grid-template-columns: repeat(3, 1fr);
   }
 }
+
+/* ---- in-chat model selector ---- */
+.model-picker { display: grid; gap: 8px; margin-top: 8px; padding: 10px; border: 1px solid var(--line, rgba(120,200,255,.25)); border-radius: 10px; background: rgba(8,16,28,.55); max-width: 100%; }
+.model-picker .model-filters > * { min-width: 0; }
+.model-picker select, .model-picker input { max-width: 100%; }
+.model-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; max-height: 260px; overflow: auto; }
+.model-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 6px 8px; border-radius: 8px; background: rgba(255,255,255,.03); }
+.model-row-main { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0; overflow-wrap: anywhere; }
+.model-popover { margin: 8px 0; }
+button.chip { cursor: pointer; }
+@media (max-width: 640px) { .model-row { flex-direction: column; align-items: stretch; } .model-list { max-height: 200px; } }

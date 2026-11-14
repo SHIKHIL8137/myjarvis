@@ -588,4 +588,8 @@ class ModelGateway:
                     fallback_reason = f"{prov}:exception"
                     break
 
-        raise CloudGatewayError(f"All model candidates failed: {last_err}") from last_err
+        raise CloudGatewayError(
+            f"All model candidates failed: {last_err}",
+            category=getattr(last_err, "category", "upstream"),
+            retryable=bool(getattr(last_err, "retryable", False)),  # keep the real cause: 401 is permanent, 429/503 are worth retrying
+        ) from last_err

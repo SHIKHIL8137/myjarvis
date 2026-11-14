@@ -1,4 +1,6 @@
 """FastAPI dependency injection providers and shared validated settings mutation helpers."""
+import re
+
 from fastapi import Request
 
 from . import sysinfo
@@ -57,6 +59,9 @@ def build_consolidated_settings(a) -> dict:
         "actions": s.actions.model_dump(),
         "monitoring": s.monitoring.model_dump(),
         "proactive": s.proactive.model_dump(),
+        "mcp": _masked_mcp(s),
+        "dictation": s.dictation.model_dump(),
+        "screen": s.screen.model_dump(),
         "providers": s.providers.model_dump(),
         "provider_keys": provider_keys,
         "gateway": s.gateway.model_dump(),
@@ -72,6 +77,34 @@ def build_consolidated_settings(a) -> dict:
         "stt_languages": SUPPORTED_LANGUAGES,
         "api_keys_configured": provider_keys,
     }
+
+
+_SECRETISH = re.compile(r"key|token|secret|password|passwd|credential", re.I)
+_ENV_REF = re.compile(r"^\$\{[A-Za-z_][A-Za-z0-9_]*\}$")
+
+
+def _masked_mcp(s) -> dict:
+    """MCP config for the UI: env values are never returned (names only)."""
+    d = s.mcp.model_dump()
+    for srv in d["servers"].values():
+        srv["env"] = {k: ("${…}" if _ENV_REF.match(v or "") else "••••") for k, v in srv["env"].items()}
+    return d
+
+
+def _validate_mcp_patch(patch, current: dict) -> None:
+    """Credentials must be passed by reference (${ENV_VAR}); literal secrets are never written to settings.json.
+    The masked placeholder returned by the API is mapped back to the stored value."""
+    if not isinstance(patch, dict):
+        return
+    for name, srv in (patch.get("servers") or {}).items():
+        if not isinstance(srv, dict):
+            continue
+        env = srv.get("env") or {}
+        for k, v in list(env.items()):
+            if v in ("••••", "${…}") and name in current and k in current[name].env:
+                env[k] = current[name].env[k]
+            elif _SECRETISH.search(k) and not _ENV_REF.match(str(v)):
+                raise ValueError(f"MCP env {k!r} looks like a credential: reference an environment variable as ${{NAME}} instead of storing the value")
 
 
 def apply_settings_patch(a, patch: dict, *, allow_gateway_and_prefs: bool = True) -> dict:
@@ -93,6 +126,9 @@ def apply_settings_patch(a, patch: dict, *, allow_gateway_and_prefs: bool = True
         "proactive",
         "providers",
         "learning",
+        "mcp",
+        "dictation",
+        "screen",
     }
     if allow_gateway_and_prefs:
         allowed |= {"gateway", "preferences", "mode", "offline_enforced"}
@@ -105,6 +141,7 @@ def apply_settings_patch(a, patch: dict, *, allow_gateway_and_prefs: bool = True
             raise ValueError("API keys and secrets must be configured via the encrypted DPAPI key endpoint, never in settings")
 
     patch_copy = dict(patch)
+    _validate_mcp_patch(patch_copy.get("mcp"), a.settings.mcp.servers)
     if "num_ctx" in patch_copy:
         b, n = a.brain, patch_copy.pop("num_ctx")
         if not isinstance(n, int) or isinstance(n, bool) or not 1024 <= n <= 8192:

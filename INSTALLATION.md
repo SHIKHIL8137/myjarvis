@@ -1,80 +1,95 @@
-# Installation (Windows)
+# Installation (Windows 10/11)
 
-This machine is already set up. These steps rebuild it from scratch. Steps 2–5 need the internet once during setup; Local Mode needs no internet afterward.
+Two ways to run JARVIS: the **packaged app** (no Python needed) or a **developer install** from source.
+In both cases the AI models are installed **by you, separately** — JARVIS never downloads models, installs software or changes Windows settings on its own. Local Mode (offline) is the default; nothing leaves the PC unless you turn on Online Assisted mode.
 
-Requirements: Windows 10/11, Python 3.14, Ollama 0.40+, ~5 GB of free disk, a microphone and headphones.
+## A. Packaged app
+
+1. Get `JARVIS-Setup-<version>.exe` (built by `scripts\build-windows.ps1`, see section D) or the portable folder `dist\jarvis\`.
+2. Run the installer. It installs **per user** (no administrator rights) and adds a Start Menu shortcut.
+   Optional checkboxes: desktop shortcut, **start JARVIS automatically when I sign in** (off by default; stored as a normal per-user `Run` entry and removed on uninstall).
+3. Install the separate requirements below (Ollama + models), then start **JARVIS** from the Start Menu.
+4. A tray icon appears and the dashboard opens at <http://127.0.0.1:4700>. The **setup wizard** appears on first run (Settings page).
+
+**Where things live** — the program is in the install folder (read-only). Your data is in **`%LOCALAPPDATA%\JARVIS`** (override with the `JARVIS_HOME` environment variable):
+
+| Folder / file | Purpose |
+|---|---|
+| `config.json`, `config\` | defaults copied on first start (`config\dictionary.txt` = dictation words, `config\vocab_hints.txt` = speech hints) |
+| `data\` | database, memory, settings overrides, encrypted secrets, dictation history |
+| `models\whisper`, `models\piper`, `models\wake` | speech models you install (below) |
+| `notes\`, `logs\` | notes and logs (tray → *Open logs folder*) |
+
+Uninstalling removes the program only; `%LOCALAPPDATA%\JARVIS` is kept. Delete it yourself for a full wipe.
+
+## B. Requirements you install separately (the installer never does this)
+
+| Component | Needed for | How |
+|---|---|---|
+| **Ollama** (0.40+) | the local language model | <https://ollama.com/download> |
+| LLM model | answers | `ollama pull qwen3:4b-instruct` |
+| Whisper model | speech-to-text, dictation | `.venv\Scripts\python.exe -c "from faster_whisper import download_model; download_model('medium.en', cache_dir=r'models\whisper')"` (developer install). Packaged app: run the same call with any Python that has `faster-whisper`, using `cache_dir=` **`%LOCALAPPDATA%\JARVIS\models\whisper`** |
+| Piper voice | spoken replies | download `en_GB-alan-medium.onnx` and `.onnx.json` from <https://huggingface.co/rhasspy/piper-voices/tree/main/en/en_GB/alan/medium> into `%LOCALAPPDATA%\JARVIS\models\piper` |
+| Wake-word model | "Hey Jarvis" | `python -c "import openwakeword.utils as u; u.download_models(['hey_jarvis'], target_directory=r'%LOCALAPPDATA%\JARVIS\models\wake')"` |
+| Tesseract OCR (optional) | *read the screen* | <https://github.com/UB-Mannheim/tesseract/wiki> (install, restart JARVIS) |
+| `uvx` (optional) | Home Assistant MCP preset | part of [uv](https://docs.astral.sh/uv/) |
+
+The **Settings → Setup / System health** page shows which of these are missing and prints the exact command for each. Disk need: about 2.5 GB per Ollama model, ~1.5 GB for `medium.en`, 63 MB per Piper voice.
+
+## C. First-run configuration
+
+Open Settings; the wizard walks through: Ollama detection and installed models → choose the LLM → speech model → Piper voice → **microphone level meter** → **speaker test** → **wake-word test** → finish. Every choice is saved through the normal Settings API. Skipped steps can be done later from Settings.
+
+Other switches (all **off** by default): MCP servers, push-to-talk dictation (default hotkey `Ctrl+Alt+Space`), screen reading, Online Assisted mode.
+Windows may ask for microphone permission: *Settings → Privacy & security → Microphone → allow desktop apps*.
+
+## D. Building the installer yourself
 
 ```powershell
 cd D:\projects\myjarvis
+.\.venv\Scripts\python.exe -m pip install pyinstaller      # once; the build script will NOT install it for you
+.\scripts\build-windows.ps1                                # frontend -> PyInstaller -> smoke test -> optional Inno Setup
+```
 
-# 1. Virtual environment and pinned packages
+Output: `dist\jarvis\jarvis.exe` (portable, ~470 MB, no models) and, if [Inno Setup 6](https://jrsoftware.org/isinfo.php) is installed, `dist\JARVIS-Setup-<version>.exe`.
+Flags: `-SkipFrontend`, `-SkipSmoke`, `-RunTests`. The **smoke test** (`scripts\smoke_test.py --exe dist\jarvis\jarvis.exe`) launches the packaged app with a throw-away home and free port, checks `/api/health`, the frontend and that MCP is empty by default, then shuts it down through its own API and requires exit code 0.
+
+## E. Developer install (from source)
+
+Requirements: Python 3.14, Node 20+, Ollama.
+
+```powershell
+cd D:\projects\myjarvis
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install --only-binary=:all: -r requirements.lock
-
-# 2. Language models (Ollama must be running). The second one is optional.
+cd apps\frontend; npm ci; npm run build; cd ..\..
 ollama pull qwen3:4b-instruct
-ollama pull qwen3:4b
-
-# 3. Piper voice
 .\.venv\Scripts\python.exe -m piper.download_voices en_GB-alan-medium --data-dir models\piper
-
-# 4. Multilingual Whisper models (base is default; small improves compound & Indic accuracy)
-.\.venv\Scripts\python.exe -c "from faster_whisper import WhisperModel; WhisperModel('base', device='cpu', compute_type='int8', download_root='models/whisper'); WhisperModel('small', device='cpu', compute_type='int8', download_root='models/whisper')"
-
-# 5. Wake-word models
+.\.venv\Scripts\python.exe -c "from faster_whisper import download_model; download_model('medium.en', cache_dir=r'models\whisper')"
 .\.venv\Scripts\python.exe -c "from openwakeword import utils; utils.download_models(model_names=['hey_jarvis'], target_directory='models/wake')"
-
-# 6. Start and verify
-.\start-jarvis.ps1
+.\start-jarvis.ps1                                         # or: .\.venv\Scripts\python.exe server.py --tray
 .\.venv\Scripts\python.exe preflight.py
 ```
 
-If PowerShell refuses to run the scripts: `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`.
+If PowerShell refuses to run scripts: `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`.
+`python server.py` runs headless; `--tray` adds the tray icon (default in the packaged app), `--no-browser` skips opening the dashboard.
 
-## What needs the internet, and when
+## F. What needs the internet, and when
 
 | Component | Source | Size |
 |---|---|---|
-| `pip install` | PyPI | ~540 MB installed (includes `scipy` for polyphase resampling) |
-| `ollama pull` | ollama.com | ~2.5 GB per model (`qwen3:4b-instruct`, `qwen3:4b`) |
+| `pip install` | PyPI | ~540 MB installed |
+| `ollama pull` | ollama.com | ~2.5 GB per model |
 | Piper voice | Hugging Face | 63 MB |
-| Whisper `base` (multilingual) | Hugging Face | 141 MB |
-| Whisper `small` (multilingual) | Hugging Face | 464 MB |
-| Whisper `small.en` (legacy English-only, optional) | Hugging Face | 464 MB |
-| Wake-word models | GitHub | 8 MB |
-| 3D library | already in `viewer/vendor/` | 1.4 MB |
+| Whisper model | Hugging Face | 0.15–1.5 GB depending on size |
+| Wake-word models | GitHub releases | ~10 MB |
 
-The 3D library is already in the project folder, so there is no npm step. Its version and checksum are in `viewer/vendor/VERSIONS.txt`.
+After setup, Local Mode needs no internet. Cloud models (OpenRouter etc.), web search and network MCP servers require you to enable **Online Assisted** mode and, for cloud LLMs, `allow_cloud`; every outbound request is audited in `logs\external_audit.jsonl`.
 
-## Optional Online Assisted Mode API Keys
+## G. Troubleshooting
 
-DuckDuckGo search requires no API key. If you prefer Tavily, Brave Search, Serper, or a self-hosted HTTPS SearXNG instance, configure keys **outside committed files**:
-
-- **Option A (recommended)**: Set environment variables before starting Jarvis:
-  - `JARVIS_TAVILY_API_KEY`
-  - `JARVIS_BRAVE_API_KEY`
-  - `JARVIS_SERPER_API_KEY`
-  - `JARVIS_SEARXNG_API_KEY` (optional bearer token)
-- **Option B (System UI)**: Open **System → Internet & Web Search**, pick the provider, paste the key into **Provider API key**, and click **Set**. Keys are written to gitignored `data/secrets.json` and are never echoed back to the browser or saved in `config.json`.
-
-## Using your own notes
-
-Set `"notes_dir"` in `config.json` to a folder of markdown files (absolute path or relative to the project). Sub-folders become categories and `[[Note Title]]` links become graph links. Jarvis writes new memories into a `captures` sub-folder there.
-
-
-## Optional Local Malayalam Specialized ASR Setup (Offline / CPU INT8)
-
-Standard OpenAI Whisper `base`/`small` models are weaker on conversational Malayalam and can occasionally emit Devanagari script instead of Malayalam Unicode. If you speak pure Malayalam frequently, you can place a specialized local CTranslate2 `int8` or ONNX model offline (no automatic runtime download occurs):
-
-1. **`sajilck/whisper-small-malayalam-v2` (Apache-2.0)** converted to CTranslate2 `int8` placed under `models/asr/whisper-small-malayalam-v2-ct2/` (containing `model.bin`).
-2. Or AI4Bharat **`ai4bharat/indicconformer_stt_ml_hybrid_ctc_rnnt_large` (MIT)** ONNX + `tokens.txt` placed under `models/asr/indicconformer-ml/` with `sherpa-onnx` installed.
-3. Configure **Settings → Voice & Audio Devices → Local Malayalam Specialized Model** (or `"stt.malayalam_model"` in `config.json`) to `"malayalam_whisper"` or `"indic_conformer"`.
-
-## Custom Domain Vocabulary Hints
-
-Add technical names, project titles, frameworks, or personal nouns (one per line or comma-separated) to `config/vocab_hints.txt` or edit **Settings → Voice & Audio Devices → Domain Vocabulary Hints** without modifying code.
-
-## Database Migrations & Optional Desktop Automation Dependencies
-
-- **Database Schema**: Jarvis automatically migrates SQLite/PostgreSQL schemas via Alembic through revision `0008_p11_command_history` (adding `project_aliases` in `0007_p11_project_aliases` and `command_history` in `0008_p11_command_history`).
-- **Windows Telemetry & Desktop Controls**: CPU/RAM/Disk/Battery/Network telemetry uses `psutil`, NVIDIA GPU metrics query `nvidia-smi` when available, Win32 window/media controls use built-in Windows `ctypes` (`user32`), and high-risk input automation (`allow_input_automation`) remains disabled by default unless explicitly enabled in Settings.
+* Tray icon missing → run `jarvis.exe --no-tray` from a terminal to see errors, check `logs\jarvis.log`.
+* Dashboard says backend down → another program may hold port 4700 (`JARVIS_PORT=4701` changes it for one run).
+* Dictation hotkey does nothing → Settings → Dictation must be **On**; the combo must include a modifier; some apps running as administrator cannot receive pasted text from a normal-rights process.
+* Antivirus flags `jarvis.exe` → it is an unsigned PyInstaller build; sign it yourself or build from source.
+* More in `TROUBLESHOOTING.md`.

@@ -5,12 +5,22 @@ import logging
 import logging.handlers
 import os
 import re
+import shutil
+import sys
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-ROOT = Path(__file__).resolve().parent.parent
+FROZEN = bool(getattr(sys, "frozen", False))  # PyInstaller build
+# Read-only resources shipped with the program (frontend build, default config, migrations). In development this is the repo.
+RESOURCE_ROOT = Path(getattr(sys, "_MEIPASS", "") or Path(__file__).resolve().parent.parent)
+# Writable application home (data/, logs/, models/, notes/, config.json). Development: the repo. Installed: %LOCALAPPDATA%\JARVIS (or JARVIS_HOME).
+ROOT = (
+    Path(os.environ["JARVIS_HOME"])  # explicit override (installer smoke test, portable installs)
+    if os.environ.get("JARVIS_HOME")
+    else (Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "JARVIS") if FROZEN else Path(__file__).resolve().parent.parent
+)
 DATA = ROOT / "data"
 SECRETS_PATH = DATA / "secrets.json"
 
@@ -57,7 +67,7 @@ class TTSSpec(BaseModel):
 
 
 class STTSpec(BaseModel):
-    model: str = "small.en"
+    model: str = "medium.en"
     compute_type: str = "int8"
     cpu_threads: int = Field(6, ge=1, le=32)
     language: str = "en"  # "en" (English accuracy profile) | "auto" | "ml" | "mixed" | ...
@@ -283,7 +293,7 @@ class ActionsSpec(BaseModel):
         "arxiv.org",
         "pypi.org",
     ])
-    allow_screenshots: bool = True
+    allow_screenshots: bool = False  # opt-in: screen capture is disabled until the owner enables it
     allow_media_controls: bool = True
     allow_window_controls: bool = True
     allow_input_automation: bool = False
@@ -487,6 +497,65 @@ class PreferencesSpec(BaseModel):
     )
 
 
+class MCPServerSpec(BaseModel):
+    """One stdio MCP server. Disabled by default; only started when the owner enables it."""
+    command: str = Field(..., min_length=1, max_length=500)
+    args: list[str] = Field(default_factory=list)
+    env: dict[str, str] = Field(default_factory=dict)  # passed to the child only; never logged or returned by the API
+    enabled: bool = False
+    startup_timeout_s: float = Field(15.0, ge=1.0, le=120.0)
+    call_timeout_s: float = Field(30.0, ge=1.0, le=600.0)
+    allowed_tools: list[str] = Field(default_factory=list)  # empty = every discovered tool (still approval-gated)
+    read_only_tools: list[str] = Field(default_factory=list)  # owner-vouched tools that may run without approval
+    critical_keywords: list[str] = Field(default_factory=list)  # tool/argument words needing spoken confirmation too
+    network: bool = False  # server talks to the network/LAN: refused while offline_enforced is on and internet is off
+    max_restarts: int = Field(3, ge=0, le=10)
+    description: str = Field("", max_length=300)
+
+
+class MCPSpec(BaseModel):
+    servers: dict[str, MCPServerSpec] = Field(default_factory=dict)
+    max_running: int = Field(8, ge=1, le=32)
+    max_result_chars: int = Field(8000, ge=500, le=100_000)
+
+    @field_validator("servers")
+    @classmethod
+    def _valid_names(cls, v: dict[str, MCPServerSpec]) -> dict[str, MCPServerSpec]:
+        for name in v:
+            if not re.fullmatch(r"[a-z0-9_-]{1,32}", name):
+                raise ValueError(f"MCP server name {name!r} must match [a-z0-9_-]{{1,32}} (no dots)")
+        return v
+
+
+class DictationSpec(BaseModel):
+    enabled: bool = False
+    hotkey: str = "ctrl+alt+space"
+    double_tap_hands_free: bool = False
+    remove_fillers: bool = True
+    history_enabled: bool = False  # text-only, stored locally in data/dictation_history.jsonl
+    dictionary_file: str = "config/dictionary.txt"
+
+    @field_validator("hotkey")
+    @classmethod
+    def _valid_hotkey(cls, v: str) -> str:
+        v = (v or "").strip().lower().replace(" ", "")
+        parts = v.split("+")
+        if len(parts) < 2 or not all(parts):
+            raise ValueError("hotkey must be modifiers plus a key, e.g. ctrl+alt+space")
+        return v
+
+
+class ScreenSpec(BaseModel):
+    """read_screen: local screenshot + local OCR. Off by default; first use needs approval."""
+    enabled: bool = False
+    first_use_approved: bool = False
+    blocked_window_titles: list[str] = Field(default_factory=lambda: [
+        "password", "passwords", "keepass", "bitwarden", "1password", "lastpass", "dashlane", "keeper", "authenticator",
+        "bank", "banking", "paypal", "credit card", "net banking", "netbanking", "wallet", "sign in", "log in", "login",
+    ])
+    max_chars: int = Field(6000, ge=200, le=50_000)
+
+
 class MonitoringSpec(BaseModel):
     enabled: bool = True
     poll_interval_s: float = Field(5.0, ge=1.0, le=300.0)
@@ -514,6 +583,7 @@ class Settings(BaseModel):
     notes_dir: str = "notes"
     offline_enforced: bool = True  # block unauthorized non-localhost connections inside the server process
     history_turns: int = Field(6, ge=0, le=30)
+    tools_max_per_turn: int = Field(6, ge=1, le=20)  # tool_select: tools offered to the model per request (+ discover_tools)
     context_notes: int = Field(3, ge=1, le=8)  # notes fed to the model per turn
     context_chars: int = Field(450, ge=100, le=1500)
     brains: dict[str, BrainSpec]
@@ -537,6 +607,9 @@ class Settings(BaseModel):
     preferences: PreferencesSpec = PreferencesSpec()
     monitoring: MonitoringSpec = MonitoringSpec()
     proactive: ProactiveSpec = ProactiveSpec()
+    mcp: MCPSpec = MCPSpec()
+    dictation: DictationSpec = DictationSpec()
+    screen: ScreenSpec = ScreenSpec()
 
     @property
     def notes_path(self) -> Path:
@@ -595,6 +668,19 @@ def _default_overrides_path() -> Path:
     return Path(env_ov) if env_ov else (DATA / "settings.json")
 
 
+def ensure_app_home() -> None:
+    """Installed builds: create the writable home and seed default config/notes from the bundle once (never overwrites)."""
+    if ROOT == RESOURCE_ROOT:
+        return
+    ROOT.mkdir(parents=True, exist_ok=True)
+    for sub in ("data", "logs", "models/whisper", "models/piper", "models/wake"):
+        (ROOT / sub).mkdir(parents=True, exist_ok=True)
+    for name in ("config.json", "config", "notes"):
+        src, dst = RESOURCE_ROOT / name, ROOT / name
+        if src.exists() and not dst.exists():
+            shutil.copytree(src, dst) if src.is_dir() else shutil.copy2(src, dst)
+
+
 def load_settings(config_path: Path | None = None, overrides_path: Path | None = None) -> Settings:
     config_path = config_path or ROOT / "config.json"
     overrides_path = overrides_path or _default_overrides_path()
@@ -602,6 +688,8 @@ def load_settings(config_path: Path | None = None, overrides_path: Path | None =
     if overrides_path.exists():
         raw = _deep_merge(raw, json.loads(overrides_path.read_text(encoding="utf-8")))
     raw = _apply_laya_env_overrides(raw)
+    if os.environ.get("JARVIS_PORT", "").strip().isdigit():  # lets the installer smoke test avoid a running instance
+        raw["port"] = int(os.environ["JARVIS_PORT"])
     return Settings.model_validate(raw)
 
 

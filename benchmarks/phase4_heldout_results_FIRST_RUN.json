@@ -1,0 +1,474 @@
+{
+  "tool_select_keyword_only": {
+    "n": 32,
+    "k": 6,
+    "catalogue_size": 25,
+    "recall_at_k": 0.6875,
+    "top1": 0.375,
+    "misses": [
+      {
+        "q": "write to Priya that the report is done",
+        "expect": [
+          "mail.send_message"
+        ],
+        "chosen": [
+          "calendar.create_event",
+          "calendar.list_events",
+          "database.run_query",
+          "fetch_webpage",
+          "fs_find_files_by_extension",
+          "fs_get_project_structure",
+          "discover_tools"
+        ],
+        "recall_at_k": false,
+        "top1": false
+      },
+      {
+        "q": "jot down that the wifi password is on the fridge",
+        "expect": [
+          "notes.create_note"
+        ],
+        "chosen": [
+          "calendar.create_event",
+          "calendar.list_events",
+          "database.run_query",
+          "fetch_webpage",
+          "fs_find_files_by_extension",
+          "fs_get_project_structure",
+          "discover_tools"
+        ],
+        "recall_at_k": false,
+        "top1": false
+      },
+      {
+        "q": "will it rain in Mumbai tomorrow",
+        "expect": [
+          "weather.get_forecast",
+          "web_search"
+        ],
+        "chosen": [
+          "calendar.create_event",
+          "calendar.list_events",
+          "database.run_query",
+          "fetch_webpage",
+          "fs_find_files_by_extension",
+          "fs_get_project_structure",
+          "discover_tools"
+        ],
+        "recall_at_k": false,
+        "top1": false
+      },
+      {
+        "q": "put on some lo-fi beats",
+        "expect": [
+          "music.play"
+        ],
+        "chosen": [
+          "calendar.create_event",
+          "calendar.list_events",
+          "database.run_query",
+          "fetch_webpage",
+          "fs_find_files_by_extension",
+          "fs_get_project_structure",
+          "discover_tools"
+        ],
+        "recall_at_k": false,
+        "top1": false
+      },
+      {
+        "q": "hold the song for a moment",
+        "expect": [
+          "music.pause"
+        ],
+        "chosen": [
+          "music.play",
+          "discover_tools"
+        ],
+        "recall_at_k": false,
+        "top1": false
+      },
+      {
+        "q": "what's new in the Rust language this year",
+        "expect": [
+          "web_search"
+        ],
+        "chosen": [
+          "github.create_issue",
+          "notes.create_note",
+          "discover_tools"
+        ],
+        "recall_at_k": false,
+        "top1": false
+      },
+      {
+        "q": "where is the file called invoice_2024.pdf",
+        "expect": [
+          "fs_search_files"
+        ],
+        "chosen": [
+          "fs_read_file",
+          "fs_read_document",
+          "fs_find_files_by_extension",
+          "fs_get_project_structure",
+          "fs_list_directory",
+          "fs_read_metadata",
+          "discover_tools"
+        ],
+        "recall_at_k": false,
+        "top1": false
+      },
+      {
+        "q": "when was readme.txt last changed and how large is it",
+        "expect": [
+          "fs_read_metadata"
+        ],
+        "chosen": [
+          "calendar.create_event",
+          "calendar.list_events",
+          "database.run_query",
+          "fetch_webpage",
+          "fs_find_files_by_extension",
+          "fs_get_project_structure",
+          "discover_tools"
+        ],
+        "recall_at_k": false,
+        "top1": false
+      },
+      {
+        "q": "describe how this repository is laid out",
+        "expect": [
+          "fs_get_project_structure"
+        ],
+        "chosen": [
+          "github.create_issue",
+          "github.list_pull_requests",
+          "discover_tools"
+        ],
+        "recall_at_k": false,
+        "top1": false
+      },
+      {
+        "q": "latest price of gold today",
+        "expect": [
+          "web_search"
+        ],
+        "chosen": [
+          "calendar.create_event",
+          "calendar.list_events",
+          "database.run_query",
+          "fetch_webpage",
+          "fs_find_files_by_extension",
+          "fs_get_project_structure",
+          "discover_tools"
+        ],
+        "recall_at_k": false,
+        "top1": false
+      }
+    ],
+    "latency_ms_mean": 1.3275031249690983,
+    "latency_ms_max": 1.8064999994749087,
+    "discover_always_present": true
+  },
+  "tool_select_hash_embeddings": {
+    "n": 32,
+    "k": 6,
+    "catalogue_size": 25,
+    "recall_at_k": 0.65625,
+    "top1": 0.4375,
+    "misses": [
+      {
+        "q": "what's on my agenda for Friday",
+        "expect": [
+          "calendar.list_events"
+        ],
+        "chosen": [
+          "fs_get_project_structure",
+          "fs_read_file",
+          "calendar.create_event",
+          "weather.get_forecast",
+          "fs_find_files_by_extension",
+          "github.list_pull_requests",
+          "discover_tools"
+        ],
+        "recall_at_k": false,
+        "top1": false
+      },
+      {
+        "q": "write to Priya that the report is done",
+        "expect": [
+          "mail.send_message"
+        ],
+        "chosen": [
+          "fs_read_file",
+          "fetch_webpage",
+          "github.list_pull_requests",
+          "fs_search_files",
+          "homeassistant.get_state",
+          "fs_read_document",
+          "discover_tools"
+        ],
+        "recall_at_k": false,
+        "top1": false
+      },
+      {
+        "q": "jot down that the wifi password is on the fridge",
+        "expect": [
+          "notes.create_note"
+        ],
+        "chosen": [
+          "fs_list_directory",
+          "fs_read_file",
+          "fs_read_metadata",
+          "mail.send_message",
+          "github.list_pull_requests",
+          "homeassistant.turn_on",
+          "discover_tools"
+        ],
+        "recall_at_k": false,
+        "top1": false
+      },
+      {
+        "q": "will it rain in Mumbai tomorrow",
+        "expect": [
+          "weather.get_forecast",
+          "web_search"
+        ],
+        "chosen": [
+          "fs_read_file",
+          "fs_read_document",
+          "github.list_pull_requests",
+          "fs_get_project_structure",
+          "fs_read_metadata",
+          "music.pause",
+          "discover_tools"
+        ],
+        "recall_at_k": false,
+        "top1": false
+      },
+      {
+        "q": "put on some lo-fi beats",
+        "expect": [
+          "music.play"
+        ],
+        "chosen": [
+          "fs_get_project_structure",
+          "fs_list_directory",
+          "web_search",
+          "github.create_issue",
+          "fs_read_document",
+          "fs_read_metadata",
+          "discover_tools"
+        ],
+        "recall_at_k": false,
+        "top1": false
+      },
+      {
+        "q": "hold the song for a moment",
+        "expect": [
+          "music.pause"
+        ],
+        "chosen": [
+          "music.play",
+          "weather.get_forecast",
+          "fs_find_files_by_extension",
+          "calendar.create_event",
+          "homeassistant.turn_on",
+          "calendar.list_events",
+          "discover_tools"
+        ],
+        "recall_at_k": false,
+        "top1": false
+      },
+      {
+        "q": "what's new in the Rust language this year",
+        "expect": [
+          "web_search"
+        ],
+        "chosen": [
+          "github.create_issue",
+          "notes.create_note",
+          "calendar.create_event",
+          "homeassistant.turn_off",
+          "homeassistant.turn_on",
+          "fs_get_project_structure",
+          "discover_tools"
+        ],
+        "recall_at_k": false,
+        "top1": false
+      },
+      {
+        "q": "list every markdown file under docs",
+        "expect": [
+          "fs_find_files_by_extension"
+        ],
+        "chosen": [
+          "fs_list_directory",
+          "fs_read_document",
+          "calendar.list_events",
+          "github.list_pull_requests",
+          "fs_read_file",
+          "fs_search_files",
+          "discover_tools"
+        ],
+        "recall_at_k": false,
+        "top1": false
+      },
+      {
+        "q": "describe how this repository is laid out",
+        "expect": [
+          "fs_get_project_structure"
+        ],
+        "chosen": [
+          "github.list_pull_requests",
+          "github.create_issue",
+          "fs_read_document",
+          "homeassistant.turn_off",
+          "homeassistant.turn_on",
+          "fs_read_file",
+          "discover_tools"
+        ],
+        "recall_at_k": false,
+        "top1": false
+      },
+      {
+        "q": "latest price of gold today",
+        "expect": [
+          "web_search"
+        ],
+        "chosen": [
+          "github.list_pull_requests",
+          "fs_list_directory",
+          "homeassistant.set_temperature",
+          "tasks.add_task",
+          "homeassistant.get_state",
+          "fs_read_file",
+          "discover_tools"
+        ],
+        "recall_at_k": false,
+        "top1": false
+      },
+      {
+        "q": "what appointments do I have next week",
+        "expect": [
+          "calendar.list_events"
+        ],
+        "chosen": [
+          "fs_read_document",
+          "fs_find_files_by_extension",
+          "fs_read_file",
+          "homeassistant.turn_on",
+          "fs_get_project_structure",
+          "music.play",
+          "discover_tools"
+        ],
+        "recall_at_k": false,
+        "top1": false
+      }
+    ],
+    "latency_ms_mean": 1.798762499959139,
+    "latency_ms_max": 15.566699999908451,
+    "discover_always_present": true
+  },
+  "intent_offline": {
+    "n": 34,
+    "accuracy": 0.9117647058823529,
+    "confusions": {
+      "stop->query": 2,
+      "ignore->query": 1
+    },
+    "wrong": [
+      {
+        "text": "okay stop",
+        "expect": "stop",
+        "got": "query",
+        "path": "llm",
+        "query": "okay stop",
+        "ok": false,
+        "ms": 1.0
+      },
+      {
+        "text": "please be quiet",
+        "expect": "stop",
+        "got": "query",
+        "path": "llm",
+        "query": "please be quiet",
+        "ok": false,
+        "ms": 0.09
+      },
+      {
+        "text": "can you pass me the salt",
+        "expect": "ignore",
+        "got": "query",
+        "path": "fast",
+        "query": "can you pass me the salt",
+        "ok": false,
+        "ms": 0.03
+      }
+    ],
+    "fast_path_n": 27,
+    "fast_ms_max": 0.07220000043162145,
+    "fast_ms_mean": 0.03131851846976335,
+    "llm_path_n": 7,
+    "llm_ms": [
+      1,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "llm_mode": "scripted"
+  },
+  "intent_live_llm": {
+    "n": 34,
+    "accuracy": 0.9117647058823529,
+    "confusions": {
+      "stop->ignore": 2,
+      "ignore->query": 1
+    },
+    "wrong": [
+      {
+        "text": "okay stop",
+        "expect": "stop",
+        "got": "ignore",
+        "path": "llm",
+        "query": "",
+        "ok": false,
+        "ms": 1438.53
+      },
+      {
+        "text": "please be quiet",
+        "expect": "stop",
+        "got": "ignore",
+        "path": "llm",
+        "query": "",
+        "ok": false,
+        "ms": 466.19
+      },
+      {
+        "text": "can you pass me the salt",
+        "expect": "ignore",
+        "got": "query",
+        "path": "fast",
+        "query": "can you pass me the salt",
+        "ok": false,
+        "ms": 0.05
+      }
+    ],
+    "fast_path_n": 27,
+    "fast_ms_max": 0.05210000017541461,
+    "fast_ms_mean": 0.029596296371892095,
+    "llm_path_n": 7,
+    "llm_ms": [
+      1439,
+      466,
+      468,
+      585,
+      477,
+      466,
+      471
+    ],
+    "llm_mode": "live-ollama"
+  }
+}

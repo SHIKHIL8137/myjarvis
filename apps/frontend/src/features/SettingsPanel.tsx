@@ -2,8 +2,9 @@ import React, { useCallback, useEffect, useState } from "react";
 import { apiFetch } from "../api/client";
 import { AudioVideoPanel, SettingsErrorBoundary, type HostAudioInventory } from "../components/AudioVideoPanel";
 import { fmtTime, type ShellProps } from "../shell";
+import { IntegrationsPanel } from "./IntegrationsPanel";
 
-type SectionId = "providers" | "voice" | "permissions" | "system";
+type SectionId = "setup" | "providers" | "voice" | "permissions" | "system";
 
 interface ConsolidatedSettings {
   tts: { enabled: boolean; voice: string; speed: number; output_device?: number | string | null };
@@ -168,6 +169,10 @@ const CLOUD_PROVIDERS = ["openrouter", "gemini", "huggingface", "openai", "anthr
 
 export const SettingsPanel: React.FC<ShellProps> = ({ onNotify }) => {
   const [section, setSection] = useState<SectionId>("providers");
+  // first run: open on the setup wizard
+  useEffect(() => {
+    apiFetch<{ completed: boolean }>("/v2/setup/state").then((r) => { if (!r.completed) setSection("setup"); }).catch(() => undefined);
+  }, []);
   const [cfg, setCfg] = useState<ConsolidatedSettings | null>(null);
   const [models, setModels] = useState<ModelItem[]>([]);
   const [caps, setCaps] = useState<CapabilityItem[]>([]);
@@ -305,6 +310,7 @@ export const SettingsPanel: React.FC<ShellProps> = ({ onNotify }) => {
         <div className="row wrap">
           {(
             [
+              ["setup", "Setup & Integrations"],
               ["providers", "AI Providers & Routing"],
               ["voice", "Voice & Audio"],
               ["permissions", "Permissions & Privacy"],
@@ -319,6 +325,7 @@ export const SettingsPanel: React.FC<ShellProps> = ({ onNotify }) => {
       </div>
 
       {/* SECTION 1: AI PROVIDERS & MODEL ROUTING */}
+      {section === "setup" && <IntegrationsPanel onNotify={onNotify} />}
       {section === "providers" && (
         <SettingsErrorBoundary title="AI Providers & Routing">
           <div className="card">

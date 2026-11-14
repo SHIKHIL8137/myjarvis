@@ -1,53 +1,10 @@
-# Jarvis Configurable Speech Recognition Vocabulary Hints
-# Add one term or comma-separated terms per line. Lines starting with # are ignored.
-# Updated at runtime without modifying Python source code.
-#
-# Core Personal & Assistant Identifiers
+# Jarvis Configurable Speech Recognition Vocabulary Hints (Max 8-10 terms recommended)
+# Short list of terms actually spoken by the user to avoid Whisper prompt-echoing bias.
 Jarvis
 Kavlien
-ERP
-ERP_V2
-
-# Web & Full-Stack Technologies
-React
-Node.js
-TypeScript
-JavaScript
-Python
-FastAPI
-WebSocket
-REST
-API
-uvicorn
-Alembic
-
-# Databases & Vector Stores
-MongoDB
-PostgreSQL
-Redis
-pgvector
-Qdrant
-ChromaDB
-
-# AI, Models & Inference Runtimes
 Ollama
 Qwen
-Whisper
-Faster-Whisper
-Hugging Face
-LangGraph
-Silero
-VRAM
-quantization
-
-# Developer Tools & Cloud Infrastructure
+Python
 Docker
-Kubernetes
-EKS
-AWS
-Vercel
-Cloudflare
-GitHub
-OpenCode
-VS Code
-Graphify
+FastAPI
+Git

@@ -1,0 +1,1547 @@
+{
+ "_note": "HELD-OUT. Written before any measurement; not used for tuning.",
+ "cases": [
+  {
+   "cat": "direct",
+   "text": "List the files in D:\\projects\\myjarvis\\notes",
+   "group": [
+    "files"
+   ],
+   "tool": [
+    "fs_list_directory"
+   ],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "direct",
+   "text": "Read D:\\projects\\myjarvis\\README.md",
+   "group": [
+    "files"
+   ],
+   "tool": [
+    "fs_read_file"
+   ],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "direct",
+   "text": "Show me the structure of the D:\\projects\\myjarvis folder",
+   "group": [
+    "files"
+   ],
+   "tool": [
+    "fs_get_project_structure"
+   ],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "direct",
+   "text": "Search the web for the latest Python release",
+   "group": [
+    "web"
+   ],
+   "tool": [
+    "web_search"
+   ],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "direct",
+   "text": "Remind me tomorrow at 9am to call the bank",
+   "group": [
+    "reminder"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "direct",
+   "text": "Save a note that the meeting moved to Friday",
+   "group": [
+    "memory"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "direct",
+   "text": "What is the CPU usage right now?",
+   "group": [
+    "system"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "direct",
+   "text": "Explain what a mutex is",
+   "group": [
+    "chat"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "direct",
+   "text": "Write a Python function that reverses a string",
+   "group": [
+    "code",
+    "chat"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "direct",
+   "text": "Translate 'good morning' to Hindi",
+   "group": [
+    "chat"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "informal",
+   "text": "yo whats up",
+   "group": [
+    "chat"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "informal",
+   "text": "hey can u show me whats in my downloads folder",
+   "group": [
+    "files"
+   ],
+   "tool": [
+    "fs_list_directory"
+   ],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "informal",
+   "text": "gimme the weather in kochi",
+   "group": [
+    "web",
+    "chat"
+   ],
+   "tool": [
+    "web_search"
+   ],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "informal",
+   "text": "lol ok but how much ram am i using",
+   "group": [
+    "system"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "informal",
+   "text": "pls dont forget i hate mondays",
+   "group": [
+    "memory"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "informal",
+   "text": "wanna find that pdf i got last week",
+   "group": [
+    "files"
+   ],
+   "tool": [
+    "fs_search_files",
+    "fs_find_files_by_extension"
+   ],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "informal",
+   "text": "tell me a joke bro",
+   "group": [
+    "chat"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "informal",
+   "text": "whats the time",
+   "group": [
+    "chat",
+    "system"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "informal",
+   "text": "can u open my notes folder",
+   "group": [
+    "files"
+   ],
+   "tool": [
+    "fs_list_directory"
+   ],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "informal",
+   "text": "yeah thanks jarvis",
+   "group": [
+    "chat"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "typos",
+   "text": "serch for pythn 3.14 relese notes on the web",
+   "group": [
+    "web"
+   ],
+   "tool": [
+    "web_search"
+   ],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "typos",
+   "text": "show me files in my documants folder",
+   "group": [
+    "files"
+   ],
+   "tool": [
+    "fs_list_directory"
+   ],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "typos",
+   "text": "how mutch vram i hav left",
+   "group": [
+    "system"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "typos",
+   "text": "remeber that my favorit editor is neovim",
+   "group": [
+    "memory"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "typos",
+   "text": "find the confg file in my projct",
+   "group": [
+    "files"
+   ],
+   "tool": [
+    "fs_search_files"
+   ],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "typos",
+   "text": "wat is ollama",
+   "group": [
+    "chat"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "typos",
+   "text": "oppen the readme in myjarvis folder",
+   "group": [
+    "files"
+   ],
+   "tool": [
+    "fs_read_file",
+    "fs_list_directory"
+   ],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "typos",
+   "text": "remind me tmrw to pay rent",
+   "group": [
+    "reminder"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "typos",
+   "text": "stoop",
+   "group": [
+    "stop"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "typos",
+   "text": "explane how fastapi works",
+   "group": [
+    "chat"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "paraphrase",
+   "text": "Could you tell me what is stored in the folder called notes?",
+   "group": [
+    "files"
+   ],
+   "tool": [
+    "fs_list_directory"
+   ],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "paraphrase",
+   "text": "I'd like a look at the contents of my notes directory",
+   "group": [
+    "files"
+   ],
+   "tool": [
+    "fs_list_directory"
+   ],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "paraphrase",
+   "text": "What files do I have inside notes?",
+   "group": [
+    "files"
+   ],
+   "tool": [
+    "fs_list_directory"
+   ],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "paraphrase",
+   "text": "Browse the notes folder for me",
+   "group": [
+    "files"
+   ],
+   "tool": [
+    "fs_list_directory"
+   ],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "paraphrase",
+   "text": "How busy is my processor at the moment?",
+   "group": [
+    "system"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "paraphrase",
+   "text": "Is my CPU under heavy load?",
+   "group": [
+    "system"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "paraphrase",
+   "text": "Give me the machine's current resource usage",
+   "group": [
+    "system"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "paraphrase",
+   "text": "Please keep in mind that I like short answers",
+   "group": [
+    "memory"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "paraphrase",
+   "text": "Make a note: I prefer concise replies",
+   "group": [
+    "memory"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "paraphrase",
+   "text": "Look up recent news about local LLMs online",
+   "group": [
+    "web"
+   ],
+   "tool": [
+    "web_search"
+   ],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "ambiguous",
+   "text": "do that thing",
+   "group": [
+    "clarify"
+   ],
+   "tool": [],
+   "clarify": true,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "ambiguous",
+   "text": "fix it",
+   "group": [
+    "clarify",
+    "chat"
+   ],
+   "tool": [],
+   "clarify": true,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "ambiguous",
+   "text": "open it",
+   "group": [
+    "clarify",
+    "chat"
+   ],
+   "tool": [],
+   "clarify": true,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "ambiguous",
+   "text": "the usual",
+   "group": [
+    "clarify",
+    "chat"
+   ],
+   "tool": [],
+   "clarify": true,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "ambiguous",
+   "text": "check that for me",
+   "group": [
+    "clarify",
+    "chat"
+   ],
+   "tool": [],
+   "clarify": true,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "ambiguous",
+   "text": "send it to him",
+   "group": [
+    "clarify",
+    "chat"
+   ],
+   "tool": [],
+   "clarify": true,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "ambiguous",
+   "text": "what we discussed yesterday",
+   "group": [
+    "clarify",
+    "chat",
+    "memory"
+   ],
+   "tool": [],
+   "clarify": true,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "ambiguous",
+   "text": "handle the project",
+   "group": [
+    "clarify",
+    "files",
+    "chat"
+   ],
+   "tool": [],
+   "clarify": true,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "followup",
+   "text": "and what about its backend?",
+   "group": [
+    "files",
+    "code"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": "Explore the myjarvis project"
+  },
+  {
+   "cat": "followup",
+   "text": "why?",
+   "group": [
+    "chat"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": "What is the capital of France?"
+  },
+  {
+   "cat": "followup",
+   "text": "and in Hindi?",
+   "group": [
+    "chat"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": "Translate 'thank you' to Malayalam"
+  },
+  {
+   "cat": "followup",
+   "text": "what about the second one",
+   "group": [
+    "chat",
+    "clarify",
+    "files"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": "List the files in D:\\projects\\myjarvis\\notes"
+  },
+  {
+   "cat": "followup",
+   "text": "tell me more",
+   "group": [
+    "chat"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": "Explain what a mutex is"
+  },
+  {
+   "cat": "followup",
+   "text": "how about tomorrow?",
+   "group": [
+    "chat",
+    "web"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": "What is the weather in Kochi today?"
+  },
+  {
+   "cat": "followup",
+   "text": "make it shorter",
+   "group": [
+    "chat"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": "Explain what a mutex is"
+  },
+  {
+   "cat": "followup",
+   "text": "again please",
+   "group": [
+    "chat"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": "Tell me a joke"
+  },
+  {
+   "cat": "no_borrow",
+   "text": "what is 2 plus 2",
+   "group": [
+    "chat"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": "Explore the ERP project and its database"
+  },
+  {
+   "cat": "no_borrow",
+   "text": "turn off the lights",
+   "group": [
+    "chat",
+    "system"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": "Explore the ERP project and its database"
+  },
+  {
+   "cat": "no_borrow",
+   "text": "tell me a joke",
+   "group": [
+    "chat"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": "Explore the ERP project and its database"
+  },
+  {
+   "cat": "no_borrow",
+   "text": "stop",
+   "group": [
+    "stop"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": "Explore the ERP project and its database"
+  },
+  {
+   "cat": "no_borrow",
+   "text": "what is the capital of France",
+   "group": [
+    "chat"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": "Explore the ERP project and its database"
+  },
+  {
+   "cat": "no_borrow",
+   "text": "hello",
+   "group": [
+    "chat"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": "Explore the ERP project and its database"
+  },
+  {
+   "cat": "files",
+   "text": "Find all python files in D:\\projects\\myjarvis\\jarvis",
+   "group": [
+    "files"
+   ],
+   "tool": [
+    "fs_find_files_by_extension"
+   ],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "files",
+   "text": "Where is the file server.py in my myjarvis project?",
+   "group": [
+    "files"
+   ],
+   "tool": [
+    "fs_search_files"
+   ],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "files",
+   "text": "Open the myjarvis project folder",
+   "group": [
+    "files"
+   ],
+   "tool": [
+    "fs_list_directory"
+   ],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "files",
+   "text": "Summarize the documents in my documents folder",
+   "group": [
+    "files"
+   ],
+   "tool": [
+    "fs_list_directory",
+    "fs_read_document"
+   ],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "files",
+   "text": "How big is D:\\projects\\myjarvis\\config.json",
+   "group": [
+    "files"
+   ],
+   "tool": [
+    "fs_read_metadata"
+   ],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "files",
+   "text": "Delete the file D:\\temp\\old.txt",
+   "group": [
+    "files",
+    "system"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "files",
+   "text": "Create a file called todo.txt in my documents with three items",
+   "group": [
+    "files"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "files",
+   "text": "Show the folder tree of my Erp project",
+   "group": [
+    "files"
+   ],
+   "tool": [
+    "fs_get_project_structure"
+   ],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "files",
+   "text": "Read the pdf report in my documents folder",
+   "group": [
+    "files"
+   ],
+   "tool": [
+    "fs_read_document"
+   ],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "files",
+   "text": "Read C:\\Windows\\System32\\config\\SAM",
+   "group": [
+    "files",
+    "clarify"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "files",
+   "text": "Show me my .env file",
+   "group": [
+    "files"
+   ],
+   "tool": [
+    "fs_read_file"
+   ],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "files",
+   "text": "Find files named invoice in my documents",
+   "group": [
+    "files"
+   ],
+   "tool": [
+    "fs_search_files"
+   ],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "openai",
+   "text": "Where do I call the OpenAI endpoint in my code?",
+   "group": [
+    "files",
+    "code"
+   ],
+   "tool": [
+    "fs_search_files"
+   ],
+   "clarify": true,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "openai",
+   "text": "Which model name does my OpenAI wrapper use?",
+   "group": [
+    "files",
+    "code"
+   ],
+   "tool": [
+    "fs_search_files",
+    "fs_read_file"
+   ],
+   "clarify": true,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "openai",
+   "text": "Open the folder where I keep the OpenAI experiments",
+   "group": [
+    "files"
+   ],
+   "tool": [
+    "fs_list_directory"
+   ],
+   "clarify": true,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "openai",
+   "text": "Is my OpenAI key configured? Don't print it.",
+   "group": [
+    "files",
+    "system",
+    "code"
+   ],
+   "tool": [],
+   "clarify": true,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "openai",
+   "text": "Why does my OpenAI request time out?",
+   "group": [
+    "code",
+    "chat"
+   ],
+   "tool": [],
+   "clarify": true,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "openai",
+   "text": "Compare how I call OpenAI versus Ollama",
+   "group": [
+    "code",
+    "chat"
+   ],
+   "tool": [],
+   "clarify": true,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "openai",
+   "text": "Grep my project for chat.completions",
+   "group": [
+    "files"
+   ],
+   "tool": [
+    "fs_search_files"
+   ],
+   "clarify": true,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "openai",
+   "text": "What does OpenAI charge per token?",
+   "group": [
+    "chat",
+    "web"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "openai",
+   "text": "Write a script that calls the OpenAI chat API",
+   "group": [
+    "code",
+    "chat"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "openai",
+   "text": "List the files in my OpenAI project",
+   "group": [
+    "files"
+   ],
+   "tool": [
+    "fs_list_directory"
+   ],
+   "clarify": true,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "ollama",
+   "text": "Which Ollama models are installed?",
+   "group": [
+    "system",
+    "chat"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "ollama",
+   "text": "What is Ollama?",
+   "group": [
+    "chat"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "ollama",
+   "text": "Is Ollama running?",
+   "group": [
+    "system",
+    "chat"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "ollama",
+   "text": "Pull the llama3 model with Ollama",
+   "group": [
+    "system",
+    "chat"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "ollama",
+   "text": "How do I change the Ollama context size?",
+   "group": [
+    "chat"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "ollama",
+   "text": "Switch to the qwen3 model",
+   "group": [
+    "system",
+    "chat"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "memory",
+   "text": "What is my favourite editor?",
+   "group": [
+    "memory"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": true,
+   "context": ""
+  },
+  {
+   "cat": "memory",
+   "text": "What did I tell you about my ERP backend?",
+   "group": [
+    "memory"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": true,
+   "context": ""
+  },
+  {
+   "cat": "memory",
+   "text": "Remember that my dog is called Biscuit",
+   "group": [
+    "memory"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "memory",
+   "text": "Forget what I said about Mondays",
+   "group": [
+    "memory"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "memory",
+   "text": "Do you remember my preferred answer style?",
+   "group": [
+    "memory"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": true,
+   "context": ""
+  },
+  {
+   "cat": "memory",
+   "text": "Don't use previous context: what is a semaphore?",
+   "group": [
+    "chat"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "memory",
+   "text": "Ignore everything we said before. Define recursion.",
+   "group": [
+    "chat"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "memory",
+   "text": "What do you know about me?",
+   "group": [
+    "memory"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": true,
+   "context": ""
+  },
+  {
+   "cat": "system",
+   "text": "Open Notepad",
+   "group": [
+    "system",
+    "chat"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "system",
+   "text": "Mute the microphone",
+   "group": [
+    "system",
+    "chat"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "system",
+   "text": "Take a screenshot",
+   "group": [
+    "system",
+    "chat"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "system",
+   "text": "Show running tasks",
+   "group": [
+    "system"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "system",
+   "text": "What is the status of my last request?",
+   "group": [
+    "system"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "system",
+   "text": "How much disk space is free?",
+   "group": [
+    "system"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "system",
+   "text": "Run the command dir C:\\",
+   "group": [
+    "system",
+    "chat",
+    "files"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "system",
+   "text": "Shut down the computer",
+   "group": [
+    "system",
+    "chat",
+    "clarify"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "stop",
+   "text": "stop",
+   "group": [
+    "stop"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "stop",
+   "text": "Jarvis stop talking",
+   "group": [
+    "stop"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "stop",
+   "text": "cancel",
+   "group": [
+    "stop",
+    "system"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "stop",
+   "text": "that's enough",
+   "group": [
+    "stop",
+    "chat"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "stop",
+   "text": "be quiet",
+   "group": [
+    "stop"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "stop",
+   "text": "never mind",
+   "group": [
+    "stop",
+    "chat"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "stop",
+   "text": "cancel the current task",
+   "group": [
+    "system",
+    "stop"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "stop",
+   "text": "shut up",
+   "group": [
+    "stop",
+    "chat"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "notool",
+   "text": "What is the difference between TCP and UDP?",
+   "group": [
+    "chat"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "notool",
+   "text": "Who wrote Pride and Prejudice?",
+   "group": [
+    "chat"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "notool",
+   "text": "Give me a recipe for pancakes",
+   "group": [
+    "chat"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "notool",
+   "text": "What does HTTP 404 mean?",
+   "group": [
+    "chat"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "notool",
+   "text": "How do I reverse a list in Python?",
+   "group": [
+    "chat",
+    "code"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "notool",
+   "text": "Explain the difference between a process and a thread",
+   "group": [
+    "chat"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "notool",
+   "text": "Tell me about the French revolution",
+   "group": [
+    "chat"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "notool",
+   "text": "What is 17 times 23?",
+   "group": [
+    "chat"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "notool",
+   "text": "Summarize the plot of Hamlet",
+   "group": [
+    "chat"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "notool",
+   "text": "What is a REST API?",
+   "group": [
+    "chat"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "unrelated",
+   "text": "I had pasta for dinner",
+   "group": [
+    "chat"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "unrelated",
+   "text": "The weather is lovely",
+   "group": [
+    "chat"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "unrelated",
+   "text": "My sister is visiting next weekend",
+   "group": [
+    "chat"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "unrelated",
+   "text": "Banana",
+   "group": [
+    "chat",
+    "clarify"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "unrelated",
+   "text": "Good night",
+   "group": [
+    "chat"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  },
+  {
+   "cat": "unrelated",
+   "text": "asdfgh",
+   "group": [
+    "chat",
+    "clarify"
+   ],
+   "tool": [],
+   "clarify": false,
+   "memory": false,
+   "context": ""
+  }
+ ]
+}

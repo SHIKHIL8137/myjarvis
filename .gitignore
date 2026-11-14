@@ -48,3 +48,7 @@ notes/.trash/
 bench_results.json
 *.pdf
 *.zip
+
+# packaged build output
+/dist/
+/build/

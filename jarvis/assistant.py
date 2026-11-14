@@ -18,7 +18,13 @@ from .aec import EchoReferenceBuffer, NLMSEchoCanceller
 from .agents.multistep import build_multistep_plan, classify_task_category
 from .agents.orchestrator import AgentOrchestrator
 from .brain import Brain, BrainError, ToolsUnsupportedError
-from .config import DATA, Settings
+from .intent_judge import IntentJudge
+from .model_catalog import ModelCatalog
+from .mcp_client import MCPManager
+from .tool_select import DISCOVER, describe, discover_more, select_tools
+from .ptt import DictationService
+from .screen import ScreenReader, screen_tool_schema
+from .config import DATA, ROOT, Settings
 from .core.event_bus import EventBus
 from .decision.rules import HARD_STOP
 from .filesystem import FilesystemPermissionError, SafeFilesystem
@@ -43,7 +49,8 @@ from .learning.training.training_scheduler import TrainingScheduler
 from .memory_store import PersonalMemoryStore
 from .notes import NoteStore
 from .persona import build_messages
-from .retrieval import search
+from .typo import normalize_for_routing
+from .retrieval import LOCAL_ARTIFACT_HINT, UNPERFORMED_NOTICE, claims_unperformed_action, grounded, is_followup, no_context_requested, refers_to_local_artifact, search, worth_remembering
 from .search import SearchError, WebSearchService
 from .stt import Whisper
 from .translator import Translator, transcript_requires_voice_clarification
@@ -235,6 +242,7 @@ class Assistant:
         self.filesystem = SafeFilesystem(settings.filesystem)
         self.actions = ActionExecutor(settings.actions, self.filesystem)
         self.brain = brain or Brain(settings)
+        self.model_catalog = ModelCatalog(self)  # discovery/recommendation/validated selection; the active model stays Brain.current
         self.history = History(self.data_dir / "history.jsonl", settings.history_turns)
         self.conversation_refs: set[str] = set()  # graph ids the current conversation retrieved (live graph links)
         self.used_tools: set[str] = set()  # real capability/web tools invoked during this session
@@ -302,6 +310,8 @@ class Assistant:
             aec=self.aec,
             echo_ref=self.echo_ref,
         )
+        self.dictation = DictationService(self.stt, settings.dictation, root=ROOT, data_dir=self.data_dir, on_recording=self._on_dictation_recording, input_device=lambda: self.settings.audio.input_device)
+        self._dictation_paused_voice = False
         self.activity = "idle"
         self.loop: asyncio.AbstractEventLoop | None = None
         self._turn_lock = asyncio.Lock()
@@ -313,6 +323,10 @@ class Assistant:
         self._bg: set[asyncio.Task] = set()
         self.warm_status = {"stt": False, "tts": False, "brain": False}
         self.orchestrator = AgentOrchestrator(settings, bus=self.bus, brain=self.brain, data_dir=self.data_dir)
+        self.mcp = MCPManager(settings, self.orchestrator.approvals)
+        self.intent_judge = IntentJudge(self.brain)
+        self.screen = ScreenReader(settings, self.orchestrator.approvals)
+        self.actions.screen_guard = self.screen.guard_reason
         self.proactive = ProactiveSuggestionEngine(settings.proactive, db=self.orchestrator.db)
         self.knowledge.vector_store = self.orchestrator.memory.vectors
         try:
@@ -340,6 +354,37 @@ class Assistant:
         self._spawn(self._watch_knowledge())
         self._spawn(self._watch_reminders())
         self._spawn(self._watch_memory_expiry())
+        self._spawn(self._start_mcp())
+        try:
+            self.dictation.start()
+        except Exception as e:  # noqa: BLE001
+            log.warning("Dictation hotkey not started: %s", e)
+
+    def _tool_embedder(self):
+        try:
+            return self.orchestrator.memory.vectors.embedder
+        except Exception:  # noqa: BLE001
+            return None  # keyword-only selection
+
+    def _on_dictation_recording(self, active: bool) -> None:
+        """Dictation owns the mic while recording: silence TTS and pause the voice loop so it never hears or answers the dictation."""
+        if active:
+            self.speaker.stop()
+            self._dictation_paused_voice = bool(self.voice.mic_active)
+            if self._dictation_paused_voice:
+                self.voice.pause()
+        elif self._dictation_paused_voice:
+            self._dictation_paused_voice = False
+            self.voice.resume()
+
+    async def _start_mcp(self):
+        """Start only owner-enabled MCP servers (none by default)."""
+        try:
+            res = await self.mcp.start_enabled()
+            if res:
+                self.bus.publish({"type": "mcp_status", "servers": self.mcp.status()})
+        except Exception as e:  # noqa: BLE001
+            log.warning("MCP startup skipped: %s", e)
 
     async def _watch_memory_expiry(self):
         """Scheduled cleanup purging expired memories and vectors atomically."""
@@ -392,6 +437,11 @@ class Assistant:
             await self.orchestrator.task_runner.stop()
         except Exception as exc:
             log.debug("Background task runner shutdown error ignored cleanly: %s", exc)
+        self.dictation.stop()
+        try:
+            await self.mcp.shutdown()
+        except Exception as exc:  # noqa: BLE001
+            log.debug("MCP shutdown error ignored: %s", exc)
         for t in self._bg:
             t.cancel()
         await self.brain.client.aclose()
@@ -487,6 +537,11 @@ class Assistant:
         self.settings.actions = new.actions
         self.actions.spec = new.actions
         self.settings.monitoring = new.monitoring
+        self.settings.mcp = new.mcp
+        if new.dictation != self.settings.dictation:
+            self.dictation.reconfigure(new.dictation)
+        self.settings.dictation = new.dictation
+        self.settings.screen = new.screen
         self.settings.proactive = new.proactive
         self.proactive.update_spec(new.proactive)
         self.settings.providers = new.providers
@@ -681,6 +736,28 @@ class Assistant:
         if not prompt_text:
             return
         self.bus.publish({"type": "user", "text": prompt_text, "transcript_id": rec.id})
+        verdict = await self.intent_judge.judge(
+            prompt_text,
+            recent_tts=list(self.speaker.recent_text),
+            playback_recent=bool(self.echo_ref.is_playback_recent(1.0) or self.speaker.speaking),
+            deliberate=self.settings.audio.voice_mode in ("ptt", "wake_word"),
+        )
+        if verdict.decision == "stop":
+            await self.interrupt_all(reason="voice_stop")
+            return
+        if verdict.decision == "echo":  # JARVIS hearing itself must never confirm anything either
+            self.bus.publish({"type": "voice_ignored", "reason": verdict.reason, "decision": "echo", "text": prompt_text[:120]})
+            return
+        spoken = await self.mcp.confirm_spoken(prompt_text, source="voice")
+        if spoken is not None:  # a spoken 'confirm <code>' for a pending critical MCP action is consumed here, never sent to the LLM
+            note = "Confirmed." if spoken.get("ok") else ("Confirmed by voice; still waiting for your approval in Approvals." if spoken.get("status") == "awaiting_owner_approval" else "That action did not run.")
+            self.bus.publish({"type": "assistant_message", "text": note, "paths": []})
+            self.speaker.say(note)
+            return
+        if verdict.decision == "ignore":
+            self.bus.publish({"type": "voice_ignored", "reason": verdict.reason, "decision": "ignore", "text": prompt_text[:120]})
+            return
+        prompt_text = verdict.query or prompt_text
         async for ev in self.stream_turn(prompt_text, speak=True, source="voice"):
             self.bus.publish(ev)
 
@@ -692,13 +769,20 @@ class Assistant:
         kwargs.setdefault("custom_instructions", self.settings.preferences.custom_instructions)
         return build_messages(*args, **kwargs)
 
-    def _gather_context(self, text: str) -> dict:
-        """Collect provenance-separated personal memory, history, feedback, notes, and indexed knowledge."""
+    def _gather_context(self, text: str, *, use_context: bool = True) -> dict:
+        """Collect provenance-separated personal memory, history, feedback, notes, and indexed knowledge.
+
+        Context is injected only with query-dependent evidence of relevance; `use_context=False` (the user said to ignore earlier
+        context) returns nothing from memory/history/feedback/knowledge."""
+        if not use_context:
+            return {"hits": [], "nodes": [], "notes_ctx": [], "memories_ctx": [], "memory_ids": [], "history_ctx": [], "feedback_ctx": [],
+                    "knowledge_ctx": [], "knowledge_sources": []}
         q = text
-        if len(text.split()) < 4 and self.history.items:  # short follow-up: borrow previous question keywords
+        if len(text.split()) < 4 and self.history.items and is_followup(text):  # genuine follow-up only: borrow the previous question
             prev = next((m["content"] for m in reversed(self.history.items) if m["role"] == "user"), "")
             q = f"{prev} {text}"
-        hits = [(n, s) for n, s in search(self.store.all(), q, self.settings.context_notes) if s >= MIN_SCORE]
+        # a note is injected only with query-dependent evidence (>= 2 shared content words), not for one generic word such as "API"
+        hits = [(n, s) for n, s in search(self.store.all(), q, self.settings.context_notes) if s >= MIN_SCORE and grounded(q, n.title, n.body)]
 
         memories_ctx: list[tuple[str, str]] = []
         memory_ids: list[str] = []
@@ -722,7 +806,14 @@ class Assistant:
                     for fh in five_hits:
                         if float(fh.get("score") or 0.0) < 0.25:
                             continue
+                        if str(fh.get("memory_type") or "") == "command_memory":
+                            continue  # operational log ("Executed workflow ..."), not knowledge about the user
                         ct = str(fh.get("content") or "").strip()
+                        curated = str(fh.get("memory_type") or "") in ("explicit", "preference", "user_preferences", "project_memory", "fact")
+                        # score has query-independent terms (recency/confidence): demand lexical evidence. Curated memories need one shared
+                        # content word; auto-captured conversation memories (noisy) need two / half the query.
+                        if not grounded(q, str(fh.get("title") or ""), ct, min_shared=1 if curated else 2, frac=0.0 if curated else 0.5):
+                            continue
                         norm_t = ct.lower()
                         if ct and norm_t not in seen_mem_texts:
                             seen_mem_texts.add(norm_t)
@@ -796,7 +887,7 @@ class Assistant:
                     title=f"Command: {intent or cmd_name}",
                     source="command_derived",
                 )
-            elif len(cleaned.split()) >= 6 and "?" not in cleaned[:3]:
+            elif worth_remembering(cleaned):
                 five_way.record_adaptive_memory(
                     content=cleaned[:240],
                     category="conversation_memory",
@@ -809,7 +900,7 @@ class Assistant:
 
     def _context(self, text: str):
         q = text
-        if len(text.split()) < 4 and self.history.items:
+        if len(text.split()) < 4 and self.history.items and is_followup(text):
             prev = next((m["content"] for m in reversed(self.history.items) if m["role"] == "user"), "")
             q = f"{prev} {text}"
         return [(n, s) for n, s in search(self.store.all(), q, self.settings.context_notes) if s >= MIN_SCORE]
@@ -1156,6 +1247,9 @@ class Assistant:
 
         if active_root:
             return {"status": "resolved", "path": active_root}
+        ws_roots = [r for r in (getattr(self.settings.filesystem, "workspace_roots", []) or []) if r and not is_temporary_or_generated_path(r)]
+        if ws_roots:  # the owner's explicitly configured trusted workspace: the natural default for "find ... in my project"
+            return {"status": "resolved", "path": str(ws_roots[0])}
         active_perms = [
             p
             for p in await self.orchestrator.fs_access.list_permissions(status="active")
@@ -1321,10 +1415,17 @@ class Assistant:
             if name == "fs_search_files":
                 query = str(args.get("query") or "").strip()
                 matches = await fs_access.execute_search_files(target, query=query, task_id=task_id)
+                query_used = query
+                if not matches and query:  # the model often passes a guessed file name: retry with the individual words, longest first
+                    for word in sorted(dict.fromkeys(re.findall(r"[A-Za-z0-9]{4,}", query)), key=len, reverse=True)[:3]:
+                        matches = await fs_access.execute_search_files(target, query=word, task_id=task_id)
+                        if matches:
+                            query_used = word
+                            break
                 if turn_ctx is not None:
                     turn_ctx.setdefault("paths", []).extend(m["path"] for m in matches[:15])
                 graph_live.filesystem_activity(self, task_id=task_id, folder_path=target, files=matches, operation="search_files")
-                return json.dumps({"outcome": "success", "ok": True, "path": target, "query": query, "count": len(matches), "matches": matches[:25]}, ensure_ascii=False)
+                return json.dumps({"outcome": "success", "ok": True, "path": target, "query": query, "query_used": query_used, "count": len(matches), "matches": matches[:25]}, ensure_ascii=False)
 
             if name == "fs_find_files_by_extension":
                 exts = list(args.get("extensions") or [])
@@ -1406,6 +1507,23 @@ class Assistant:
                 original_text=original_text,
             )
             return out_json, []
+        if name == "read_screen":
+            res = await self.screen.read_screen(source="llm", task_id=task_id)
+            if res.get("status") == "approval_required":
+                self.bus.publish({"type": "approval_requested", "approval": self.orchestrator.approvals.get(res["approval_token"]), "task_id": task_id})
+            return json.dumps(res, ensure_ascii=False), []
+        if name == DISCOVER:
+            q = str((args or {}).get("query") or "").strip()
+            exposed = (turn_ctx or {}).get("tools_ref")
+            extra = discover_more(q, (turn_ctx or {}).get("all_tools") or [], exposed or [], n=self.settings.tools_max_per_turn, embedder=self._tool_embedder())
+            if exposed is not None:
+                exposed[:0] = extra  # next round the model can actually call them
+            return json.dumps({"added_tools": describe(extra), "note": "" if extra else "no additional tools match"}), []
+        if self.mcp.is_mcp_tool(name):
+            res = await self.mcp.call_tool(name, args if isinstance(args, dict) else {}, source="llm", task_id=task_id)
+            if res.get("status") == "approval_required":
+                self.bus.publish({"type": "approval_requested", "approval": self.orchestrator.approvals.get(res["approval_token"]), "task_id": task_id})
+            return json.dumps(res, ensure_ascii=False), []
         if name == "web_search":
             query = str(args.get("query") or "").strip()
             if not query:
@@ -2343,6 +2461,8 @@ class Assistant:
     def _format_clarification_prompt(pending: dict) -> str:
         mode = str(pending.get("mode") or "supply_parent_dir")
         proj = str(pending.get("project_name") or "that project")
+        if len(proj.split()) > 5 or proj.rstrip(" .?!").lower().startswith(("search ", "find ", "open ", "show ", "list ")):
+            proj = "that project"  # the whole sentence was taken as a name: do not echo it back
         cands = list(pending.get("candidates") or [])
         op_label = str(pending.get("requested_operation") or "list_directory")
         if mode == "select_candidate" and cands:
@@ -2643,6 +2763,21 @@ class Assistant:
             task_id=task_id,
         )
 
+    def _looks_like_clarification_answer(self, raw: str, cands: list[dict]) -> bool:
+        """Is this message plausibly the answer to 'which folder?' (ordinal, path, a candidate name, or a short folder-ish name)?"""
+        if self._parse_clarification_ordinal(raw) is not None:
+            return True
+        if re.match(r"^(?:[A-Za-z]:[\\/]|\\\\|/|~[\\/])", raw) or self._parse_host_fs_request(raw).get("explicit_path"):
+            return True
+        if cands and self._match_clarification_candidate(raw, cands)[0]:
+            return True
+        words = raw.split()
+        named = bool(re.match(r"^(?:my|the)\s+\w+(?:\s+\w+)?\s+(?:project|folder|directory|repo|repository)\W*$", raw, re.I))
+        if "?" in raw or (len(words) > 2 and not named):  # a bare folder/alias name is 1-2 words ("my X project" too); anything longer is a new request
+            return False
+        return not re.match(r"^\W*(?:what|whats|who|when|where|why|how|which|can|could|would|will|do|does|did|is|are|am|tell|show|explain|help|remind|remember|"
+                            r"save|open|find|search|read|write|create|make|set|turn|play|stop|cancel|list|run|start|please|hey|hello|hi|ok|okay|jarvis|good|thanks|thank|bye|goodbye|yes|no|yeah|sure|nice|great)\b", raw, re.I)
+
     async def _handle_pending_clarification_reply(
         self,
         text: str,
@@ -2676,6 +2811,12 @@ class Assistant:
             )
         )
         if is_new_explicit_command:
+            await self._clear_pending_clarification(tid, expired=False)
+            return None
+
+        if not self._looks_like_clarification_answer(raw, cands):
+            # The user moved on (a question, a sentence, an unrelated command). Holding on to the old question made every following
+            # message answer "I couldn't locate `<old folder>`..." - drop it and route the message normally.
             await self._clear_pending_clarification(tid, expired=False)
             return None
 
@@ -3612,7 +3753,8 @@ class Assistant:
                     }
                     return
 
-                cmd = await commands.route(self, text)
+                route_text = normalize_for_routing(text)  # typo-tolerant rule matching only; the model always sees the original wording
+                cmd = await commands.route(self, route_text)
                 if cmd:
                     if cmd["name"] == "repeat_last_command" and cmd.get("replay_text") and not _in_replay:
                         async for ev in self._stream_turn_unlocked(
@@ -3702,7 +3844,7 @@ class Assistant:
                     return
 
                 self._set_os_state("Planning", source=source)
-                plan = await self.orchestrator.decision.decide(text, context=self.get_conversation_context())
+                plan = await self.orchestrator.decision.decide(route_text, context=self.get_conversation_context())
 
                 has_fs_intent = (
                     plan.decision.intent in ("filesystem_ops", "dev_review", "project_exploration", "clarification_needed")
@@ -3967,7 +4109,8 @@ class Assistant:
                     return
 
                 self._set_os_state("Thinking", source=source, detail=plan.decision.intent)
-                ctx_bundle = self._gather_context(text)
+                no_ctx = no_context_requested(text)
+                ctx_bundle = self._gather_context(text, use_context=not no_ctx)
                 hits = ctx_bundle["hits"]
                 graph_live.conversation_used(self, hits, ctx_bundle)
                 nodes = ctx_bundle["nodes"]
@@ -3996,7 +4139,7 @@ class Assistant:
                     )
                 )
                 msgs = self._build_messages(
-                    self.history.window(),
+                    [] if no_ctx else self.history.window(),
                     text,
                     [] if isolate_web else notes_ctx,
                     today,
@@ -4008,14 +4151,27 @@ class Assistant:
                     isolate_untrusted_context=isolate_web,
                 )
                 include_fs = bool(getattr(self.orchestrator, "fs_access", None)) and not isolate_web
+                if include_fs and refers_to_local_artifact(text) and msgs and msgs[-1].get("role") == "user":
+                    c = str(msgs[-1].get("content") or "")
+                    k = c.rfind("Today is ")
+                    msgs[-1] = {**msgs[-1], "content": (c[:k] + LOCAL_ARTIFACT_HINT + c[k:]) if k >= 0 else LOCAL_ARTIFACT_HINT + c}
                 include_web = bool(online and self.settings.internet.tool_calling)
-                tools = _assistant_tools(
-                    include_fs=include_fs,
-                    include_web=include_web,
-                    allow_page_fetch=self.settings.internet.allow_page_fetch,
+                tools = (
+                    _assistant_tools(
+                        include_fs=include_fs,
+                        include_web=include_web,
+                        allow_page_fetch=self.settings.internet.allow_page_fetch,
+                    )
+                    + ([] if isolate_web else self.mcp.tool_schemas())
+                    + ([screen_tool_schema()] if (self.settings.screen.enabled and not isolate_web) else [])
                 ) or None
 
+                all_tools = tools
+                if tools:  # offer only the most relevant tools (+ discover_tools) instead of every registered tool
+                    tools = select_tools(text, tools, k=self.settings.tools_max_per_turn, embedder=self._tool_embedder())
                 turn_ctx: dict = {
+                    "all_tools": all_tools or [],
+                    "tools_ref": tools,
                     "answer": "",
                     "paths": [],
                     "warnings": [],
@@ -4143,6 +4299,8 @@ class Assistant:
                 answer = answer.strip()
                 if not answer:
                     raise BrainError("The model returned an empty reply.")
+                if refers_to_local_artifact(text) and claims_unperformed_action(answer, turn_ctx.get("tools_used")):
+                    answer += UNPERFORMED_NOTICE  # never let a fabricated "I searched / found nothing" stand as a real outcome
                 if turn_ctx.get("warnings"):
                     uniq_warn = list(dict.fromkeys(turn_ctx["warnings"]))
                     answer = f"{answer}\n\nSafety/Inspection Notice: {'; '.join(uniq_warn)}"

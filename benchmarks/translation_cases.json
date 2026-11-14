@@ -1,0 +1,31 @@
+{
+  "_note": "Translation test set. References were written by the assistant (NOT reviewed by a native speaker): automatic scores are indicative only; outputs are stored for human review.",
+  "cases": [
+    {"id": 1, "src": "en", "tgt": "ml", "text": "Please open the project folder.", "ref": "ദയവായി പ്രോജക്റ്റ് ഫോൾഡർ തുറക്കൂ.", "keep": []},
+    {"id": 2, "src": "en", "tgt": "ml", "text": "The meeting is on 15 March at 3:30 PM.", "ref": "മീറ്റിംഗ് മാർച്ച് 15-ന് ഉച്ചയ്ക്ക് 3:30-ന് ആണ്.", "keep": ["15", "3:30"]},
+    {"id": 3, "src": "en", "tgt": "ml", "text": "My OpenAI API key must not be shown.", "ref": "എന്റെ OpenAI API കീ കാണിക്കരുത്.", "keep": ["OpenAI", "API"]},
+    {"id": 4, "src": "en", "tgt": "ml", "text": "Send the report to Ravi tomorrow.", "ref": "നാളെ രവിക്ക് റിപ്പോർട്ട് അയയ്ക്കൂ.", "keep": []},
+    {"id": 5, "src": "ml", "tgt": "en", "text": "ഇന്ന് മഴ പെയ്യുമോ?", "ref": "Will it rain today?", "keep": []},
+    {"id": 6, "src": "ml", "tgt": "en", "text": "എനിക്ക് 250 രൂപ വേണം.", "ref": "I need 250 rupees.", "keep": ["250"]},
+    {"id": 7, "src": "ml", "tgt": "en", "text": "ദയവായി ഫയൽ config.json തുറക്കൂ.", "ref": "Please open the file config.json.", "keep": ["config.json"]},
+    {"id": 8, "src": "ml", "tgt": "en", "text": "നാളെ ഞാൻ കൊച്ചിയിലേക്ക് പോകും.", "ref": "Tomorrow I will go to Kochi.", "keep": []},
+    {"id": 9, "src": "en", "tgt": "hi", "text": "Please open the project folder.", "ref": "कृपया प्रोजेक्ट फ़ोल्डर खोलिए।", "keep": []},
+    {"id": 10, "src": "en", "tgt": "hi", "text": "The meeting is on 15 March at 3:30 PM.", "ref": "बैठक 15 मार्च को दोपहर 3:30 बजे है।", "keep": ["15", "3:30"]},
+    {"id": 11, "src": "en", "tgt": "hi", "text": "Do not reveal the API key.", "ref": "API कुंजी मत दिखाइए।", "keep": ["API"]},
+    {"id": 12, "src": "en", "tgt": "hi", "text": "Send the report to Ravi tomorrow.", "ref": "कल रवि को रिपोर्ट भेजिए।", "keep": []},
+    {"id": 13, "src": "hi", "tgt": "en", "text": "आज मौसम कैसा है?", "ref": "How is the weather today?", "keep": []},
+    {"id": 14, "src": "hi", "tgt": "en", "text": "मुझे 500 रुपये चाहिए।", "ref": "I need 500 rupees.", "keep": ["500"]},
+    {"id": 15, "src": "hi", "tgt": "en", "text": "कृपया config.json फ़ाइल खोलिए।", "ref": "Please open the config.json file.", "keep": ["config.json"]},
+    {"id": 16, "src": "hi", "tgt": "en", "text": "मैं कल दिल्ली जाऊँगा।", "ref": "I will go to Delhi tomorrow.", "keep": []},
+    {"id": 17, "src": "en", "tgt": "ta", "text": "Please open the project folder.", "ref": "தயவுசெய்து திட்ட கோப்புறையைத் திறக்கவும்.", "keep": []},
+    {"id": 18, "src": "en", "tgt": "ta", "text": "The meeting is on 15 March at 3:30 PM.", "ref": "கூட்டம் மார்ச் 15 அன்று மாலை 3:30 மணிக்கு.", "keep": ["15", "3:30"]},
+    {"id": 19, "src": "en", "tgt": "ta", "text": "Do not show the API key.", "ref": "API விசையைக் காட்ட வேண்டாம்.", "keep": ["API"]},
+    {"id": 20, "src": "en", "tgt": "ta", "text": "Send the report to Ravi tomorrow.", "ref": "நாளை ரவிக்கு அறிக்கையை அனுப்பு.", "keep": []},
+    {"id": 21, "src": "ta", "tgt": "en", "text": "இன்று மழை பெய்யுமா?", "ref": "Will it rain today?", "keep": []},
+    {"id": 22, "src": "ta", "tgt": "en", "text": "எனக்கு 300 ரூபாய் வேண்டும்.", "ref": "I need 300 rupees.", "keep": ["300"]},
+    {"id": 23, "src": "ta", "tgt": "en", "text": "தயவுசெய்து config.json கோப்பைத் திறக்கவும்.", "ref": "Please open the file config.json.", "keep": ["config.json"]},
+    {"id": 24, "src": "ta", "tgt": "en", "text": "நான் நாளை சென்னைக்குப் போவேன்.", "ref": "I will go to Chennai tomorrow.", "keep": []},
+    {"id": 25, "src": "auto", "tgt": "en", "text": "Jarvis, ente project folder open cheyyu.", "ref": "Jarvis, open my project folder.", "keep": ["Jarvis"]},
+    {"id": 26, "src": "auto", "tgt": "en", "text": "Kal meeting hai at 5 PM, please remind me.", "ref": "There is a meeting tomorrow at 5 PM, please remind me.", "keep": ["5 PM"]}
+  ]
+}

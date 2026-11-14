@@ -503,6 +503,10 @@ def create_v2_router(fallback=None) -> APIRouter:
                 approved=body.approved,
                 decided_by=body.decided_by,
             )
+            if body.approved and isinstance(row_before, dict) and row_before.get("action_type") == "screen_first_use":
+                apply_settings_patch(a, {"screen": {"first_use_approved": True}}, allow_gateway_and_prefs=True)  # unlocks later captures only; nothing is captured now
+            if body.approved and isinstance(row_before, dict) and str(row_before.get("action_type", "")).startswith("mcp_"):
+                res = {**res, "mcp_result": await a.mcp.execute_approved(token)}  # runs only once approval (+spoken confirm if critical) is satisfied
             task_id = ((row_before or {}).get("args") or {}).get("task_id") if isinstance(row_before, dict) else None
             if task_id:
                 status = "completed" if body.approved else "cancelled"
@@ -1326,6 +1330,122 @@ def create_v2_router(fallback=None) -> APIRouter:
     async def poll_due_routines_now(a=Depends(get_a)):
         triggered = await a.orchestrator.routines.poll_due_routines()
         return {"ok": True, "triggered": triggered, "count": len(triggered)}
+
+    # ---- System health + first-run wizard ---------------------------------------------------------------
+    @router.get("/setup/health")
+    async def setup_health(a=Depends(get_a)):
+        from . import health
+
+        return await health.collect(a)
+
+    @router.get("/setup/state")
+    async def setup_state(a=Depends(get_a)):
+        from . import health
+
+        return health.setup_state(a.data_dir)
+
+    @router.post("/setup/complete")
+    async def setup_complete(a=Depends(get_a)):
+        from . import health
+
+        return health.complete_setup(a.data_dir)
+
+    @router.get("/setup/mic-devices")
+    async def setup_mic_devices(a=Depends(get_a)):
+        """Probe every input device for real audio; tells which one is selected and which actually work."""
+        from . import health
+
+        devs = await asyncio.to_thread(health.probe_input_devices)
+        return {"devices": devs, "diagnosis": health.mic_diagnosis(devs, a.settings.audio.input_device)}
+
+    @router.get("/setup/mic-level")
+    async def setup_mic_level(a=Depends(get_a)):
+        from . import health
+
+        try:
+            return {"ok": True, **await asyncio.to_thread(health.mic_level, a.settings.audio.input_device)}
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "error": str(e)[:200]}
+
+    @router.post("/setup/speaker-test")
+    async def setup_speaker_test(a=Depends(get_a)):
+        from . import health
+
+        try:
+            await asyncio.to_thread(health.play_test_tone)
+            return {"ok": True}
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "error": str(e)[:200]}
+
+    @router.post("/setup/wake-test")
+    async def setup_wake_test(a=Depends(get_a)):
+        from . import health
+
+        if not a.wake.ready:
+            return {"ok": False, "error": f"wake model {a.settings.wake.model}.onnx is not installed"}
+        try:
+            return {"ok": True, **await asyncio.to_thread(health.wake_listen, a.wake, a.settings.audio.input_device, 5.0)}
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "error": str(e)[:200]}
+
+    # ---- Dictation (hotkey config lives in Settings → dictation) ---------------------------------------
+    @router.get("/dictation/status")
+    async def dictation_status(a=Depends(get_a)):
+        st = a.dictation.status()
+        return {"enabled": st.enabled, "running": st.running, "recording": st.recording, "hotkey": st.hotkey, "last_error": st.last_error}
+
+    @router.get("/dictation/history")
+    async def dictation_history(limit: int = Query(100, ge=1, le=500), a=Depends(get_a)):
+        return {"enabled": a.settings.dictation.history_enabled, "items": a.dictation.history.list(limit)}
+
+    @router.delete("/dictation/history")
+    async def dictation_history_clear(a=Depends(get_a)):
+        return {"deleted": a.dictation.history.clear()}
+
+    # ---- MCP servers (disabled by default; config lives in Settings → mcp) -----------------------------
+    @router.get("/mcp/servers")
+    async def mcp_servers(a=Depends(get_a)):
+        return {"servers": a.mcp.status(), "tools": [{k: v for k, v in t.items() if k != "input_schema"} for t in a.mcp.tools()]}
+
+    @router.get("/mcp/presets")
+    async def mcp_presets(a=Depends(get_a)):
+        from .integrations.mcp_presets import PRESETS
+
+        return {"presets": [{"name": n, "installed": n in a.mcp.specs, "description": p.description, "network": p.network} for n, p in PRESETS.items()]}
+
+    @router.post("/mcp/presets/{name}/install")
+    async def mcp_preset_install(name: str, a=Depends(get_a)):
+        """Adds the preset to settings, DISABLED. Enabling it (and exporting its ${ENV} credentials) is a separate owner action."""
+        from .integrations.mcp_presets import PRESETS, preset_config
+
+        if name not in PRESETS:
+            raise HTTPException(404, f"unknown preset {name!r}")
+        if name in a.mcp.specs:
+            raise HTTPException(409, f"{name} is already configured")
+        existing = {k: v.model_dump() for k, v in a.settings.mcp.servers.items()}
+        patch = {"mcp": {"servers": {**existing, **preset_config(name)["mcp"]["servers"]}}}
+        return {"ok": True, "settings": apply_settings_patch(a, patch, allow_gateway_and_prefs=True)["mcp"]}
+
+    @router.post("/mcp/servers/{name}/{op}")
+    async def mcp_server_op(name: str, op: str, a=Depends(get_a)):
+        from .mcp_client import MCPError
+
+        if op not in ("start", "stop", "restart"):
+            raise HTTPException(404, f"unknown operation {op!r}")
+        if name not in a.mcp.specs:
+            raise HTTPException(404, f"unknown MCP server {name!r}")
+        try:
+            if op == "start":
+                st = await a.mcp.start(name)
+            elif op == "restart":
+                st = await a.mcp.restart(name)
+            else:
+                await a.mcp.stop(name)
+                st = a.mcp.server_status(name)
+        except MCPError as e:
+            raise HTTPException(409, str(e))
+        a.bus.publish({"type": "mcp_status", "servers": a.mcp.status()})
+        return st
 
     router.include_router(create_skills_subrouter(fallback))
     router.include_router(create_decision_subrouter(fallback))

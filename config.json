@@ -31,7 +31,7 @@
     "chunk_chars": 170
   },
   "stt": {
-    "model": "small.en",
+    "model": "medium.en",
     "compute_type": "int8",
     "cpu_threads": 6,
     "language": "en",
@@ -43,7 +43,7 @@
     "min_speech_duration_ms": 120,
     "speech_pad_ms": 300,
     "short_utterance_pad_ms": 160,
-    "vocab_hints": "Jarvis, Kavlien, ERP, React, Node.js, TypeScript, JavaScript, Python, FastAPI, MongoDB, PostgreSQL, Redis, Docker, Kubernetes, Ollama, Qwen, Whisper, Faster-Whisper, GitHub, OpenCode, VS Code, Graphify, API, REST, WebSocket, Vercel, Cloudflare, AWS, EKS, Hugging Face, Qdrant, ChromaDB, VRAM, quantization",
+    "vocab_hints": "Jarvis, Kavlien, Ollama, Qwen, Python, Docker, FastAPI, Git",
     "vocab_hints_file": "config/vocab_hints.txt",
     "preserve_punctuation": true,
     "max_retry_attempts": 2,

@@ -25,6 +25,7 @@ UNTRUSTED_SOURCE_TYPES: frozenset[str] = frozenset(
         "external_note",
         "knowledge_chunk",
         "external_tool_output",
+        "screen_ocr",
     }
 )
 
@@ -113,6 +114,14 @@ class UntrustedContent:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+def memory_safe(text: Any) -> str:
+    """The ONLY form in which external text (MCP results, OCR, web) may be stored in memory: secrets/e-mail redacted, boundary-wrapped."""
+    from .pii_firewall import redact_secrets
+
+    clean, _ = redact_secrets(str(text or ""), mask_email=True)
+    return wrap_untrusted(clean, source_type="external_tool_output", source_id="memory")
 
 
 def wrap_untrusted(

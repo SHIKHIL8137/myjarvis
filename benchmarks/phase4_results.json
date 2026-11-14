@@ -1,0 +1,72 @@
+{
+  "tool_select_keyword_only": {
+    "n": 33,
+    "k": 6,
+    "catalogue_size": 25,
+    "recall_at_k": 1.0,
+    "top1": 0.7575757575757576,
+    "misses": [],
+    "latency_ms_mean": 1.2311939394335654,
+    "latency_ms_max": 1.8115000002580928,
+    "discover_always_present": true
+  },
+  "tool_select_hash_embeddings": {
+    "n": 33,
+    "k": 6,
+    "catalogue_size": 25,
+    "recall_at_k": 1.0,
+    "top1": 0.7878787878787878,
+    "misses": [],
+    "latency_ms_mean": 1.8149575757475263,
+    "latency_ms_max": 11.696200000187673,
+    "discover_always_present": true
+  },
+  "intent_offline": {
+    "n": 38,
+    "accuracy": 1.0,
+    "confusions": {},
+    "wrong": [],
+    "fast_path_n": 33,
+    "fast_ms_max": 0.14879999980621506,
+    "fast_ms_mean": 0.032869696951820515,
+    "llm_path_n": 5,
+    "llm_ms": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "llm_mode": "scripted"
+  },
+  "intent_live_llm": {
+    "n": 38,
+    "accuracy": 0.9736842105263158,
+    "confusions": {
+      "query->ignore": 1
+    },
+    "wrong": [
+      {
+        "text": "my battery is almost dead",
+        "expect": "query",
+        "got": "ignore",
+        "path": "llm",
+        "query": "",
+        "ok": false,
+        "ms": 481.27
+      }
+    ],
+    "fast_path_n": 33,
+    "fast_ms_max": 0.37849999989703065,
+    "fast_ms_mean": 0.04199696967120734,
+    "llm_path_n": 5,
+    "llm_ms": [
+      610,
+      606,
+      591,
+      487,
+      481
+    ],
+    "llm_mode": "live-ollama"
+  }
+}

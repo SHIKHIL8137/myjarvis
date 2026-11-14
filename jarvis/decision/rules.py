@@ -19,11 +19,12 @@ DOC_EXPORT_RE = re.compile(
     re.I,
 )
 REMINDER_RE = re.compile(
-    r"\b(?:remind\s+me|set\s+(?:a\s+)?reminder|schedule\s+(?:a\s+)?reminder|(?:list|show|what\s+are)\s+(?:(?:all|my|pending|active)\s+)*reminders?)\b",
+    r"\b(?:remind\s+me|(?:set|create|add|make|schedule)\s+(?:me\s+)?(?:a\s+|an\s+)?(?:\w+\s+)?reminder|(?:list|show|what\s+are)\s+(?:(?:all|my|pending|active)\s+)*reminders?)\b",
     re.I,
 )
 WEB_RESEARCH_RE = re.compile(
-    r"\b(?:search\s+(?:the\s+)?(?:web|internet|online)|look\s+up\s+online|latest\s+news|weather\b|stock\s+price|current\s+version)\b",
+    r"\b(?:search\s+(?:the\s+)?(?:web|internet|online)|look\s+up\s+online|(?:latest|recent|current|today'?s)\s+news|weather\b|stock\s+price|current\s+version)\b|"
+    r"\b(?:look\s*up|search(?:\s+for)?|ser[ck]h\s+for|google|find\s+out)\b[^\n?!]{0,70}\b(?:online|on\s+the\s+(?:web|internet)|on\s+google)\b",
     re.I,
 )
 FILESYSTEM_OPS_RE = re.compile(
@@ -35,11 +36,12 @@ FILESYSTEM_OPS_RE = re.compile(
     r"(?:list|show|find|search|inspect|read|open|explore)\s+(?:its\s+|the\s+)?(?:backend|frontend|src|app|apps|packages|client|server|database|docs|tests|config)\b|"
     r"\b(?:read|open|show|inspect|check|explore)\s+(?:its\s+|the\s+)?[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,8}\b[^\n]{0,40}\b(?:in|inside|from)?|"
     r"\b(?:folder|directory)\s+structure\b|"
-    r"what\s+files\s+are\s+in\b|[A-Za-z]:\\|\\\\[A-Za-z0-9_.-]+\\)",
+    r"what\s+files\s+(?:are\s+)?(?:do\s+i\s+have\s+)?(?:in|inside)\b|[A-Za-z]:\\|\\\\[A-Za-z0-9_.-]+\\|"
+    r"\b(?:find|search\s+for|locate|where\s+is|look\s+for)\b[^\n.?!]{0,40}\b(?:pdfs?|docx?|xlsx?|pptx?|csv|spreadsheets?|presentations?|word\s+documents?)\b)",
     re.I,
 )
 TASK_STATUS_RE = re.compile(
-    r"\b(?:(?:check|list|show|what\s+are|status\s+of)\s+(?:(?:all|my|the|current|active|pending|running)\s+)*tasks?)\b",
+    r"\b(?:(?:check|list|show|what\s+are|status\s+of)\s+(?:me\s+)?(?:(?:all|my|the|current|active|pending|running)\s+)*tasks?)\b",
     re.I,
 )
 HOST_FOLDER_TARGET_RE = re.compile(
@@ -63,7 +65,14 @@ RECOVERY_OPS_RE = re.compile(
     re.I,
 )
 SYSTEM_STATUS_RE = re.compile(
-    r"\b(?:(?:check|show|monitor|report|what\s+is)\s+(?:the\s+|current\s+|my\s+)?(?:system\s+(?:health|status|metrics|resources)|cpu|ram|memory\s+usage|gpu|vram|audio\s+devices?|hardware\s+status)|system\s+(?:status|health)\b)\b",
+    r"\b(?:(?:check|show|monitor|report|what\s+is)\s+(?:the\s+|current\s+|my\s+)?(?:system\s+(?:health|status|metrics|resources)|cpu|ram|memory\s+usage|gpu|vram|audio\s+devices?|hardware\s+status)|system\s+(?:status|health)\b)\b|"
+    r"\bmy\s+(?:cpu|ram|vram|gpu|processor|disk|storage|battery)\b|"
+    r"\b(?:cpu|ram|vram|gpu|processor|disk|storage)\s+(?:usage|load|status|utili[sz]ation)\b|"
+    r"\b(?:ram|vram|gpu|disk|storage|memory)\b[^\n.?!]{0,25}\b(?:left|free|available|remaining)\b|"
+    r"\b(?:am\s+i|are\s+we)\s+using\b[^\n.?!]{0,20}\b(?:ram|vram|cpu|gpu|memory|disk)\b|\b(?:ram|vram|cpu|gpu|memory|disk)\b[^\n.?!]{0,15}\b(?:am\s+i|are\s+we)\s+using\b|\bhow\s+busy\b|\bunder\s+(?:heavy\s+)?load\b|"
+    r"\b(?:machine|system|pc|computer|laptop)(?:'s)?\s+(?:current\s+)?(?:resource|usage|load|performance)\b|\bresource\s+usage\b|"
+    r"\bhow\s+is\s+(?:the|my)\s+(?:machine|computer|pc|laptop|system)\s+(?:doing|performing|running)\b|\bfree\s+(?:disk\s+)?space\b|\b(?:disk|drive)\s+space\b|"
+    r"\b(?:cpu|gpu|processor)\s+temp\w*|\bgraphics\s+card\b[^\n.?!]{0,25}\b(?:load|usage|temp\w*|memory|doing)\b",
     re.I,
 )
 

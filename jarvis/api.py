@@ -1,6 +1,7 @@
 """FastAPI app. Loopback-only. Mutating requests need the X-Jarvis header (blocks cross-site form/fetch posts) and every
 request must carry a loopback Host header (blocks DNS rebinding). Static viewer served from viewer/ only."""
 import asyncio
+import re
 from contextlib import asynccontextmanager
 import json
 import logging
@@ -26,8 +27,8 @@ from .core.logging_ctx import correlation_scope, sanitize_correlation_id
 from .filesystem import FilesystemPermissionError
 from .memory_store import infer_memory_category
 from .config import (
+    RESOURCE_ROOT,
     PROVIDER_ENV_VARS,
-    ROOT,
     Settings,
     delete_provider_api_key,
     has_provider_api_key,
@@ -65,6 +66,11 @@ class ChatIn(BaseModel):
 
 class SwitchIn(BaseModel):
     model: str = Field(min_length=1, max_length=100)
+
+
+class SelectIn(BaseModel):
+    key: str = Field(min_length=1, max_length=140)
+    confirm_paid: bool = False
 
 
 class SpeakIn(BaseModel):
@@ -215,7 +221,18 @@ def create_app(settings: Settings | None = None, assistant: Assistant | None = N
 
     @app.exception_handler(RequestValidationError)
     async def _req_val_err(_, e: RequestValidationError):
-        errs = e.errors()
+        from .security.pii_firewall import redact_secrets
+
+        def _clean(v):  # FastAPI echoes the submitted body in `input`: never send a mistyped secret back to the client or into logs
+            if isinstance(v, str):
+                return redact_secrets(v, mask_email=False)[0][:200]
+            if isinstance(v, dict):
+                return {k: ("[REDACTED]" if re.search(r"key|token|secret|password", str(k), re.I) and isinstance(x, str) else _clean(x)) for k, x in v.items()}
+            if isinstance(v, (list, tuple)):
+                return [_clean(x) for x in v]
+            return v if isinstance(v, (int, float, bool)) or v is None else str(v)[:200]
+
+        errs = _clean(e.errors())
         msg = "; ".join(f"{'.'.join(str(x) for x in err.get('loc', []))}: {err.get('msg', 'invalid')}" for err in errs[:4]) or "validation error"
         return _err_resp(msg, code="validation_error", status_code=422, details={"errors": errs[:10]})
 
@@ -313,6 +330,7 @@ def create_app(settings: Settings | None = None, assistant: Assistant | None = N
     @app.delete("/api/history")
     async def clear_history():
         A().history.clear()
+        A().pending_clarification = None  # a conversation reset must not keep an old "which folder?" question alive
         graph_live.conversation_cleared(A())
         return {"ok": True}
 
@@ -320,6 +338,20 @@ def create_app(settings: Settings | None = None, assistant: Assistant | None = N
     @app.get("/api/models")
     async def models():
         return {"current": A().brain.current, "models": await A().brain.catalogue()}
+
+    @app.get("/api/models/catalog")
+    async def model_catalog(provider: str = "", free: bool | None = None, q: str = Query("", max_length=80), refresh: bool = False):
+        return await A().model_catalog.listing(provider=provider[:20], free=free, q=q, refresh=refresh)
+
+    @app.get("/api/models/recommend")
+    async def model_recommend(task: str = "general", provider: str = "", free: bool | None = None):
+        cat = A().model_catalog
+        res = await cat.listing(provider=provider[:20], free=free)
+        return cat.recommend(task, res["models"])
+
+    @app.post("/api/models/select")
+    async def model_select(body: SelectIn):
+        return await A().model_catalog.select(body.key, confirm_paid=body.confirm_paid)
 
     @app.post("/api/models/switch")
     async def switch(body: SwitchIn):
@@ -638,6 +670,15 @@ def create_app(settings: Settings | None = None, assistant: Assistant | None = N
             "error": a.voice.last_error,
         }
 
+    @app.post("/api/system/shutdown")
+    async def system_shutdown():
+        """Graceful local shutdown (tray Quit equivalent / installer smoke test). Same loopback + X-Jarvis guard as every mutating route."""
+        fn = getattr(app.state, "request_shutdown", None)
+        if not callable(fn):
+            raise StarletteHTTPException(501, "this instance was not started by server.py")
+        fn()
+        return {"ok": True, "shutting_down": True}
+
     @app.post("/api/voice/interrupt")
     async def voice_interrupt():
         return await A().interrupt_all(reason="manual_interrupt")
@@ -813,8 +854,8 @@ def create_app(settings: Settings | None = None, assistant: Assistant | None = N
     app.include_router(create_learning_router())
     app.include_router(create_v2_router())
 
-    vdir = viewer or ROOT / "viewer"
-    react_dist = ROOT / "apps" / "frontend" / "dist"
+    vdir = viewer or RESOURCE_ROOT / "viewer"
+    react_dist = RESOURCE_ROOT / "apps" / "frontend" / "dist"
     if react_dist.exists() and (react_dist / "index.html").exists() and viewer is None:
         if vdir.exists():
             app.mount("/legacy", StaticFiles(directory=vdir, html=True), name="viewer_legacy")
